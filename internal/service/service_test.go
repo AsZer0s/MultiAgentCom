@@ -1,0 +1,415 @@
+package service
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"testing"
+	"time"
+
+	"multiagentcom/internal/config"
+	"multiagentcom/internal/domain"
+)
+
+func TestSprintOneFlow(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "test-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Todo Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:       "实现 Todo 列表的增删改查",
+		Content:     "实现 Todo 列表的增删改查，并提供最小可演示交付包。",
+		Constraints: []string{"后端使用 Go"},
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: plan.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := svc.GetRunStatus(ctx, project.ID, runEnvelope.Run.ID)
+		if err != nil {
+			t.Fatalf("get run status: %v", err)
+		}
+		if status.Run.Status == domain.RunStatusSucceeded {
+			if status.Task.Status != domain.TaskStatusDone {
+				t.Fatalf("expected task DONE, got %s", status.Task.Status)
+			}
+			if len(status.Artifacts) != 1 {
+				t.Fatalf("expected 1 artifact, got %d", len(status.Artifacts))
+			}
+			if _, err := os.Stat(status.Artifacts[0].URI); err != nil {
+				t.Fatalf("artifact file missing: %v", err)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatal("run did not complete before deadline")
+}
+
+func TestContractHubVersioning(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-contracts",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "test-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Contract Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	requirement, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:       "实现 Todo 列表的增删改查",
+		Content:     "实现 Todo 列表的增删改查，并先生成 API 契约。",
+		Constraints: []string{"后端使用 Go", "前端稍后补齐"},
+	})
+	if err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	contractV1, err := svc.GenerateContract(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate contract v1: %v", err)
+	}
+	if contractV1.Version != 1 {
+		t.Fatalf("expected version 1, got %d", contractV1.Version)
+	}
+	if contractV1.PlanID != planResult.Plan.ID {
+		t.Fatalf("expected plan id %s, got %s", planResult.Plan.ID, contractV1.PlanID)
+	}
+	if contractV1.RequirementID != requirement.ID {
+		t.Fatalf("expected requirement id %s, got %s", requirement.ID, contractV1.RequirementID)
+	}
+	if len(contractV1.Endpoints) < 4 {
+		t.Fatalf("expected CRUD endpoints, got %d", len(contractV1.Endpoints))
+	}
+	if len(contractV1.Schemas) < 2 {
+		t.Fatalf("expected schemas to be generated, got %d", len(contractV1.Schemas))
+	}
+
+	contractV2, err := svc.GenerateContract(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate contract v2: %v", err)
+	}
+	if contractV2.Version != 2 {
+		t.Fatalf("expected version 2, got %d", contractV2.Version)
+	}
+
+	contracts, err := svc.ListContracts(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list contracts: %v", err)
+	}
+	if len(contracts) != 2 {
+		t.Fatalf("expected 2 contracts, got %d", len(contracts))
+	}
+
+	stored, err := svc.GetContract(ctx, project.ID, contractV2.ID)
+	if err != nil {
+		t.Fatalf("get contract: %v", err)
+	}
+	if stored.Name == "" {
+		t.Fatal("expected stored contract name")
+	}
+	if stored.Endpoints[0].Path != "/api/todos" {
+		t.Fatalf("expected todo contract path, got %s", stored.Endpoints[0].Path)
+	}
+}
+
+func TestValidateContractCreatesRemediationTaskOnConflict(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-validate-contract",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "test-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Conflict Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo 列表的增删改查",
+		Content: "实现 Todo 列表的增删改查，并校验契约一致性。",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	contract, err := svc.GenerateContract(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+
+	result, err := svc.ValidateContract(ctx, project.ID, ValidateContractInput{
+		ContractID: contract.ID,
+		Endpoints: []domain.ContractEndpoint{
+			{Name: "ListTodo", Method: "GET", Path: "/api/todos"},
+			{Name: "CreateTodo", Method: "POST", Path: "/api/todos"},
+		},
+		Schemas: []domain.ContractSchema{
+			{
+				Name: "Todo",
+				Fields: []domain.ContractField{
+					{Name: "id", Type: "string", Required: true},
+					{Name: "title", Type: "number", Required: true},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("validate contract: %v", err)
+	}
+	if result.Passed {
+		t.Fatal("expected validation to fail")
+	}
+	if len(result.Conflicts) == 0 {
+		t.Fatal("expected conflicts to be returned")
+	}
+	if result.RemediationTask == nil {
+		t.Fatal("expected remediation task to be created")
+	}
+	if result.RemediationTask.Type != "CONTRACT_REWORK" {
+		t.Fatalf("expected remediation task type CONTRACT_REWORK, got %s", result.RemediationTask.Type)
+	}
+	if result.RemediationTask.InputRef != "contract://"+contract.ID {
+		t.Fatalf("expected remediation task input ref to point to contract, got %s", result.RemediationTask.InputRef)
+	}
+}
+
+func TestValidateContractPassesForMatchingCandidate(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-validate-contract-pass",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "test-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Valid Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo 列表的增删改查",
+		Content: "实现 Todo 列表的增删改查，并校验契约一致性。",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	contract, err := svc.GenerateContract(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+
+	result, err := svc.ValidateContract(ctx, project.ID, ValidateContractInput{
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	})
+	if err != nil {
+		t.Fatalf("validate contract: %v", err)
+	}
+	if !result.Passed {
+		t.Fatalf("expected validation to pass, got conflicts: %+v", result.Conflicts)
+	}
+	if result.RemediationTask != nil {
+		t.Fatal("did not expect remediation task on successful validation")
+	}
+}
+
+func TestDispatchTasksAndParallelRun(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-parallel-run",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Parallel Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:       "实现 Todo 全栈功能",
+		Content:     "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+		Constraints: []string{"后端使用 Go", "前端使用 Vue"},
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if _, err := svc.GenerateContract(ctx, project.ID); err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+
+	dispatchResult, err := svc.DispatchTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("dispatch tasks: %v", err)
+	}
+	if len(dispatchResult.Tasks) != 3 {
+		t.Fatalf("expected 3 dispatched tasks, got %d", len(dispatchResult.Tasks))
+	}
+	if len(dispatchResult.Tasks[2].DependsOn) != 2 {
+		t.Fatalf("expected integration task to depend on 2 tasks, got %d", len(dispatchResult.Tasks[2].DependsOn))
+	}
+
+	parallelResult, err := svc.StartParallelRun(ctx, project.ID, ParallelRunInput{
+		TaskIDs: []string{dispatchResult.Tasks[0].ID, dispatchResult.Tasks[1].ID},
+	})
+	if err != nil {
+		t.Fatalf("start parallel run: %v", err)
+	}
+	if len(parallelResult.Started) != 2 {
+		t.Fatalf("expected 2 started runs, got %d", len(parallelResult.Started))
+	}
+
+	for _, started := range parallelResult.Started {
+		waitForSucceededRun(t, svc, project.ID, started.Run.ID)
+	}
+
+	integrationRun, err := svc.StartParallelRun(ctx, project.ID, ParallelRunInput{
+		TaskIDs: []string{dispatchResult.Tasks[2].ID},
+	})
+	if err != nil {
+		t.Fatalf("start integration run: %v", err)
+	}
+	if len(integrationRun.Started) != 1 {
+		t.Fatalf("expected 1 integration run, got %d", len(integrationRun.Started))
+	}
+	waitForSucceededRun(t, svc, project.ID, integrationRun.Started[0].Run.ID)
+}
+
+func TestRetryTaskCreatesIndependentRetry(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-retry-task",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Retry Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo 全栈功能",
+		Content: "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if _, err := svc.GenerateContract(ctx, project.ID); err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+	dispatchResult, err := svc.DispatchTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("dispatch tasks: %v", err)
+	}
+
+	targetTaskID := dispatchResult.Tasks[1].ID
+	svc.mu.Lock()
+	task := svc.tasks[targetTaskID]
+	now := time.Now().UTC()
+	if err := task.TransitionTo(domain.TaskStatusInProgress, "test start", now); err != nil {
+		svc.mu.Unlock()
+		t.Fatalf("transition to in progress: %v", err)
+	}
+	if err := task.TransitionTo(domain.TaskStatusFailed, "test fail", now.Add(time.Millisecond)); err != nil {
+		svc.mu.Unlock()
+		t.Fatalf("transition to failed: %v", err)
+	}
+	svc.mu.Unlock()
+
+	retryTask, err := svc.RetryTask(ctx, project.ID, targetTaskID)
+	if err != nil {
+		t.Fatalf("retry task: %v", err)
+	}
+	if retryTask.Status != domain.TaskStatusCreated {
+		t.Fatalf("expected retry task status CREATED, got %s", retryTask.Status)
+	}
+	if retryTask.AssigneeAgent != dispatchResult.Tasks[1].AssigneeAgent {
+		t.Fatalf("expected retry task to preserve assignee %s, got %s", dispatchResult.Tasks[1].AssigneeAgent, retryTask.AssigneeAgent)
+	}
+	if retryTask.ID == targetTaskID {
+		t.Fatal("expected retry task to have a new id")
+	}
+}
+
+func waitForSucceededRun(t *testing.T, svc *Service, projectID, runID string) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := svc.GetRunStatus(context.Background(), projectID, runID)
+		if err != nil {
+			t.Fatalf("get run status: %v", err)
+		}
+		if status.Run.Status == domain.RunStatusSucceeded {
+			if status.Task.Status != domain.TaskStatusDone {
+				t.Fatalf("expected task DONE, got %s", status.Task.Status)
+			}
+			return
+		}
+		if status.Run.Status == domain.RunStatusFailed {
+			t.Fatalf("expected run success, got failure: %s", status.Run.Error)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("run %s did not complete before deadline", runID)
+}
