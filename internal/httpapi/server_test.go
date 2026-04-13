@@ -385,6 +385,128 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 	}
 }
 
+func TestHTTPSprintTwoAcceptanceFlow(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-sprint2-acceptance",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name":        "Todo Sprint 2 Acceptance",
+		"description": "AC-03/04/05/06/12",
+	})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{
+		"title":           "实现 Todo 全栈功能",
+		"content":         "实现 Todo 全栈功能，后端提供 API，前端提供页面，并展示状态面板。",
+		"constraints":     []string{"后端使用 Go", "前端使用 Vue"},
+		"acceptanceHints": []string{"双 Agent 并行执行", "可查看状态矩阵"},
+	})
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{})
+
+	contractBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/contracts/generate", map[string]any{})
+	var contract domain.Contract
+	decodeResponse(t, contractBody, &contract)
+	if contract.Version != 1 || len(contract.Endpoints) == 0 || len(contract.Schemas) == 0 {
+		t.Fatalf("expected generated contract with v1 endpoints and schemas, got %+v", contract)
+	}
+
+	conflictBody := requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/contracts/validate", map[string]any{
+		"contractId": contract.ID,
+		"endpoints": []map[string]any{
+			{"name": "ListTodo", "method": "GET", "path": "/api/todos"},
+		},
+		"schemas": []map[string]any{
+			{
+				"name": "Todo",
+				"fields": []map[string]any{
+					{"name": "id", "type": "string", "required": true},
+					{"name": "title", "type": "number", "required": true},
+				},
+			},
+		},
+	}, http.StatusConflict)
+	var conflictResult service.ContractValidationResult
+	decodeResponse(t, conflictBody, &conflictResult)
+	if conflictResult.Passed || len(conflictResult.Conflicts) == 0 || conflictResult.RemediationTask == nil {
+		t.Fatalf("expected contract validation conflict with remediation task, got %+v", conflictResult)
+	}
+
+	dispatchBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/dispatch", map[string]any{})
+	var dispatchResult service.DispatchTasksResult
+	decodeResponse(t, dispatchBody, &dispatchResult)
+	if len(dispatchResult.Tasks) != 3 {
+		t.Fatalf("expected backend/frontend/integration tasks, got %d", len(dispatchResult.Tasks))
+	}
+
+	backendTask := dispatchResult.Tasks[0]
+	frontendTask := dispatchResult.Tasks[1]
+	integrationTask := dispatchResult.Tasks[2]
+
+	backendContextBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/"+backendTask.ID+"/context/generate", map[string]any{})
+	frontendContextBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/"+frontendTask.ID+"/context/generate", map[string]any{})
+	var backendContext service.TaskContextEnvelope
+	var frontendContext service.TaskContextEnvelope
+	decodeResponse(t, backendContextBody, &backendContext)
+	decodeResponse(t, frontendContextBody, &frontendContext)
+	if backendContext.Context.Role != "backend" || frontendContext.Context.Role != "frontend" {
+		t.Fatalf("expected backend/frontend context roles, got %s and %s", backendContext.Context.Role, frontendContext.Context.Role)
+	}
+	if sectionTitles(backendContext.Context.Sections) == sectionTitles(frontendContext.Context.Sections) {
+		t.Fatal("expected backend and frontend context slices to differ")
+	}
+
+	parallelBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/runs/parallel", map[string]any{
+		"taskIds": []string{backendTask.ID, frontendTask.ID},
+	})
+	var parallelResult service.ParallelRunResult
+	decodeResponse(t, parallelBody, &parallelResult)
+	if len(parallelResult.Started) != 2 {
+		t.Fatalf("expected 2 started runs, got %d", len(parallelResult.Started))
+	}
+	for _, started := range parallelResult.Started {
+		waitForHTTPRun(t, server, project.ID, started.Run.ID)
+	}
+
+	matrixBody := getJSON(t, server.Client(), server.URL+"/status/matrix?projectId="+project.ID)
+	var matrix service.StatusMatrixView
+	decodeResponse(t, matrixBody, &matrix)
+	if len(matrix.Matrices) != 1 {
+		t.Fatalf("expected one project matrix, got %d", len(matrix.Matrices))
+	}
+	if matrix.Matrices[0].ReadyTasks < 1 {
+		t.Fatalf("expected at least one ready task for integration, got %d", matrix.Matrices[0].ReadyTasks)
+	}
+	if !containsAgentStatus(matrix.Matrices[0].AgentMatrix, "go-backend-agent", "COMPLETED") {
+		t.Fatal("expected go-backend-agent to be completed in status matrix")
+	}
+	if !containsTaskID(matrix.Matrices[0].TaskMatrix, integrationTask.ID) {
+		t.Fatal("expected integration task to appear in status matrix")
+	}
+
+	resp, err := server.Client().Get(server.URL + "/status/panel")
+	if err != nil {
+		t.Fatalf("get status panel: %v", err)
+	}
+	defer resp.Body.Close()
+	panelBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read panel body: %v", err)
+	}
+	if !strings.Contains(string(panelBody), "Status Matrix") {
+		t.Fatal("expected status panel html title")
+	}
+}
+
 func requestJSON(t *testing.T, client *http.Client, method, url string, payload any) []byte {
 	t.Helper()
 
@@ -495,4 +617,30 @@ func waitForHTTPRun(t *testing.T, server *httptest.Server, projectID, runID stri
 	}
 
 	t.Fatalf("run %s did not complete before deadline", runID)
+}
+
+func containsAgentStatus(items []service.StatusMatrixAgent, agent, status string) bool {
+	for _, item := range items {
+		if item.Agent == agent && item.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTaskID(items []service.StatusMatrixTask, taskID string) bool {
+	for _, item := range items {
+		if item.ID == taskID {
+			return true
+		}
+	}
+	return false
+}
+
+func sectionTitles(items []domain.ContextSection) string {
+	titles := make([]string, 0, len(items))
+	for _, item := range items {
+		titles = append(titles, item.Title)
+	}
+	return strings.Join(titles, "|")
 }
