@@ -5,6 +5,8 @@
 ## 已实现范围
 
 - `GET /health`：健康检查
+- `GET /status/matrix`：查看全局或按项目过滤的状态矩阵数据
+- `GET /status/panel`：打开最小状态矩阵面板
 - `POST /projects`：创建项目
 - `POST /projects/{id}/requirements`：提交需求
 - `GET /projects/{id}/requirements`：查看需求
@@ -15,6 +17,8 @@
 - `GET /projects/{id}/contracts/{contractId}`：读取单个契约
 - `POST /projects/{id}/tasks/dispatch`：基于最新契约生成前后端并行任务
 - `GET /projects/{id}/tasks`：查看项目任务列表与依赖
+- `POST /projects/{id}/tasks/{taskId}/context/generate`：为指定任务生成上下文切片
+- `GET /projects/{id}/tasks/{taskId}/context`：查看该任务最新上下文注入结果
 - `POST /projects/{id}/tasks/run`：触发单 Agent 串行执行
 - `POST /projects/{id}/tasks/{taskId}/retry`：为失败任务创建独立重试任务
 - `POST /projects/{id}/runs/parallel`：并行触发多个已就绪任务
@@ -30,6 +34,8 @@
 - Contract Hub 当前为**最小可演示实现**：支持基于最新 PRD 规则生成 CRUD 风格 API/Schema 契约，并按版本保存在内存中。
 - 契约校验当前支持**合并前最小闸门**：可检查候选 endpoints/schemas 与契约的缺失、类型不一致、额外字段；若存在冲突，会拒绝校验并自动创建修复任务。
 - 并行调度当前支持**双 Agent + 简单 DAG**：可生成后端/前端实现任务，并在依赖满足后触发集成任务；失败任务可单独创建 retry 任务，不影响其他任务继续推进。
+- Context Engine 当前支持**按任务角色切片注入**：后端任务会拿到 API/Schema 重点，前端任务会拿到 UX/验收重点；每次生成都会记录 `version` 和 `sources`，可回查最新注入结果。
+- 状态矩阵面板当前支持**最小可视化监控**：可查看项目级任务矩阵、Agent 状态汇总，并在 `/status/panel` 中按项目过滤与自动刷新。
 
 ## 本地运行
 

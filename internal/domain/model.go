@@ -70,6 +70,29 @@ type Contract struct {
 	CreatedAt     time.Time          `json:"createdAt"`
 }
 
+type ContextSource struct {
+	Kind    string `json:"kind"`
+	Ref     string `json:"ref"`
+	Version string `json:"version,omitempty"`
+}
+
+type ContextSection struct {
+	Title string   `json:"title"`
+	Items []string `json:"items"`
+}
+
+type ContextInjection struct {
+	ID        string           `json:"id"`
+	ProjectID string           `json:"projectId"`
+	TaskID    string           `json:"taskId"`
+	Role      string           `json:"role"`
+	Version   int              `json:"version"`
+	Summary   string           `json:"summary"`
+	Sources   []ContextSource  `json:"sources"`
+	Sections  []ContextSection `json:"sections"`
+	CreatedAt time.Time        `json:"createdAt"`
+}
+
 type TaskStatus string
 
 const (

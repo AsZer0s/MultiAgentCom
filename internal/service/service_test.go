@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -387,6 +388,203 @@ func TestRetryTaskCreatesIndependentRetry(t *testing.T) {
 	}
 	if retryTask.ID == targetTaskID {
 		t.Fatal("expected retry task to have a new id")
+	}
+}
+
+func TestGenerateTaskContextSlicesByRole(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-context-engine",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Context Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:       "实现 Todo 全栈功能",
+		Content:     "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+		Constraints: []string{"后端使用 Go", "前端使用 Vue"},
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if _, err := svc.GenerateContract(ctx, project.ID); err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+	dispatchResult, err := svc.DispatchTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("dispatch tasks: %v", err)
+	}
+
+	backendContext, err := svc.GenerateTaskContext(ctx, project.ID, dispatchResult.Tasks[0].ID)
+	if err != nil {
+		t.Fatalf("generate backend context: %v", err)
+	}
+	frontendContext, err := svc.GenerateTaskContext(ctx, project.ID, dispatchResult.Tasks[1].ID)
+	if err != nil {
+		t.Fatalf("generate frontend context: %v", err)
+	}
+
+	if backendContext.Context.Role != "backend" {
+		t.Fatalf("expected backend role, got %s", backendContext.Context.Role)
+	}
+	if frontendContext.Context.Role != "frontend" {
+		t.Fatalf("expected frontend role, got %s", frontendContext.Context.Role)
+	}
+	if len(backendContext.Context.Sources) != 3 {
+		t.Fatalf("expected 3 context sources, got %d", len(backendContext.Context.Sources))
+	}
+	if backendContext.Context.Sections[2].Title != "API Contract" {
+		t.Fatalf("expected backend API Contract section, got %s", backendContext.Context.Sections[2].Title)
+	}
+	if frontendContext.Context.Sections[1].Title != "UX Scope" {
+		t.Fatalf("expected frontend UX Scope section, got %s", frontendContext.Context.Sections[1].Title)
+	}
+	if strings.Join(backendContext.Context.Sections[2].Items, " ") == strings.Join(frontendContext.Context.Sections[2].Items, " ") {
+		t.Fatal("expected backend and frontend context sections to be different")
+	}
+}
+
+func TestGenerateTaskContextVersioning(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-context-version",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Context Version Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo 全栈功能",
+		Content: "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if _, err := svc.GenerateContract(ctx, project.ID); err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+	dispatchResult, err := svc.DispatchTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("dispatch tasks: %v", err)
+	}
+
+	first, err := svc.GenerateTaskContext(ctx, project.ID, dispatchResult.Tasks[0].ID)
+	if err != nil {
+		t.Fatalf("generate first context: %v", err)
+	}
+	second, err := svc.GenerateTaskContext(ctx, project.ID, dispatchResult.Tasks[0].ID)
+	if err != nil {
+		t.Fatalf("generate second context: %v", err)
+	}
+	if first.Context.Version != 1 || second.Context.Version != 2 {
+		t.Fatalf("expected versions 1 and 2, got %d and %d", first.Context.Version, second.Context.Version)
+	}
+
+	latest, err := svc.GetLatestTaskContext(ctx, project.ID, dispatchResult.Tasks[0].ID)
+	if err != nil {
+		t.Fatalf("get latest context: %v", err)
+	}
+	if latest.Context.Version != 2 {
+		t.Fatalf("expected latest context version 2, got %d", latest.Context.Version)
+	}
+}
+
+func TestStatusMatrixAggregatesTasksAndAgents(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-status-matrix",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Status Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:       "实现 Todo 全栈功能",
+		Content:     "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+		Constraints: []string{"后端使用 Go", "前端使用 Vue"},
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if _, err := svc.GenerateContract(ctx, project.ID); err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+	dispatchResult, err := svc.DispatchTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("dispatch tasks: %v", err)
+	}
+	parallelResult, err := svc.StartParallelRun(ctx, project.ID, ParallelRunInput{
+		TaskIDs: []string{dispatchResult.Tasks[0].ID, dispatchResult.Tasks[1].ID},
+	})
+	if err != nil {
+		t.Fatalf("start parallel run: %v", err)
+	}
+	for _, started := range parallelResult.Started {
+		waitForSucceededRun(t, svc, project.ID, started.Run.ID)
+	}
+
+	matrixView, err := svc.GetStatusMatrix(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("get status matrix: %v", err)
+	}
+	if matrixView.SelectedProjectID != project.ID {
+		t.Fatalf("expected selected project id %s, got %s", project.ID, matrixView.SelectedProjectID)
+	}
+	if len(matrixView.Matrices) != 1 {
+		t.Fatalf("expected 1 matrix, got %d", len(matrixView.Matrices))
+	}
+
+	matrix := matrixView.Matrices[0]
+	if matrix.TotalTasks < 4 {
+		t.Fatalf("expected at least 4 tasks, got %d", matrix.TotalTasks)
+	}
+	if matrix.CompletedTasks < 2 {
+		t.Fatalf("expected at least 2 completed tasks, got %d", matrix.CompletedTasks)
+	}
+	if matrix.ReadyTasks < 1 {
+		t.Fatalf("expected at least 1 ready task, got %d", matrix.ReadyTasks)
+	}
+
+	foundBackend := false
+	foundIntegration := false
+	for _, agent := range matrix.AgentMatrix {
+		if agent.Agent == "go-backend-agent" && agent.Status == "COMPLETED" {
+			foundBackend = true
+		}
+		if agent.Agent == "integration-agent" && agent.Status == "READY" {
+			foundIntegration = true
+		}
+	}
+	if !foundBackend {
+		t.Fatal("expected go-backend-agent to appear as COMPLETED")
+	}
+	if !foundIntegration {
+		t.Fatal("expected integration-agent to appear as READY")
 	}
 }
 

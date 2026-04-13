@@ -56,6 +56,8 @@ type Service struct {
 	plans         map[string][]*domain.Plan
 	contractIndex map[string]*domain.Contract
 	contracts     map[string][]*domain.Contract
+	contextIndex  map[string]*domain.ContextInjection
+	contexts      map[string][]*domain.ContextInjection
 	tasks         map[string]*domain.Task
 	taskOrder     map[string][]string
 	runs          map[string]*domain.AgentRun
@@ -136,6 +138,49 @@ type ParallelRunResult struct {
 	BlockedTasks []domain.Task `json:"blockedTasks,omitempty"`
 }
 
+type TaskContextEnvelope struct {
+	Task    domain.Task             `json:"task"`
+	Context domain.ContextInjection `json:"context"`
+}
+
+type StatusMatrixAgent struct {
+	Agent        string `json:"agent"`
+	Status       string `json:"status"`
+	CreatedTasks int    `json:"createdTasks"`
+	RunningTasks int    `json:"runningTasks"`
+	DoneTasks    int    `json:"doneTasks"`
+	FailedTasks  int    `json:"failedTasks"`
+	TotalTasks   int    `json:"totalTasks"`
+}
+
+type StatusMatrixTask struct {
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	Type            string            `json:"type"`
+	AssigneeAgent   string            `json:"assigneeAgent"`
+	Status          domain.TaskStatus `json:"status"`
+	DependsOn       []string          `json:"dependsOn,omitempty"`
+	LatestRunStatus domain.RunStatus  `json:"latestRunStatus,omitempty"`
+}
+
+type StatusMatrixProject struct {
+	Project        domain.Project      `json:"project"`
+	AgentMatrix    []StatusMatrixAgent `json:"agentMatrix"`
+	TaskMatrix     []StatusMatrixTask  `json:"taskMatrix"`
+	TotalTasks     int                 `json:"totalTasks"`
+	ReadyTasks     int                 `json:"readyTasks"`
+	RunningTasks   int                 `json:"runningTasks"`
+	CompletedTasks int                 `json:"completedTasks"`
+	FailedTasks    int                 `json:"failedTasks"`
+}
+
+type StatusMatrixView struct {
+	Projects          []domain.Project      `json:"projects"`
+	SelectedProjectID string                `json:"selectedProjectId,omitempty"`
+	Matrices          []StatusMatrixProject `json:"matrices"`
+	GeneratedAt       time.Time             `json:"generatedAt"`
+}
+
 func New(cfg config.Config, logger *slog.Logger) *Service {
 	return &Service{
 		cfg:           cfg,
@@ -146,6 +191,8 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		plans:         make(map[string][]*domain.Plan),
 		contractIndex: make(map[string]*domain.Contract),
 		contracts:     make(map[string][]*domain.Contract),
+		contextIndex:  make(map[string]*domain.ContextInjection),
+		contexts:      make(map[string][]*domain.ContextInjection),
 		tasks:         make(map[string]*domain.Task),
 		taskOrder:     make(map[string][]string),
 		runs:          make(map[string]*domain.AgentRun),
@@ -175,6 +222,28 @@ func (s *Service) CreateProject(_ context.Context, input CreateProjectInput) (*d
 	s.mu.Unlock()
 
 	return cloneProject(project), nil
+}
+
+func (s *Service) ListProjects(_ context.Context) ([]domain.Project, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	projects := make([]domain.Project, 0, len(s.projects))
+	for _, project := range s.projects {
+		projects = append(projects, *cloneProject(project))
+	}
+	slices.SortFunc(projects, func(a, b domain.Project) int {
+		switch {
+		case a.CreatedAt.Before(b.CreatedAt):
+			return -1
+		case a.CreatedAt.After(b.CreatedAt):
+			return 1
+		default:
+			return strings.Compare(a.ID, b.ID)
+		}
+	})
+
+	return projects, nil
 }
 
 func (s *Service) GetProject(_ context.Context, projectID string) (*domain.Project, error) {
@@ -343,6 +412,113 @@ func (s *Service) GetContract(_ context.Context, projectID, contractID string) (
 	}
 
 	return cloneContract(contract), nil
+}
+
+func (s *Service) GenerateTaskContext(_ context.Context, projectID, taskID string) (*TaskContextEnvelope, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	task, err := s.resolveTaskLocked(projectID, taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	plan, ok := s.planIndex[task.PlanID]
+	if !ok {
+		return nil, newNotFoundError("plan not found for task")
+	}
+
+	contract, err := s.resolveTaskContractLocked(projectID, task)
+	if err != nil {
+		return nil, err
+	}
+
+	requirement, err := resolveRequirementByID(s.requirements[projectID], plan.RequirementID)
+	if err != nil {
+		return nil, err
+	}
+
+	version := len(s.contexts[task.ID]) + 1
+	injection := buildTaskContextInjection(task, plan, contract, requirement, version, now)
+	s.contextIndex[injection.ID] = injection
+	s.contexts[task.ID] = append(s.contexts[task.ID], injection)
+
+	return &TaskContextEnvelope{
+		Task:    *cloneTask(task),
+		Context: *cloneContextInjection(injection),
+	}, nil
+}
+
+func (s *Service) GetLatestTaskContext(_ context.Context, projectID, taskID string) (*TaskContextEnvelope, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	task, ok := s.tasks[taskID]
+	if !ok || task.ProjectID != projectID {
+		return nil, newNotFoundError("task not found")
+	}
+
+	history := s.contexts[taskID]
+	if len(history) == 0 {
+		return nil, newNotFoundError("context not found for task")
+	}
+
+	latest := history[len(history)-1]
+	return &TaskContextEnvelope{
+		Task:    *cloneTask(task),
+		Context: *cloneContextInjection(latest),
+	}, nil
+}
+
+func (s *Service) GetStatusMatrix(_ context.Context, selectedProjectID string) (*StatusMatrixView, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	projects := make([]domain.Project, 0, len(s.projects))
+	for _, project := range s.projects {
+		projects = append(projects, *cloneProject(project))
+	}
+	slices.SortFunc(projects, func(a, b domain.Project) int {
+		switch {
+		case a.CreatedAt.Before(b.CreatedAt):
+			return -1
+		case a.CreatedAt.After(b.CreatedAt):
+			return 1
+		default:
+			return strings.Compare(a.ID, b.ID)
+		}
+	})
+
+	if selectedProjectID != "" {
+		if _, ok := s.projects[selectedProjectID]; !ok {
+			return nil, newNotFoundError("project not found")
+		}
+	}
+
+	matrices := make([]StatusMatrixProject, 0, len(projects))
+	for _, project := range projects {
+		if selectedProjectID != "" && project.ID != selectedProjectID {
+			continue
+		}
+		matrices = append(matrices, s.buildProjectStatusMatrixLocked(project))
+	}
+
+	return &StatusMatrixView{
+		Projects:          projects,
+		SelectedProjectID: selectedProjectID,
+		Matrices:          matrices,
+		GeneratedAt:       time.Now().UTC(),
+	}, nil
 }
 
 func (s *Service) ListTasks(_ context.Context, projectID string) ([]domain.Task, error) {
@@ -848,6 +1024,126 @@ func (s *Service) resolveLatestPlanAndContractLocked(projectID string) (*domain.
 	return plans[len(plans)-1], contracts[len(contracts)-1], nil
 }
 
+func (s *Service) buildProjectStatusMatrixLocked(project domain.Project) StatusMatrixProject {
+	order := s.taskOrder[project.ID]
+	taskMatrix := make([]StatusMatrixTask, 0, len(order))
+	agentMap := make(map[string]*StatusMatrixAgent)
+
+	var readyTasks, runningTasks, completedTasks, failedTasks int
+	for _, taskID := range order {
+		task, ok := s.tasks[taskID]
+		if !ok {
+			continue
+		}
+
+		latestRunStatus := s.latestRunStatusForTaskLocked(project.ID, task.ID)
+		taskMatrix = append(taskMatrix, StatusMatrixTask{
+			ID:              task.ID,
+			Name:            task.Name,
+			Type:            task.Type,
+			AssigneeAgent:   task.AssigneeAgent,
+			Status:          task.Status,
+			DependsOn:       append([]string(nil), task.DependsOn...),
+			LatestRunStatus: latestRunStatus,
+		})
+
+		switch task.Status {
+		case domain.TaskStatusCreated:
+			readyTasks++
+		case domain.TaskStatusInProgress:
+			runningTasks++
+		case domain.TaskStatusDone:
+			completedTasks++
+		case domain.TaskStatusFailed:
+			failedTasks++
+		}
+
+		agentName := task.AssigneeAgent
+		if strings.TrimSpace(agentName) == "" {
+			agentName = s.cfg.DefaultAgent
+		}
+		agent, ok := agentMap[agentName]
+		if !ok {
+			agent = &StatusMatrixAgent{Agent: agentName}
+			agentMap[agentName] = agent
+		}
+		agent.TotalTasks++
+		switch task.Status {
+		case domain.TaskStatusCreated:
+			agent.CreatedTasks++
+		case domain.TaskStatusInProgress:
+			agent.RunningTasks++
+		case domain.TaskStatusDone:
+			agent.DoneTasks++
+		case domain.TaskStatusFailed:
+			agent.FailedTasks++
+		}
+	}
+
+	agentMatrix := make([]StatusMatrixAgent, 0, len(agentMap))
+	for _, agent := range agentMap {
+		agent.Status = deriveAgentMatrixStatus(*agent)
+		agentMatrix = append(agentMatrix, *agent)
+	}
+	slices.SortFunc(agentMatrix, func(a, b StatusMatrixAgent) int {
+		return strings.Compare(a.Agent, b.Agent)
+	})
+
+	return StatusMatrixProject{
+		Project:        project,
+		AgentMatrix:    agentMatrix,
+		TaskMatrix:     taskMatrix,
+		TotalTasks:     len(taskMatrix),
+		ReadyTasks:     readyTasks,
+		RunningTasks:   runningTasks,
+		CompletedTasks: completedTasks,
+		FailedTasks:    failedTasks,
+	}
+}
+
+func (s *Service) latestRunStatusForTaskLocked(projectID, taskID string) domain.RunStatus {
+	runIDs := s.runOrder[projectID]
+	for idx := len(runIDs) - 1; idx >= 0; idx-- {
+		run, ok := s.runs[runIDs[idx]]
+		if !ok || run.TaskID != taskID {
+			continue
+		}
+		return run.Status
+	}
+	return ""
+}
+
+func deriveAgentMatrixStatus(agent StatusMatrixAgent) string {
+	switch {
+	case agent.FailedTasks > 0:
+		return "BLOCKED"
+	case agent.RunningTasks > 0:
+		return "RUNNING"
+	case agent.CreatedTasks > 0:
+		return "READY"
+	case agent.DoneTasks > 0:
+		return "COMPLETED"
+	default:
+		return "IDLE"
+	}
+}
+
+func (s *Service) resolveTaskContractLocked(projectID string, task *domain.Task) (*domain.Contract, error) {
+	if strings.HasPrefix(task.InputRef, "contract://") {
+		contractID := strings.TrimPrefix(task.InputRef, "contract://")
+		contract, ok := s.contractIndex[contractID]
+		if ok && contract.ProjectID == projectID {
+			return contract, nil
+		}
+	}
+
+	contracts := s.contracts[projectID]
+	if len(contracts) == 0 {
+		return nil, newNotFoundError("contract not found for task")
+	}
+	return contracts[len(contracts)-1], nil
+}
+
 func (s *Service) findDispatchedTasksLocked(projectID, planID, contractID string) []*domain.Task {
 	expectedInputRef := fmt.Sprintf("contract://%s", contractID)
 	result := make([]*domain.Task, 0, 3)
@@ -1100,6 +1396,177 @@ func buildContract(req *domain.Requirement, plan *domain.Plan, version int, now 
 		},
 		CreatedAt: now,
 	}
+}
+
+func buildTaskContextInjection(task *domain.Task, plan *domain.Plan, contract *domain.Contract, requirement *domain.Requirement, version int, now time.Time) *domain.ContextInjection {
+	role := deriveTaskContextRole(task)
+	return &domain.ContextInjection{
+		ID:        nextID("ctx"),
+		ProjectID: task.ProjectID,
+		TaskID:    task.ID,
+		Role:      role,
+		Version:   version,
+		Summary:   fmt.Sprintf("%s context for task %s", role, task.Name),
+		Sources: []domain.ContextSource{
+			{Kind: "requirement", Ref: "requirement://" + requirement.ID},
+			{Kind: "plan", Ref: "plan://" + plan.ID, Version: fmt.Sprintf("v%d", plan.Version)},
+			{Kind: "contract", Ref: "contract://" + contract.ID, Version: fmt.Sprintf("v%d", contract.Version)},
+		},
+		Sections:  buildContextSections(task, plan, contract, requirement, role),
+		CreatedAt: now,
+	}
+}
+
+func deriveTaskContextRole(task *domain.Task) string {
+	switch task.Type {
+	case "BACKEND_IMPLEMENTATION":
+		return "backend"
+	case "FRONTEND_IMPLEMENTATION":
+		return "frontend"
+	case "INTEGRATION_REVIEW":
+		return "integration"
+	default:
+		return "general"
+	}
+}
+
+func buildContextSections(task *domain.Task, plan *domain.Plan, contract *domain.Contract, requirement *domain.Requirement, role string) []domain.ContextSection {
+	switch role {
+	case "backend":
+		return []domain.ContextSection{
+			{
+				Title: "Execution Focus",
+				Items: []string{
+					"实现后端 API 与数据模型，优先满足契约而不是扩展范围。",
+					"只关注服务端职责，避免把 UI 细节带入后端实现。",
+				},
+			},
+			{
+				Title: "Requirement Signals",
+				Items: compactStrings(append([]string{requirement.Title, requirement.Content}, filterConstraints(requirement.Constraints, "backend")...)),
+			},
+			{
+				Title: "API Contract",
+				Items: renderContextEndpoints(contract.Endpoints),
+			},
+			{
+				Title: "Data Schemas",
+				Items: renderContextSchemas(contract.Schemas),
+			},
+		}
+	case "frontend":
+		return []domain.ContextSection{
+			{
+				Title: "Execution Focus",
+				Items: []string{
+					"围绕用户交互和页面状态组织实现，避免扩展后端内部细节。",
+					"优先消费既有契约，确保字段展示和交互流程与验收一致。",
+				},
+			},
+			{
+				Title: "UX Scope",
+				Items: compactStrings(append([]string{}, plan.Scope...)),
+			},
+			{
+				Title: "Acceptance Criteria",
+				Items: compactStrings(append([]string{}, plan.AcceptanceCriteria...)),
+			},
+			{
+				Title: "API Consumption",
+				Items: renderContextEndpointSummaries(contract.Endpoints),
+			},
+		}
+	case "integration":
+		return []domain.ContextSection{
+			{
+				Title: "Execution Focus",
+				Items: []string{
+					"检查前后端产物是否满足同一份契约，并准备共享交付包。",
+					"优先关注依赖完成状态、契约一致性和验收标准闭环。",
+				},
+			},
+			{
+				Title: "Dependencies",
+				Items: renderDependencyItems(task.DependsOn),
+			},
+			{
+				Title: "Contract Summary",
+				Items: []string{contract.Summary},
+			},
+			{
+				Title: "Acceptance Criteria",
+				Items: compactStrings(append([]string{}, plan.AcceptanceCriteria...)),
+			},
+		}
+	default:
+		return []domain.ContextSection{
+			{
+				Title: "Goal",
+				Items: []string{plan.Goal},
+			},
+			{
+				Title: "Requirement",
+				Items: []string{requirement.Content},
+			},
+		}
+	}
+}
+
+func filterConstraints(items []string, role string) []string {
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		lower := strings.ToLower(item)
+		switch role {
+		case "backend":
+			if strings.Contains(lower, "go") || strings.Contains(lower, "后端") || strings.Contains(lower, "api") || strings.Contains(lower, "数据") {
+				result = append(result, item)
+			}
+		case "frontend":
+			if strings.Contains(lower, "vue") || strings.Contains(lower, "前端") || strings.Contains(lower, "ui") || strings.Contains(lower, "交互") {
+				result = append(result, item)
+			}
+		}
+	}
+	return result
+}
+
+func renderContextEndpoints(items []domain.ContractEndpoint) []string {
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		result = append(result, fmt.Sprintf("%s %s (%s)", item.Method, item.Path, item.Name))
+	}
+	return result
+}
+
+func renderContextEndpointSummaries(items []domain.ContractEndpoint) []string {
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		result = append(result, fmt.Sprintf("%s %s", item.Method, item.Path))
+	}
+	return result
+}
+
+func renderContextSchemas(items []domain.ContractSchema) []string {
+	result := make([]string, 0, len(items))
+	for _, schema := range items {
+		fields := make([]string, 0, len(schema.Fields))
+		for _, field := range schema.Fields {
+			fields = append(fields, fmt.Sprintf("%s:%s", field.Name, field.Type))
+		}
+		result = append(result, fmt.Sprintf("%s => %s", schema.Name, strings.Join(fields, ", ")))
+	}
+	return result
+}
+
+func renderDependencyItems(items []string) []string {
+	if len(items) == 0 {
+		return []string{"No dependencies"}
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		result = append(result, "task://"+item)
+	}
+	return result
 }
 
 func validateContractDefinition(contract *domain.Contract, endpoints []domain.ContractEndpoint, schemas []domain.ContractSchema) []ContractValidationConflict {
@@ -1546,6 +2013,21 @@ func cloneTask(task *domain.Task) *domain.Task {
 	copy := *task
 	copy.DependsOn = append([]string(nil), task.DependsOn...)
 	copy.Audit = append([]domain.TaskTransition(nil), task.Audit...)
+	return &copy
+}
+
+func cloneContextInjection(injection *domain.ContextInjection) *domain.ContextInjection {
+	if injection == nil {
+		return nil
+	}
+	copy := *injection
+	copy.Sources = append([]domain.ContextSource(nil), injection.Sources...)
+	copy.Sections = make([]domain.ContextSection, 0, len(injection.Sections))
+	for _, section := range injection.Sections {
+		sectionCopy := section
+		sectionCopy.Items = append([]string(nil), section.Items...)
+		copy.Sections = append(copy.Sections, sectionCopy)
+	}
 	return &copy
 }
 

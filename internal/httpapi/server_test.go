@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -260,6 +261,127 @@ func TestHTTPParallelDispatchFlow(t *testing.T) {
 
 	if taskList.Count < 4 {
 		t.Fatalf("expected at least 4 tasks including sprint1 seed and dispatched tasks, got %d", taskList.Count)
+	}
+}
+
+func TestHTTPTaskContextFlow(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-context",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Todo Context Demo",
+	})
+
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{
+		"title":       "实现 Todo 全栈功能",
+		"content":     "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+		"constraints": []string{"后端使用 Go", "前端使用 Vue"},
+	})
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{})
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/contracts/generate", map[string]any{})
+
+	dispatchBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/dispatch", map[string]any{})
+	var dispatchResult service.DispatchTasksResult
+	decodeResponse(t, dispatchBody, &dispatchResult)
+
+	contextBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/"+dispatchResult.Tasks[0].ID+"/context/generate", map[string]any{})
+	var generated service.TaskContextEnvelope
+	decodeResponse(t, contextBody, &generated)
+
+	if generated.Context.Version != 1 {
+		t.Fatalf("expected context version 1, got %d", generated.Context.Version)
+	}
+	if generated.Context.Role != "backend" {
+		t.Fatalf("expected backend role, got %s", generated.Context.Role)
+	}
+
+	latestBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/tasks/"+dispatchResult.Tasks[0].ID+"/context")
+	var latest service.TaskContextEnvelope
+	decodeResponse(t, latestBody, &latest)
+
+	if latest.Context.ID != generated.Context.ID {
+		t.Fatalf("expected latest context id %s, got %s", generated.Context.ID, latest.Context.ID)
+	}
+	if len(latest.Context.Sources) != 3 {
+		t.Fatalf("expected 3 context sources, got %d", len(latest.Context.Sources))
+	}
+}
+
+func TestHTTPStatusMatrixAndPanel(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-status-panel",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Todo Status Demo",
+	})
+
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{
+		"title":       "实现 Todo 全栈功能",
+		"content":     "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+		"constraints": []string{"后端使用 Go", "前端使用 Vue"},
+	})
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{})
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/contracts/generate", map[string]any{})
+	dispatchBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/dispatch", map[string]any{})
+	var dispatchResult service.DispatchTasksResult
+	decodeResponse(t, dispatchBody, &dispatchResult)
+	parallelBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/runs/parallel", map[string]any{
+		"taskIds": []string{dispatchResult.Tasks[0].ID, dispatchResult.Tasks[1].ID},
+	})
+	var parallelResult service.ParallelRunResult
+	decodeResponse(t, parallelBody, &parallelResult)
+	for _, started := range parallelResult.Started {
+		waitForHTTPRun(t, server, project.ID, started.Run.ID)
+	}
+
+	matrixBody := getJSON(t, server.Client(), server.URL+"/status/matrix?projectId="+project.ID)
+	var matrix service.StatusMatrixView
+	decodeResponse(t, matrixBody, &matrix)
+
+	if len(matrix.Matrices) != 1 {
+		t.Fatalf("expected 1 matrix, got %d", len(matrix.Matrices))
+	}
+	if matrix.SelectedProjectID != project.ID {
+		t.Fatalf("expected selected project id %s, got %s", project.ID, matrix.SelectedProjectID)
+	}
+
+	resp, err := server.Client().Get(server.URL + "/status/panel")
+	if err != nil {
+		t.Fatalf("get status panel: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read status panel: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status panel 200, got %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "Status Matrix") {
+		t.Fatalf("expected status panel html to contain title, got %s", string(body))
 	}
 }
 

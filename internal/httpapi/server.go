@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -28,6 +29,8 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", server.handleHealth)
+	mux.HandleFunc("GET /status/matrix", server.handleGetStatusMatrix)
+	mux.HandleFunc("GET /status/panel", server.handleStatusPanel)
 	mux.HandleFunc("POST /projects", server.handleCreateProject)
 	mux.HandleFunc("GET /projects/{id}", server.handleGetProject)
 	mux.HandleFunc("POST /projects/{id}/requirements", server.handleAddRequirement)
@@ -39,6 +42,8 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("GET /projects/{id}/contracts/{contractId}", server.handleGetContract)
 	mux.HandleFunc("GET /projects/{id}/tasks", server.handleListTasks)
 	mux.HandleFunc("POST /projects/{id}/tasks/dispatch", server.handleDispatchTasks)
+	mux.HandleFunc("GET /projects/{id}/tasks/{taskId}/context", server.handleGetTaskContext)
+	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/context/generate", server.handleGenerateTaskContext)
 	mux.HandleFunc("POST /projects/{id}/tasks/run", server.handleStartRun)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/retry", server.handleRetryTask)
 	mux.HandleFunc("POST /projects/{id}/runs/parallel", server.handleStartParallelRun)
@@ -55,6 +60,21 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"service":   s.cfg.ServiceName,
 		"timestamp": time.Now().UTC(),
 	})
+}
+
+func (s *Server) handleGetStatusMatrix(w http.ResponseWriter, r *http.Request) {
+	result, err := s.svc.GetStatusMatrix(r.Context(), r.URL.Query().Get("projectId"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleStatusPanel(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(renderStatusPanelHTML(s.cfg.ServiceName)))
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
@@ -190,6 +210,26 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDispatchTasks(w http.ResponseWriter, r *http.Request) {
 	result, err := s.svc.DispatchTasks(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, result)
+}
+
+func (s *Server) handleGetTaskContext(w http.ResponseWriter, r *http.Request) {
+	result, err := s.svc.GetLatestTaskContext(r.Context(), r.PathValue("id"), r.PathValue("taskId"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleGenerateTaskContext(w http.ResponseWriter, r *http.Request) {
+	result, err := s.svc.GenerateTaskContext(r.Context(), r.PathValue("id"), r.PathValue("taskId"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -403,4 +443,270 @@ func requestIDFromContext(ctx context.Context) string {
 
 func generateRequestID() string {
 	return time.Now().UTC().Format("20060102T150405.000000000")
+}
+
+func renderStatusPanelHTML(serviceName string) string {
+	return fmt.Sprintf(`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>%s Status Matrix</title>
+  <style>
+    :root {
+      --bg: #f4efe7;
+      --card: rgba(255, 252, 247, 0.92);
+      --line: #d6cab8;
+      --ink: #1f1b16;
+      --muted: #6a5d4d;
+      --accent: #165dff;
+      --accent-soft: rgba(22, 93, 255, 0.12);
+      --ok: #0f8b4c;
+      --warn: #b7791f;
+      --bad: #b42318;
+      --idle: #7c8798;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(22, 93, 255, 0.12), transparent 28%%),
+        radial-gradient(circle at bottom right, rgba(180, 35, 24, 0.08), transparent 24%%),
+        linear-gradient(180deg, #fbf7f1 0%%, var(--bg) 100%%);
+    }
+    .shell {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    .hero {
+      display: grid;
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .eyebrow {
+      font-size: 12px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(32px, 5vw, 52px);
+      line-height: 0.94;
+    }
+    .sub {
+      max-width: 680px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.5;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin: 20px 0 28px;
+    }
+    .toolbar select,
+    .toolbar button {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--card);
+      color: var(--ink);
+      padding: 10px 16px;
+      font: inherit;
+    }
+    .toolbar button {
+      background: var(--ink);
+      color: #fff;
+      cursor: pointer;
+    }
+    .grid {
+      display: grid;
+      gap: 18px;
+    }
+    .panel {
+      background: var(--card);
+      backdrop-filter: blur(14px);
+      border: 1px solid rgba(214, 202, 184, 0.8);
+      border-radius: 24px;
+      box-shadow: 0 18px 60px rgba(31, 27, 22, 0.08);
+      padding: 20px;
+    }
+    .project-head {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .meta {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .pill {
+      border-radius: 999px;
+      padding: 6px 10px;
+      background: #fff;
+      border: 1px solid var(--line);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+    }
+    .RUNNING .dot { background: var(--accent); }
+    .READY .dot { background: var(--warn); }
+    .BLOCKED .dot { background: var(--bad); }
+    .COMPLETED .dot { background: var(--ok); }
+    .IDLE .dot { background: var(--idle); }
+    table {
+      width: 100%%;
+      border-collapse: collapse;
+      margin-top: 12px;
+    }
+    th, td {
+      text-align: left;
+      padding: 12px 10px;
+      border-top: 1px solid rgba(214, 202, 184, 0.7);
+      vertical-align: top;
+      font-size: 14px;
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .empty {
+      padding: 28px;
+      border: 1px dashed var(--line);
+      border-radius: 20px;
+      color: var(--muted);
+      text-align: center;
+      background: rgba(255,255,255,0.5);
+    }
+    .foot {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    @media (max-width: 760px) {
+      .panel { padding: 16px; }
+      th:nth-child(3), td:nth-child(3),
+      th:nth-child(5), td:nth-child(5) { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="hero">
+      <div class="eyebrow">Operational View</div>
+      <h1>Status Matrix</h1>
+      <div class="sub">查看每个项目下任务和 Agent 的当前状态。这个最小版面板会自动刷新，适合演示 Sprint 2 的协同编排进度。</div>
+    </div>
+    <div class="toolbar">
+      <select id="projectFilter"></select>
+      <button id="refreshBtn" type="button">Refresh Now</button>
+      <div id="generatedAt" class="pill">loading...</div>
+    </div>
+    <div id="app" class="grid"></div>
+  </div>
+  <script>
+    const filter = document.getElementById("projectFilter");
+    const refreshBtn = document.getElementById("refreshBtn");
+    const app = document.getElementById("app");
+    const generatedAt = document.getElementById("generatedAt");
+
+    function statusBadge(status) {
+      return '<span class="status ' + status + '"><span class="dot"></span>' + status + '</span>';
+    }
+
+    function renderMatrix(view) {
+      const selected = view.selectedProjectId || "";
+      const options = ['<option value="">All Projects</option>']
+        .concat((view.projects || []).map(project =>
+          '<option value="' + project.id + '"' + (project.id === selected ? ' selected' : '') + '>' + project.name + '</option>'
+        ));
+      filter.innerHTML = options.join("");
+      generatedAt.textContent = view.generatedAt ? 'Generated at ' + new Date(view.generatedAt).toLocaleString() : 'No data';
+
+      if (!view.matrices || view.matrices.length === 0) {
+        app.innerHTML = '<div class="empty">还没有可展示的项目状态。先创建项目并派发任务，再回来查看。</div>';
+        return;
+      }
+
+      app.innerHTML = view.matrices.map(function(matrix) {
+        const project = matrix.project;
+        const agentRows = (matrix.agentMatrix || []).map(function(agent) {
+          return '<tr>'
+            + '<td>' + agent.agent + '</td>'
+            + '<td>' + statusBadge(agent.status) + '</td>'
+            + '<td>' + agent.totalTasks + '</td>'
+            + '<td>' + agent.runningTasks + '</td>'
+            + '<td>' + agent.doneTasks + '</td>'
+            + '<td>' + agent.failedTasks + '</td>'
+            + '</tr>';
+        }).join("");
+
+        const taskRows = (matrix.taskMatrix || []).map(function(task) {
+          return '<tr>'
+            + '<td>' + task.name + '</td>'
+            + '<td>' + (task.assigneeAgent || '-') + '</td>'
+            + '<td>' + task.type + '</td>'
+            + '<td>' + task.status + '</td>'
+            + '<td>' + (task.latestRunStatus || '-') + '</td>'
+            + '<td>' + ((task.dependsOn || []).join(', ') || '-') + '</td>'
+            + '</tr>';
+        }).join("");
+
+        return '<section class="panel">'
+          + '<div class="project-head">'
+          +   '<div>'
+          +     '<div class="eyebrow">Project</div>'
+          +     '<h2 style="margin:6px 0 0;">' + project.name + '</h2>'
+          +   '</div>'
+          +   '<div class="meta">'
+          +     '<span class="pill">Ready ' + matrix.readyTasks + '</span>'
+          +     '<span class="pill">Running ' + matrix.runningTasks + '</span>'
+          +     '<span class="pill">Done ' + matrix.completedTasks + '</span>'
+          +     '<span class="pill">Failed ' + matrix.failedTasks + '</span>'
+          +   '</div>'
+          + '</div>'
+          + '<table>'
+          +   '<thead><tr><th>Agent</th><th>Status</th><th>Total</th><th>Running</th><th>Done</th><th>Failed</th></tr></thead>'
+          +   '<tbody>' + (agentRows || '<tr><td colspan="6">No agents</td></tr>') + '</tbody>'
+          + '</table>'
+          + '<table>'
+          +   '<thead><tr><th>Task</th><th>Agent</th><th>Type</th><th>Status</th><th>Latest Run</th><th>Depends On</th></tr></thead>'
+          +   '<tbody>' + (taskRows || '<tr><td colspan="6">No tasks</td></tr>') + '</tbody>'
+          + '</table>'
+          + '</section>';
+      }).join("");
+    }
+
+    async function load() {
+      const value = filter.value ? '?projectId=' + encodeURIComponent(filter.value) : '';
+      const response = await fetch('/status/matrix' + value, { headers: { 'Accept': 'application/json' } });
+      const data = await response.json();
+      renderMatrix(data);
+    }
+
+    filter.addEventListener('change', load);
+    refreshBtn.addEventListener('click', load);
+    load();
+    setInterval(load, 4000);
+  </script>
+</body>
+</html>`, serviceName)
 }
