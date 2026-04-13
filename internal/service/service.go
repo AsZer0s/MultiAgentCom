@@ -58,6 +58,9 @@ type Service struct {
 	contracts     map[string][]*domain.Contract
 	contextIndex  map[string]*domain.ContextInjection
 	contexts      map[string][]*domain.ContextInjection
+	sandboxIndex  map[string]*domain.Sandbox
+	sandboxes     map[string][]*domain.Sandbox
+	sandboxFaults map[string]string
 	tasks         map[string]*domain.Task
 	taskOrder     map[string][]string
 	runs          map[string]*domain.AgentRun
@@ -181,7 +184,21 @@ type StatusMatrixView struct {
 	GeneratedAt       time.Time             `json:"generatedAt"`
 }
 
+type SandboxView struct {
+	Sandbox domain.Sandbox  `json:"sandbox"`
+	Run     domain.AgentRun `json:"run"`
+	Task    domain.Task     `json:"task"`
+}
+
+type InjectSandboxFailureInput struct {
+	Reason string `json:"reason"`
+}
+
 func New(cfg config.Config, logger *slog.Logger) *Service {
+	if strings.TrimSpace(cfg.SandboxRoot) == "" {
+		cfg.SandboxRoot = filepath.Join(os.TempDir(), "multiagentcom", "sandboxes")
+	}
+
 	return &Service{
 		cfg:           cfg,
 		logger:        logger,
@@ -193,6 +210,9 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		contracts:     make(map[string][]*domain.Contract),
 		contextIndex:  make(map[string]*domain.ContextInjection),
 		contexts:      make(map[string][]*domain.ContextInjection),
+		sandboxIndex:  make(map[string]*domain.Sandbox),
+		sandboxes:     make(map[string][]*domain.Sandbox),
+		sandboxFaults: make(map[string]string),
 		tasks:         make(map[string]*domain.Task),
 		taskOrder:     make(map[string][]string),
 		runs:          make(map[string]*domain.AgentRun),
@@ -222,6 +242,35 @@ func (s *Service) CreateProject(_ context.Context, input CreateProjectInput) (*d
 	s.mu.Unlock()
 
 	return cloneProject(project), nil
+}
+
+func (s *Service) ListSandboxes(_ context.Context, projectID string) ([]SandboxView, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	items := s.sandboxes[projectID]
+	result := make([]SandboxView, 0, len(items))
+	for _, sandbox := range items {
+		run, ok := s.runs[sandbox.RunID]
+		if !ok {
+			continue
+		}
+		task, ok := s.tasks[sandbox.TaskID]
+		if !ok {
+			continue
+		}
+		result = append(result, SandboxView{
+			Sandbox: *cloneSandbox(sandbox),
+			Run:     *cloneRun(run),
+			Task:    *cloneTask(task),
+		})
+	}
+
+	return result, nil
 }
 
 func (s *Service) ListProjects(_ context.Context) ([]domain.Project, error) {
@@ -480,6 +529,33 @@ func (s *Service) GetLatestTaskContext(_ context.Context, projectID, taskID stri
 	}, nil
 }
 
+func (s *Service) GetRunSandbox(_ context.Context, projectID, runID string) (*SandboxView, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	run, ok := s.runs[runID]
+	if !ok || run.ProjectID != projectID {
+		return nil, newNotFoundError("run not found")
+	}
+	if run.SandboxID == "" {
+		return nil, newNotFoundError("sandbox not found for run")
+	}
+	sandbox, ok := s.sandboxIndex[run.SandboxID]
+	if !ok || sandbox.ProjectID != projectID {
+		return nil, newNotFoundError("sandbox not found")
+	}
+	task, ok := s.tasks[run.TaskID]
+	if !ok {
+		return nil, newNotFoundError("task not found for sandbox")
+	}
+
+	return &SandboxView{
+		Sandbox: *cloneSandbox(sandbox),
+		Run:     *cloneRun(run),
+		Task:    *cloneTask(task),
+	}, nil
+}
+
 func (s *Service) GetStatusMatrix(_ context.Context, selectedProjectID string) (*StatusMatrixView, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -540,6 +616,26 @@ func (s *Service) ListTasks(_ context.Context, projectID string) ([]domain.Task,
 	}
 
 	return result, nil
+}
+
+func (s *Service) MarkTaskSandboxFailure(_ context.Context, projectID, taskID, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return newNotFoundError("project not found")
+	}
+	task, err := s.resolveTaskLocked(projectID, taskID)
+	if err != nil {
+		return err
+	}
+
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "simulated sandbox failure"
+	}
+	s.sandboxFaults[task.ID] = reason
+	return nil
 }
 
 func (s *Service) DispatchTasks(_ context.Context, projectID string) (*DispatchTasksResult, error) {
@@ -838,14 +934,23 @@ func (s *Service) GetArtifact(_ context.Context, projectID, artifactID string) (
 }
 
 func (s *Service) executeRun(runID string) {
-	run, task, plan, project, err := s.snapshotForExecution(runID)
+	run, task, plan, project, sandbox, err := s.snapshotForExecution(runID)
 	if err != nil {
 		s.logger.Error("failed to prepare run snapshot", "runId", runID, "error", err)
 		s.failRun(runID, err)
 		return
 	}
 
-	artifact, summary, err := s.generateDeliveryBundle(project, task, plan, run)
+	if failure := s.sandboxFailureForTask(task.ID); failure != "" {
+		if sandbox != nil {
+			_ = writeFile(filepath.Join(sandbox.RootPath, "sandbox-error.log"), []byte(failure+"\n"))
+		}
+		s.logger.Error("sandbox execution failed", "runId", run.ID, "taskId", task.ID, "sandboxId", run.SandboxID, "error", failure)
+		s.failRun(runID, errors.New(failure))
+		return
+	}
+
+	artifact, summary, err := s.generateDeliveryBundle(project, task, plan, run, sandbox)
 	if err != nil {
 		s.logger.Error("run execution failed", "runId", run.ID, "taskId", task.ID, "error", err)
 		s.failRun(runID, err)
@@ -878,35 +983,46 @@ func (s *Service) executeRun(runID string) {
 	if err := storedTask.TransitionTo(domain.TaskStatusDone, "single agent execution completed", now); err != nil {
 		s.logger.Error("failed to transition task to done", "taskId", storedTask.ID, "error", err)
 	}
+	if storedRun.SandboxID != "" {
+		if sandbox, exists := s.sandboxIndex[storedRun.SandboxID]; exists {
+			sandbox.Status = domain.SandboxStatusReleased
+			sandbox.UpdatedAt = now
+		}
+	}
 
 	s.logger.Info("run execution completed", "runId", storedRun.ID, "taskId", storedTask.ID, "artifactId", artifact.ID)
 }
 
-func (s *Service) snapshotForExecution(runID string) (*domain.AgentRun, *domain.Task, *domain.Plan, *domain.Project, error) {
+func (s *Service) snapshotForExecution(runID string) (*domain.AgentRun, *domain.Task, *domain.Plan, *domain.Project, *domain.Sandbox, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	run, ok := s.runs[runID]
 	if !ok {
-		return nil, nil, nil, nil, errors.New("run not found")
+		return nil, nil, nil, nil, nil, errors.New("run not found")
 	}
 
 	task, ok := s.tasks[run.TaskID]
 	if !ok {
-		return nil, nil, nil, nil, errors.New("task not found")
+		return nil, nil, nil, nil, nil, errors.New("task not found")
 	}
 
 	plan, ok := s.planIndex[task.PlanID]
 	if !ok {
-		return nil, nil, nil, nil, errors.New("plan not found")
+		return nil, nil, nil, nil, nil, errors.New("plan not found")
 	}
 
 	project, ok := s.projects[run.ProjectID]
 	if !ok {
-		return nil, nil, nil, nil, errors.New("project not found")
+		return nil, nil, nil, nil, nil, errors.New("project not found")
 	}
 
-	return cloneRun(run), cloneTask(task), clonePlan(plan), cloneProject(project), nil
+	var sandbox *domain.Sandbox
+	if run.SandboxID != "" {
+		sandbox = cloneSandbox(s.sandboxIndex[run.SandboxID])
+	}
+
+	return cloneRun(run), cloneTask(task), clonePlan(plan), cloneProject(project), sandbox, nil
 }
 
 func (s *Service) failRun(runID string, failure error) {
@@ -923,6 +1039,13 @@ func (s *Service) failRun(runID string, failure error) {
 	run.Status = domain.RunStatusFailed
 	run.Error = failure.Error()
 	run.EndedAt = now
+	if run.SandboxID != "" {
+		if sandbox, exists := s.sandboxIndex[run.SandboxID]; exists {
+			sandbox.Status = domain.SandboxStatusFailed
+			sandbox.FailureReason = failure.Error()
+			sandbox.UpdatedAt = now
+		}
+	}
 
 	if task, exists := s.tasks[run.TaskID]; exists && task.Status == domain.TaskStatusInProgress {
 		if err := task.TransitionTo(domain.TaskStatusFailed, "single agent execution failed", now); err != nil {
@@ -931,9 +1054,12 @@ func (s *Service) failRun(runID string, failure error) {
 	}
 }
 
-func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.Task, plan *domain.Plan, run *domain.AgentRun) (*domain.Artifact, string, error) {
+func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.Task, plan *domain.Plan, run *domain.AgentRun, sandbox *domain.Sandbox) (*domain.Artifact, string, error) {
 	runDir := filepath.Join(s.cfg.ArtifactRoot, project.ID, run.ID)
 	bundleDir := filepath.Join(runDir, "bundle")
+	if sandbox != nil && strings.TrimSpace(sandbox.RootPath) != "" {
+		bundleDir = filepath.Join(sandbox.RootPath, "workspace", "bundle")
+	}
 
 	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
 		return nil, "", fmt.Errorf("create bundle directory: %w", err)
@@ -1238,15 +1364,20 @@ func (s *Service) startTaskRunLocked(projectID string, task *domain.Task, now ti
 		agentType = s.cfg.DefaultAgent
 	}
 
+	sandbox := s.createPrivateSandboxLocked(projectID, task, agentType, now)
+
 	run := &domain.AgentRun{
 		ID:        nextID("run"),
 		ProjectID: projectID,
 		TaskID:    task.ID,
 		AgentType: agentType,
 		Model:     "rule-based-" + agentType,
+		SandboxID: sandbox.ID,
 		Status:    domain.RunStatusRunning,
 		StartedAt: now,
 	}
+	sandbox.RunID = run.ID
+	sandbox.UpdatedAt = now
 
 	s.runs[run.ID] = run
 	s.runOrder[projectID] = append(s.runOrder[projectID], run.ID)
@@ -1255,6 +1386,37 @@ func (s *Service) startTaskRunLocked(projectID string, task *domain.Task, now ti
 		Task: *cloneTask(task),
 		Run:  *cloneRun(run),
 	}, nil
+}
+
+func (s *Service) createPrivateSandboxLocked(projectID string, task *domain.Task, agentType string, now time.Time) *domain.Sandbox {
+	sandbox := &domain.Sandbox{
+		ID:        nextID("sandbox"),
+		ProjectID: projectID,
+		TaskID:    task.ID,
+		AgentType: agentType,
+		Scope:     "PRIVATE",
+		Status:    domain.SandboxStatusActive,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	sandbox.RootPath = filepath.Join(s.cfg.SandboxRoot, projectID, sandbox.ID)
+	_ = os.MkdirAll(filepath.Join(sandbox.RootPath, "workspace"), 0o755)
+
+	s.sandboxIndex[sandbox.ID] = sandbox
+	s.sandboxes[projectID] = append(s.sandboxes[projectID], sandbox)
+	return sandbox
+}
+
+func (s *Service) sandboxFailureForTask(taskID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	failure := strings.TrimSpace(s.sandboxFaults[taskID])
+	if failure == "" {
+		return ""
+	}
+	delete(s.sandboxFaults, taskID)
+	return failure
 }
 
 func (s *Service) resolveContractLocked(projectID, contractID string) (*domain.Contract, error) {
@@ -2028,6 +2190,14 @@ func cloneContextInjection(injection *domain.ContextInjection) *domain.ContextIn
 		sectionCopy.Items = append([]string(nil), section.Items...)
 		copy.Sections = append(copy.Sections, sectionCopy)
 	}
+	return &copy
+}
+
+func cloneSandbox(sandbox *domain.Sandbox) *domain.Sandbox {
+	if sandbox == nil {
+		return nil
+	}
+	copy := *sandbox
 	return &copy
 }
 

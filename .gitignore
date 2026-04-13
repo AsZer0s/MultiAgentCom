@@ -1,2 +1,7 @@
 runtime/artifacts/
+runtime/sandboxes/
+/internal/httpapi/proj_*/
+/internal/service/proj_*/
+/internal/httpapi/runtime/
+/internal/service/runtime/
 bin/

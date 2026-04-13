@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -588,6 +589,108 @@ func TestStatusMatrixAggregatesTasksAndAgents(t *testing.T) {
 	}
 }
 
+func TestPrivateSandboxIsolation(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-private-sandbox",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Sandbox Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:       "实现 Todo 全栈功能",
+		Content:     "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+		Constraints: []string{"后端使用 Go", "前端使用 Vue"},
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if _, err := svc.GenerateContract(ctx, project.ID); err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+	dispatchResult, err := svc.DispatchTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("dispatch tasks: %v", err)
+	}
+
+	backendTaskID := dispatchResult.Tasks[0].ID
+	frontendTaskID := dispatchResult.Tasks[1].ID
+	if err := svc.MarkTaskSandboxFailure(ctx, project.ID, backendTaskID, "simulated private sandbox crash"); err != nil {
+		t.Fatalf("inject sandbox failure: %v", err)
+	}
+
+	parallelResult, err := svc.StartParallelRun(ctx, project.ID, ParallelRunInput{
+		TaskIDs: []string{backendTaskID, frontendTaskID},
+	})
+	if err != nil {
+		t.Fatalf("start parallel run: %v", err)
+	}
+	if len(parallelResult.Started) != 2 {
+		t.Fatalf("expected 2 started runs, got %d", len(parallelResult.Started))
+	}
+
+	runByTask := make(map[string]domain.AgentRun, 2)
+	for _, started := range parallelResult.Started {
+		runByTask[started.Task.ID] = started.Run
+	}
+
+	backendStatus := waitForRunTerminal(t, svc, project.ID, runByTask[backendTaskID].ID)
+	frontendStatus := waitForRunTerminal(t, svc, project.ID, runByTask[frontendTaskID].ID)
+
+	if backendStatus.Run.Status != domain.RunStatusFailed {
+		t.Fatalf("expected backend run to fail, got %s", backendStatus.Run.Status)
+	}
+	if frontendStatus.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected frontend run to succeed, got %s", frontendStatus.Run.Status)
+	}
+
+	backendSandbox, err := svc.GetRunSandbox(ctx, project.ID, runByTask[backendTaskID].ID)
+	if err != nil {
+		t.Fatalf("get backend sandbox: %v", err)
+	}
+	frontendSandbox, err := svc.GetRunSandbox(ctx, project.ID, runByTask[frontendTaskID].ID)
+	if err != nil {
+		t.Fatalf("get frontend sandbox: %v", err)
+	}
+
+	if backendSandbox.Sandbox.ID == frontendSandbox.Sandbox.ID {
+		t.Fatal("expected isolated sandbox ids for parallel runs")
+	}
+	if backendSandbox.Sandbox.RootPath == frontendSandbox.Sandbox.RootPath {
+		t.Fatal("expected isolated sandbox root paths for parallel runs")
+	}
+	if backendSandbox.Sandbox.Status != domain.SandboxStatusFailed {
+		t.Fatalf("expected backend sandbox FAILED, got %s", backendSandbox.Sandbox.Status)
+	}
+	if frontendSandbox.Sandbox.Status != domain.SandboxStatusReleased {
+		t.Fatalf("expected frontend sandbox RELEASED, got %s", frontendSandbox.Sandbox.Status)
+	}
+	if _, err := os.Stat(filepath.Join(backendSandbox.Sandbox.RootPath, "sandbox-error.log")); err != nil {
+		t.Fatalf("expected sandbox error log to exist: %v", err)
+	}
+	if len(frontendStatus.Artifacts) != 1 {
+		t.Fatalf("expected frontend run to produce one artifact, got %d", len(frontendStatus.Artifacts))
+	}
+
+	sandboxes, err := svc.ListSandboxes(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list sandboxes: %v", err)
+	}
+	if len(sandboxes) != 2 {
+		t.Fatalf("expected 2 sandboxes, got %d", len(sandboxes))
+	}
+}
+
 func waitForSucceededRun(t *testing.T, svc *Service, projectID, runID string) {
 	t.Helper()
 
@@ -610,4 +713,23 @@ func waitForSucceededRun(t *testing.T, svc *Service, projectID, runID string) {
 	}
 
 	t.Fatalf("run %s did not complete before deadline", runID)
+}
+
+func waitForRunTerminal(t *testing.T, svc *Service, projectID, runID string) *RunStatusView {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := svc.GetRunStatus(context.Background(), projectID, runID)
+		if err != nil {
+			t.Fatalf("get run status: %v", err)
+		}
+		if status.Run.Status == domain.RunStatusSucceeded || status.Run.Status == domain.RunStatusFailed {
+			return status
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("run %s did not reach terminal state before deadline", runID)
+	return nil
 }

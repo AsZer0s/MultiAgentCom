@@ -93,6 +93,28 @@ type ContextInjection struct {
 	CreatedAt time.Time        `json:"createdAt"`
 }
 
+type SandboxStatus string
+
+const (
+	SandboxStatusActive   SandboxStatus = "ACTIVE"
+	SandboxStatusReleased SandboxStatus = "RELEASED"
+	SandboxStatusFailed   SandboxStatus = "FAILED"
+)
+
+type Sandbox struct {
+	ID            string        `json:"id"`
+	ProjectID     string        `json:"projectId"`
+	RunID         string        `json:"runId"`
+	TaskID        string        `json:"taskId"`
+	AgentType     string        `json:"agentType"`
+	Scope         string        `json:"scope"`
+	RootPath      string        `json:"rootPath"`
+	Status        SandboxStatus `json:"status"`
+	FailureReason string        `json:"failureReason,omitempty"`
+	CreatedAt     time.Time     `json:"createdAt"`
+	UpdatedAt     time.Time     `json:"updatedAt"`
+}
+
 type TaskStatus string
 
 const (
@@ -193,6 +215,7 @@ type AgentRun struct {
 	TaskID        string    `json:"taskId"`
 	AgentType     string    `json:"agentType"`
 	Model         string    `json:"model"`
+	SandboxID     string    `json:"sandboxId,omitempty"`
 	Status        RunStatus `json:"status"`
 	ResultSummary string    `json:"resultSummary,omitempty"`
 	Error         string    `json:"error,omitempty"`

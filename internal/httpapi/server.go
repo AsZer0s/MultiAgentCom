@@ -44,10 +44,13 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("POST /projects/{id}/tasks/dispatch", server.handleDispatchTasks)
 	mux.HandleFunc("GET /projects/{id}/tasks/{taskId}/context", server.handleGetTaskContext)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/context/generate", server.handleGenerateTaskContext)
+	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/sandbox/fail", server.handleInjectSandboxFailure)
 	mux.HandleFunc("POST /projects/{id}/tasks/run", server.handleStartRun)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/retry", server.handleRetryTask)
 	mux.HandleFunc("POST /projects/{id}/runs/parallel", server.handleStartParallelRun)
 	mux.HandleFunc("GET /projects/{id}/runs/{runId}/status", server.handleGetRunStatus)
+	mux.HandleFunc("GET /projects/{id}/runs/{runId}/sandbox", server.handleGetRunSandbox)
+	mux.HandleFunc("GET /projects/{id}/sandboxes", server.handleListSandboxes)
 	mux.HandleFunc("POST /projects/{id}/delivery/export", server.handleExportDelivery)
 	mux.HandleFunc("GET /projects/{id}/artifacts/{artifactId}/download", server.handleDownloadArtifact)
 
@@ -238,6 +241,24 @@ func (s *Server) handleGenerateTaskContext(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusCreated, result)
 }
 
+func (s *Server) handleInjectSandboxFailure(w http.ResponseWriter, r *http.Request) {
+	var input service.InjectSandboxFailureInput
+	if err := decodeJSONAllowEmpty(r, &input); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	if err := s.svc.MarkTaskSandboxFailure(r.Context(), r.PathValue("id"), r.PathValue("taskId"), input.Reason); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"taskId":  r.PathValue("taskId"),
+		"message": "sandbox failure injected",
+	})
+}
+
 func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 	var input service.StartRunInput
 	if err := decodeJSONAllowEmpty(r, &input); err != nil {
@@ -278,6 +299,29 @@ func (s *Server) handleStartParallelRun(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusAccepted, result)
+}
+
+func (s *Server) handleGetRunSandbox(w http.ResponseWriter, r *http.Request) {
+	result, err := s.svc.GetRunSandbox(r.Context(), r.PathValue("id"), r.PathValue("runId"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
+	sandboxes, err := s.svc.ListSandboxes(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": sandboxes,
+		"count": len(sandboxes),
+	})
 }
 
 func (s *Server) handleGetRunStatus(w http.ResponseWriter, r *http.Request) {

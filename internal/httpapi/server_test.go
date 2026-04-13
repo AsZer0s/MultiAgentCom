@@ -507,6 +507,82 @@ func TestHTTPSprintTwoAcceptanceFlow(t *testing.T) {
 	}
 }
 
+func TestHTTPSandboxIsolationFlow(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-sandbox",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Todo Sandbox Demo",
+	})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{
+		"title":       "实现 Todo 全栈功能",
+		"content":     "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+		"constraints": []string{"后端使用 Go", "前端使用 Vue"},
+	})
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{})
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/contracts/generate", map[string]any{})
+
+	dispatchBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/dispatch", map[string]any{})
+	var dispatchResult service.DispatchTasksResult
+	decodeResponse(t, dispatchBody, &dispatchResult)
+
+	requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/"+dispatchResult.Tasks[0].ID+"/sandbox/fail", map[string]any{
+		"reason": "simulated private sandbox crash",
+	}, http.StatusAccepted)
+
+	parallelBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/runs/parallel", map[string]any{
+		"taskIds": []string{dispatchResult.Tasks[0].ID, dispatchResult.Tasks[1].ID},
+	})
+	var parallelResult service.ParallelRunResult
+	decodeResponse(t, parallelBody, &parallelResult)
+	if len(parallelResult.Started) != 2 {
+		t.Fatalf("expected 2 started runs, got %d", len(parallelResult.Started))
+	}
+
+	runByTask := make(map[string]domain.AgentRun, 2)
+	for _, started := range parallelResult.Started {
+		runByTask[started.Task.ID] = started.Run
+	}
+
+	backendStatus := waitForHTTPRunTerminal(t, server, project.ID, runByTask[dispatchResult.Tasks[0].ID].ID)
+	frontendStatus := waitForHTTPRunTerminal(t, server, project.ID, runByTask[dispatchResult.Tasks[1].ID].ID)
+	if backendStatus.Run.Status != domain.RunStatusFailed {
+		t.Fatalf("expected backend run to fail, got %s", backendStatus.Run.Status)
+	}
+	if frontendStatus.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected frontend run to succeed, got %s", frontendStatus.Run.Status)
+	}
+
+	backendSandboxBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/runs/"+runByTask[dispatchResult.Tasks[0].ID].ID+"/sandbox")
+	var backendSandbox service.SandboxView
+	decodeResponse(t, backendSandboxBody, &backendSandbox)
+	if backendSandbox.Sandbox.Status != domain.SandboxStatusFailed {
+		t.Fatalf("expected backend sandbox FAILED, got %s", backendSandbox.Sandbox.Status)
+	}
+
+	sandboxesBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/sandboxes")
+	var sandboxes struct {
+		Items []service.SandboxView `json:"items"`
+		Count int                   `json:"count"`
+	}
+	decodeResponse(t, sandboxesBody, &sandboxes)
+	if sandboxes.Count != 2 || len(sandboxes.Items) != 2 {
+		t.Fatalf("expected 2 sandboxes, got count=%d len=%d", sandboxes.Count, len(sandboxes.Items))
+	}
+}
+
 func requestJSON(t *testing.T, client *http.Client, method, url string, payload any) []byte {
 	t.Helper()
 
@@ -617,6 +693,24 @@ func waitForHTTPRun(t *testing.T, server *httptest.Server, projectID, runID stri
 	}
 
 	t.Fatalf("run %s did not complete before deadline", runID)
+}
+
+func waitForHTTPRunTerminal(t *testing.T, server *httptest.Server, projectID, runID string) service.RunStatusView {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var status service.RunStatusView
+	for time.Now().Before(deadline) {
+		statusBody := getJSON(t, server.Client(), server.URL+"/projects/"+projectID+"/runs/"+runID+"/status")
+		decodeResponse(t, statusBody, &status)
+		if status.Run.Status == domain.RunStatusSucceeded || status.Run.Status == domain.RunStatusFailed {
+			return status
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("run %s did not complete before deadline", runID)
+	return service.RunStatusView{}
 }
 
 func containsAgentStatus(items []service.StatusMatrixAgent, agent, status string) bool {

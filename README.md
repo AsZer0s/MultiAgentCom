@@ -19,10 +19,13 @@
 - `GET /projects/{id}/tasks`：查看项目任务列表与依赖
 - `POST /projects/{id}/tasks/{taskId}/context/generate`：为指定任务生成上下文切片
 - `GET /projects/{id}/tasks/{taskId}/context`：查看该任务最新上下文注入结果
+- `POST /projects/{id}/tasks/{taskId}/sandbox/fail`：为指定任务注入一次性私有沙盒失败
 - `POST /projects/{id}/tasks/run`：触发单 Agent 串行执行
 - `POST /projects/{id}/tasks/{taskId}/retry`：为失败任务创建独立重试任务
 - `POST /projects/{id}/runs/parallel`：并行触发多个已就绪任务
 - `GET /projects/{id}/runs/{runId}/status`：查询执行状态
+- `GET /projects/{id}/runs/{runId}/sandbox`：查看指定 run 的私有沙盒信息
+- `GET /projects/{id}/sandboxes`：查看项目下全部私有沙盒
 - `POST /projects/{id}/delivery/export`：获取最新交付包
 - `GET /projects/{id}/artifacts/{artifactId}/download`：下载交付包
 
@@ -36,6 +39,7 @@
 - 并行调度当前支持**双 Agent + 简单 DAG**：可生成后端/前端实现任务，并在依赖满足后触发集成任务；失败任务可单独创建 retry 任务，不影响其他任务继续推进。
 - Context Engine 当前支持**按任务角色切片注入**：后端任务会拿到 API/Schema 重点，前端任务会拿到 UX/验收重点；每次生成都会记录 `version` 和 `sources`，可回查最新注入结果。
 - 状态矩阵面板当前支持**最小可视化监控**：可查看项目级任务矩阵、Agent 状态汇总，并在 `/status/panel` 中按项目过滤与自动刷新。
+- 私有沙盒运行时当前支持**每个 run 独立工作目录**：系统会为每次执行分配显式 `sandboxId` 和独立 `rootPath`；单个沙盒失败会标记为 `FAILED`，不会影响其他并行任务继续产生产物。
 
 ## 本地运行
 
