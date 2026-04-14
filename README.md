@@ -20,6 +20,8 @@
 - `POST /projects/{id}/tasks/{taskId}/context/generate`：为指定任务生成上下文切片
 - `GET /projects/{id}/tasks/{taskId}/context`：查看该任务最新上下文注入结果
 - `POST /projects/{id}/tasks/{taskId}/sandbox/fail`：为指定任务注入一次性私有沙盒失败
+- `POST /projects/{id}/overrides`：为运行中的任务注入人工高优指令，在安全检查点进入并恢复 `HUMAN_OVERRIDE`
+- `POST /projects/{id}/locks`：注册带 `LOCKED BY HUMAN` 标记的人工代码片段，后续自动产物生成时保留为真值
 - `POST /projects/{id}/shared-sandbox/merge`：将多个已完成任务的产物送入共享沙盒并执行合并闸门
 - `GET /projects/{id}/snapshots`：查看项目时间线快照与分支
 - `POST /projects/{id}/snapshots/rollback`：回滚到指定快照并创建新的平行时间线分支
@@ -43,6 +45,8 @@
 - Context Engine 当前支持**按任务角色切片注入**：后端任务会拿到 API/Schema 重点，前端任务会拿到 UX/验收重点；每次生成都会记录 `version` 和 `sources`，可回查最新注入结果。
 - 状态矩阵面板当前支持**最小可视化监控**：可查看项目级任务矩阵、Agent 状态汇总，并在 `/status/panel` 中按项目过滤与自动刷新。
 - 私有沙盒运行时当前支持**每个 run 独立工作目录**：系统会为每次执行分配显式 `sandboxId` 和独立 `rootPath`；单个沙盒失败会标记为 `FAILED`，不会影响其他并行任务继续产生产物。
+- HITL 当前支持**最小人工接管**：运行中的任务可通过 `POST /projects/{id}/overrides` 进入 `HUMAN_OVERRIDE`，执行器会在安全检查点应用指令并恢复执行，任务审计与运行摘要会记录这次接管。
+- 代码锁定当前支持**最小人工真值保护**：人类可通过 `POST /projects/{id}/locks` 注册包含 `LOCKED BY HUMAN` 标记的文件内容；后续自动生成 bundle 时会保留这段人工内容，并在 `metadata/lock-conflicts.log` 记录跳过覆盖行为。
 - 共享沙盒当前支持**最小合并闸门**：只有 `DONE` 任务的成功产物才可进入 `SHARED` 沙盒；可在合并前执行契约校验并生成修复任务，或在模拟集成失败时阻断进入主交付链路。
 - Timeline 当前支持**最小快照与回滚**：共享沙盒成功合并后会自动生成稳定快照；共享沙盒集成失败时会自动回滚到最近稳定快照，并创建新的 branch 保留原时间线；手动回滚也会清理旧的上下文注入记录。
 

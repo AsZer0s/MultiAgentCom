@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -823,6 +825,173 @@ func TestHTTPRollbackSnapshotCreatesParallelBranchTimeline(t *testing.T) {
 	}
 }
 
+func TestHTTPApplyHumanOverride(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-human-override",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Todo Override Demo",
+	})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{
+		"title":   "实现 Todo 列表的增删改查",
+		"content": "实现 Todo 列表的增删改查，并支持人工接管。",
+	})
+	planBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{})
+	var planResult service.PlanResult
+	decodeResponse(t, planBody, &planResult)
+
+	runBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/run", map[string]any{
+		"taskId": planResult.Task.ID,
+	})
+	var runEnvelope service.RunEnvelope
+	decodeResponse(t, runBody, &runEnvelope)
+	waitForHTTPTaskStatus(t, server, project.ID, runEnvelope.Run.ID, domain.TaskStatusInProgress)
+
+	overrideBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/overrides", map[string]any{
+		"taskId":      planResult.Task.ID,
+		"operator":    "reviewer",
+		"instruction": "请优先保留 README 说明并按人工要求继续执行",
+		"lockScope":   "TASK",
+	})
+	var overrideResult service.HumanOverrideResult
+	decodeResponse(t, overrideBody, &overrideResult)
+	if overrideResult.Task.Status != domain.TaskStatusHumanOverride {
+		t.Fatalf("expected HUMAN_OVERRIDE status, got %s", overrideResult.Task.Status)
+	}
+
+	status := waitForHTTPRunTerminal(t, server, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success after override, got %s", status.Run.Status)
+	}
+	if !strings.Contains(status.Run.ResultSummary, "applied human override by reviewer") {
+		t.Fatalf("expected run summary to mention applied override, got %s", status.Run.ResultSummary)
+	}
+}
+
+func TestHTTPApplyCodeLock(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-code-lock",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Todo Code Lock Demo",
+	})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{
+		"title":   "实现 Todo 列表的增删改查",
+		"content": "实现 Todo 列表的增删改查，并支持人工锁定代码。",
+	})
+	planBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{})
+	var planResult service.PlanResult
+	decodeResponse(t, planBody, &planResult)
+
+	lockedSource := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\t// LOCKED BY HUMAN\n\tfmt.Println(\"human locked main\")\n}\n"
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/locks", map[string]any{
+		"taskId":    planResult.Task.ID,
+		"path":      "generated-app/main.go",
+		"content":   lockedSource,
+		"createdBy": "reviewer",
+	})
+
+	runBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/run", map[string]any{
+		"taskId": planResult.Task.ID,
+	})
+	var runEnvelope service.RunEnvelope
+	decodeResponse(t, runBody, &runEnvelope)
+	status := waitForHTTPRunTerminal(t, server, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s", status.Run.Status)
+	}
+
+	sandboxBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/runs/"+runEnvelope.Run.ID+"/sandbox")
+	var sandbox service.SandboxView
+	decodeResponse(t, sandboxBody, &sandbox)
+
+	mainPath := filepath.Join(sandbox.Sandbox.RootPath, "workspace", "bundle", "generated-app", "main.go")
+	data, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read locked main.go: %v", err)
+	}
+	if string(data) != lockedSource {
+		t.Fatalf("expected locked source to be preserved, got:\n%s", string(data))
+	}
+}
+
+func TestHTTPStartPreview(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-preview",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	project, contract, dispatched := prepareHTTPSharedSandboxMergeScenario(t, server)
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/shared-sandbox/merge", map[string]any{
+		"taskIds":    []string{dispatched[0].ID, dispatched[1].ID},
+		"contractId": contract.ID,
+		"endpoints":  contract.Endpoints,
+		"schemas":    contract.Schemas,
+	})
+
+	previewBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/preview/start", map[string]any{})
+	var preview service.PreviewStartResult
+	decodeResponse(t, previewBody, &preview)
+	if preview.Preview.Status != "READY" {
+		t.Fatalf("expected preview READY, got %s", preview.Preview.Status)
+	}
+
+	resp, err := server.Client().Get(server.URL + preview.Preview.URL)
+	if err != nil {
+		t.Fatalf("get preview page: %v", err)
+	}
+	defer resp.Body.Close()
+	page, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read preview page: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected preview page 200, got %d", resp.StatusCode)
+	}
+	body := string(page)
+	if !strings.Contains(body, "Todo Preview Workspace") || !strings.Contains(body, "Hot reload watching") {
+		t.Fatalf("expected preview page content, got %s", body)
+	}
+
+	statusBody := getJSON(t, server.Client(), server.URL+preview.Preview.URL+"/status")
+	var previewStatus domain.Preview
+	decodeResponse(t, statusBody, &previewStatus)
+	if previewStatus.Revision == "" {
+		t.Fatal("expected preview revision in status response")
+	}
+}
+
 func prepareHTTPSharedSandboxMergeScenario(t *testing.T, server *httptest.Server) (domain.Project, domain.Contract, []domain.Task) {
 	t.Helper()
 
@@ -987,6 +1156,26 @@ func waitForHTTPRunTerminal(t *testing.T, server *httptest.Server, projectID, ru
 
 	t.Fatalf("run %s did not complete before deadline", runID)
 	return service.RunStatusView{}
+}
+
+func waitForHTTPTaskStatus(t *testing.T, server *httptest.Server, projectID, runID string, expected domain.TaskStatus) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var status service.RunStatusView
+	for time.Now().Before(deadline) {
+		statusBody := getJSON(t, server.Client(), server.URL+"/projects/"+projectID+"/runs/"+runID+"/status")
+		decodeResponse(t, statusBody, &status)
+		if status.Task.Status == expected {
+			return
+		}
+		if status.Run.Status == domain.RunStatusFailed {
+			t.Fatalf("run failed before reaching task status %s: %s", expected, status.Run.Error)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("run %s did not reach task status %s before deadline", runID, expected)
 }
 
 func containsAgentStatus(items []service.StatusMatrixAgent, agent, status string) bool {

@@ -58,6 +58,12 @@ type Service struct {
 	contracts     map[string][]*domain.Contract
 	contextIndex  map[string]*domain.ContextInjection
 	contexts      map[string][]*domain.ContextInjection
+	overrideIndex map[string]*domain.HumanOverride
+	overrides     map[string][]*domain.HumanOverride
+	lockIndex     map[string]*domain.CodeLock
+	locks         map[string][]*domain.CodeLock
+	previewIndex  map[string]*domain.Preview
+	previews      map[string][]*domain.Preview
 	sandboxIndex  map[string]*domain.Sandbox
 	sandboxes     map[string][]*domain.Sandbox
 	sandboxFaults map[string]string
@@ -153,13 +159,14 @@ type TaskContextEnvelope struct {
 }
 
 type StatusMatrixAgent struct {
-	Agent        string `json:"agent"`
-	Status       string `json:"status"`
-	CreatedTasks int    `json:"createdTasks"`
-	RunningTasks int    `json:"runningTasks"`
-	DoneTasks    int    `json:"doneTasks"`
-	FailedTasks  int    `json:"failedTasks"`
-	TotalTasks   int    `json:"totalTasks"`
+	Agent              string `json:"agent"`
+	Status             string `json:"status"`
+	CreatedTasks       int    `json:"createdTasks"`
+	RunningTasks       int    `json:"runningTasks"`
+	HumanOverrideTasks int    `json:"humanOverrideTasks"`
+	DoneTasks          int    `json:"doneTasks"`
+	FailedTasks        int    `json:"failedTasks"`
+	TotalTasks         int    `json:"totalTasks"`
 }
 
 type StatusMatrixTask struct {
@@ -179,6 +186,7 @@ type StatusMatrixProject struct {
 	TotalTasks     int                 `json:"totalTasks"`
 	ReadyTasks     int                 `json:"readyTasks"`
 	RunningTasks   int                 `json:"runningTasks"`
+	OverrideTasks  int                 `json:"overrideTasks"`
 	CompletedTasks int                 `json:"completedTasks"`
 	FailedTasks    int                 `json:"failedTasks"`
 }
@@ -198,6 +206,37 @@ type SandboxView struct {
 
 type InjectSandboxFailureInput struct {
 	Reason string `json:"reason"`
+}
+
+type ApplyHumanOverrideInput struct {
+	TaskID      string `json:"taskId"`
+	Operator    string `json:"operator"`
+	Instruction string `json:"instruction"`
+	LockScope   string `json:"lockScope"`
+}
+
+type HumanOverrideResult struct {
+	Override domain.HumanOverride `json:"override"`
+	Task     domain.Task          `json:"task"`
+	Run      *domain.AgentRun     `json:"run,omitempty"`
+	Message  string               `json:"message,omitempty"`
+}
+
+type ApplyCodeLockInput struct {
+	TaskID    string `json:"taskId"`
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+	CreatedBy string `json:"createdBy"`
+}
+
+type CodeLockResult struct {
+	Lock    domain.CodeLock `json:"lock"`
+	Message string          `json:"message,omitempty"`
+}
+
+type PreviewStartResult struct {
+	Preview           domain.Preview `json:"preview"`
+	RefreshIntervalMs int            `json:"refreshIntervalMs"`
 }
 
 type MergeSharedSandboxInput struct {
@@ -264,6 +303,12 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		contracts:     make(map[string][]*domain.Contract),
 		contextIndex:  make(map[string]*domain.ContextInjection),
 		contexts:      make(map[string][]*domain.ContextInjection),
+		overrideIndex: make(map[string]*domain.HumanOverride),
+		overrides:     make(map[string][]*domain.HumanOverride),
+		lockIndex:     make(map[string]*domain.CodeLock),
+		locks:         make(map[string][]*domain.CodeLock),
+		previewIndex:  make(map[string]*domain.Preview),
+		previews:      make(map[string][]*domain.Preview),
 		sandboxIndex:  make(map[string]*domain.Sandbox),
 		sandboxes:     make(map[string][]*domain.Sandbox),
 		sandboxFaults: make(map[string]string),
@@ -600,6 +645,166 @@ func (s *Service) GetLatestTaskContext(_ context.Context, projectID, taskID stri
 		Task:    *cloneTask(task),
 		Context: *cloneContextInjection(latest),
 	}, nil
+}
+
+func (s *Service) ApplyHumanOverride(_ context.Context, projectID string, input ApplyHumanOverrideInput) (*HumanOverrideResult, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	project, ok := s.projects[projectID]
+	if !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	task, err := s.resolveTaskLocked(projectID, input.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(input.Instruction) == "" {
+		return nil, newValidationError("instruction is required for human override")
+	}
+	if task.Status != domain.TaskStatusInProgress && task.Status != domain.TaskStatusHumanOverride {
+		return nil, newConflictError("only in-progress tasks can receive human override")
+	}
+
+	override := &domain.HumanOverride{
+		ID:          nextID("override"),
+		ProjectID:   projectID,
+		TaskID:      task.ID,
+		Operator:    strings.TrimSpace(input.Operator),
+		Instruction: strings.TrimSpace(input.Instruction),
+		LockScope:   strings.TrimSpace(input.LockScope),
+		CreatedAt:   now,
+	}
+	if override.Operator == "" {
+		override.Operator = "human-operator"
+	}
+
+	if task.Status == domain.TaskStatusInProgress {
+		if err := task.TransitionTo(domain.TaskStatusHumanOverride, "human override requested by "+override.Operator, now); err != nil {
+			return nil, newConflictError(err.Error())
+		}
+	}
+
+	s.overrideIndex[override.ID] = override
+	s.overrides[projectID] = append(s.overrides[projectID], override)
+	project.UpdatedAt = now
+
+	result := &HumanOverrideResult{
+		Override: *cloneHumanOverride(override),
+		Task:     *cloneTask(task),
+		Message:  "human override queued for next safety checkpoint",
+	}
+	if run := s.findActiveRunForTaskLocked(projectID, task.ID); run != nil {
+		result.Run = cloneRun(run)
+	}
+
+	return result, nil
+}
+
+func (s *Service) ApplyCodeLock(_ context.Context, projectID string, input ApplyCodeLockInput) (*CodeLockResult, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	project, ok := s.projects[projectID]
+	if !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	lockPath := strings.TrimSpace(input.Path)
+	lockContent := input.Content
+	if lockPath == "" {
+		return nil, newValidationError("path is required for code lock")
+	}
+	if filepath.IsAbs(lockPath) || strings.Contains(lockPath, "..") {
+		return nil, newValidationError("path must be a relative bundle path")
+	}
+	if strings.TrimSpace(lockContent) == "" {
+		return nil, newValidationError("content is required for code lock")
+	}
+	if !strings.Contains(lockContent, "LOCKED BY HUMAN") {
+		return nil, newValidationError("content must include LOCKED BY HUMAN marker")
+	}
+	if strings.TrimSpace(input.TaskID) != "" {
+		if _, err := s.resolveTaskLocked(projectID, input.TaskID); err != nil {
+			return nil, err
+		}
+	}
+
+	lock := &domain.CodeLock{
+		ID:        nextID("lock"),
+		ProjectID: projectID,
+		TaskID:    strings.TrimSpace(input.TaskID),
+		Path:      filepath.ToSlash(lockPath),
+		Content:   lockContent,
+		CreatedBy: strings.TrimSpace(input.CreatedBy),
+		CreatedAt: now,
+	}
+	if lock.CreatedBy == "" {
+		lock.CreatedBy = "human-operator"
+	}
+
+	s.lockIndex[lock.ID] = lock
+	s.locks[projectID] = append(s.locks[projectID], lock)
+	project.UpdatedAt = now
+
+	return &CodeLockResult{
+		Lock:    *cloneCodeLock(lock),
+		Message: "code lock registered and will be preserved on future bundle generations",
+	}, nil
+}
+
+func (s *Service) StartPreview(_ context.Context, projectID string) (*PreviewStartResult, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	project, ok := s.projects[projectID]
+	if !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	sandbox, err := s.resolveLatestReleasedSharedSandboxLocked(projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	preview := &domain.Preview{
+		ID:        nextID("preview"),
+		ProjectID: projectID,
+		SandboxID: sandbox.ID,
+		Status:    "READY",
+		Revision:  fmt.Sprintf("%s-%d", sandbox.ID, sandbox.UpdatedAt.UnixNano()),
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	preview.URL = "/projects/" + projectID + "/preview/" + preview.ID
+
+	s.previewIndex[preview.ID] = preview
+	s.previews[projectID] = append(s.previews[projectID], preview)
+	project.UpdatedAt = now
+
+	return &PreviewStartResult{
+		Preview:           *clonePreview(preview),
+		RefreshIntervalMs: 3000,
+	}, nil
+}
+
+func (s *Service) GetPreview(_ context.Context, projectID, previewID string) (*domain.Preview, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	preview, ok := s.previewIndex[previewID]
+	if !ok || preview.ProjectID != projectID {
+		return nil, newNotFoundError("preview not found")
+	}
+
+	return clonePreview(preview), nil
 }
 
 func (s *Service) GetRunSandbox(_ context.Context, projectID, runID string) (*SandboxView, error) {
@@ -1130,6 +1335,15 @@ func (s *Service) executeRun(runID string) {
 		return
 	}
 
+	// Simulate a scheduler safety checkpoint so a queued human override can be applied.
+	time.Sleep(60 * time.Millisecond)
+	appliedOverride, err := s.applyPendingHumanOverrideLocked(runID)
+	if err != nil {
+		s.logger.Error("failed to apply human override", "runId", run.ID, "taskId", task.ID, "error", err)
+		s.failRun(runID, err)
+		return
+	}
+
 	artifact, summary, err := s.generateDeliveryBundle(project, task, plan, run, sandbox)
 	if err != nil {
 		s.logger.Error("run execution failed", "runId", run.ID, "taskId", task.ID, "error", err)
@@ -1155,6 +1369,9 @@ func (s *Service) executeRun(runID string) {
 	s.artifactOrder[artifact.ProjectID] = append(s.artifactOrder[artifact.ProjectID], artifact.ID)
 
 	storedRun.Status = domain.RunStatusSucceeded
+	if appliedOverride != nil {
+		summary += "; applied human override by " + appliedOverride.Operator + ": " + appliedOverride.Instruction
+	}
 	storedRun.ResultSummary = summary
 	storedRun.ArtifactIDs = append(storedRun.ArtifactIDs, artifact.ID)
 	storedRun.EndedAt = now
@@ -1227,7 +1444,7 @@ func (s *Service) failRun(runID string, failure error) {
 		}
 	}
 
-	if task, exists := s.tasks[run.TaskID]; exists && task.Status == domain.TaskStatusInProgress {
+	if task, exists := s.tasks[run.TaskID]; exists && (task.Status == domain.TaskStatusInProgress || task.Status == domain.TaskStatusHumanOverride) {
 		if err := task.TransitionTo(domain.TaskStatusFailed, "single agent execution failed", now); err != nil {
 			s.logger.Error("failed to transition task to failed", "taskId", task.ID, "error", err)
 		}
@@ -1252,6 +1469,9 @@ func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.T
 		return nil, "", err
 	}
 	if err := writeFile(filepath.Join(bundleDir, "generated-app", "main.go"), []byte(renderGeneratedSource(project, plan))); err != nil {
+		return nil, "", err
+	}
+	if err := s.applyProjectLocksToBundle(project.ID, task.ID, bundleDir); err != nil {
 		return nil, "", err
 	}
 
@@ -1335,7 +1555,7 @@ func (s *Service) buildProjectStatusMatrixLocked(project domain.Project) StatusM
 	taskMatrix := make([]StatusMatrixTask, 0, len(order))
 	agentMap := make(map[string]*StatusMatrixAgent)
 
-	var readyTasks, runningTasks, completedTasks, failedTasks int
+	var readyTasks, runningTasks, overrideTasks, completedTasks, failedTasks int
 	for _, taskID := range order {
 		task, ok := s.tasks[taskID]
 		if !ok {
@@ -1358,6 +1578,8 @@ func (s *Service) buildProjectStatusMatrixLocked(project domain.Project) StatusM
 			readyTasks++
 		case domain.TaskStatusInProgress:
 			runningTasks++
+		case domain.TaskStatusHumanOverride:
+			overrideTasks++
 		case domain.TaskStatusDone:
 			completedTasks++
 		case domain.TaskStatusFailed:
@@ -1379,6 +1601,8 @@ func (s *Service) buildProjectStatusMatrixLocked(project domain.Project) StatusM
 			agent.CreatedTasks++
 		case domain.TaskStatusInProgress:
 			agent.RunningTasks++
+		case domain.TaskStatusHumanOverride:
+			agent.HumanOverrideTasks++
 		case domain.TaskStatusDone:
 			agent.DoneTasks++
 		case domain.TaskStatusFailed:
@@ -1402,6 +1626,7 @@ func (s *Service) buildProjectStatusMatrixLocked(project domain.Project) StatusM
 		TotalTasks:     len(taskMatrix),
 		ReadyTasks:     readyTasks,
 		RunningTasks:   runningTasks,
+		OverrideTasks:  overrideTasks,
 		CompletedTasks: completedTasks,
 		FailedTasks:    failedTasks,
 	}
@@ -1421,6 +1646,8 @@ func (s *Service) latestRunStatusForTaskLocked(projectID, taskID string) domain.
 
 func deriveAgentMatrixStatus(agent StatusMatrixAgent) string {
 	switch {
+	case agent.HumanOverrideTasks > 0:
+		return "HUMAN_OVERRIDE"
 	case agent.FailedTasks > 0:
 		return "BLOCKED"
 	case agent.RunningTasks > 0:
@@ -1432,6 +1659,94 @@ func deriveAgentMatrixStatus(agent StatusMatrixAgent) string {
 	default:
 		return "IDLE"
 	}
+}
+
+func (s *Service) findActiveRunForTaskLocked(projectID, taskID string) *domain.AgentRun {
+	runIDs := s.runOrder[projectID]
+	for idx := len(runIDs) - 1; idx >= 0; idx-- {
+		run, ok := s.runs[runIDs[idx]]
+		if !ok || run.TaskID != taskID {
+			continue
+		}
+		if run.Status == domain.RunStatusRunning {
+			return run
+		}
+	}
+	return nil
+}
+
+func (s *Service) applyPendingHumanOverrideLocked(runID string) (*domain.HumanOverride, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	run, ok := s.runs[runID]
+	if !ok {
+		return nil, newNotFoundError("run not found")
+	}
+	task, ok := s.tasks[run.TaskID]
+	if !ok {
+		return nil, newNotFoundError("task not found")
+	}
+
+	for idx := len(s.overrides[run.ProjectID]) - 1; idx >= 0; idx-- {
+		override := s.overrides[run.ProjectID][idx]
+		if override.TaskID != task.ID || !override.AppliedAt.IsZero() {
+			continue
+		}
+
+		override.AppliedAt = now
+		if task.Status == domain.TaskStatusHumanOverride {
+			if err := task.TransitionTo(domain.TaskStatusInProgress, "human override applied at safety checkpoint", now); err != nil {
+				return nil, newConflictError(err.Error())
+			}
+		}
+		return cloneHumanOverride(override), nil
+	}
+
+	return nil, nil
+}
+
+func (s *Service) applyProjectLocksToBundle(projectID, taskID, bundleDir string) error {
+	s.mu.RLock()
+	locks := append([]*domain.CodeLock(nil), s.locks[projectID]...)
+	s.mu.RUnlock()
+
+	conflicts := make([]string, 0)
+	for _, lock := range locks {
+		if lock == nil {
+			continue
+		}
+		if lock.TaskID != "" && lock.TaskID != taskID {
+			continue
+		}
+
+		targetPath := filepath.Join(bundleDir, filepath.FromSlash(lock.Path))
+		if existing, err := os.ReadFile(targetPath); err == nil && string(existing) != lock.Content {
+			conflicts = append(conflicts, fmt.Sprintf("skipped overwrite for %s because LOCKED BY HUMAN content from %s takes precedence", lock.Path, lock.CreatedBy))
+		}
+		if err := writeFile(targetPath, []byte(lock.Content)); err != nil {
+			return err
+		}
+	}
+
+	if len(conflicts) > 0 {
+		return writeFile(filepath.Join(bundleDir, "metadata", "lock-conflicts.log"), []byte(strings.Join(conflicts, "\n")+"\n"))
+	}
+
+	return nil
+}
+
+func (s *Service) resolveLatestReleasedSharedSandboxLocked(projectID string) (*domain.Sandbox, error) {
+	items := s.sandboxes[projectID]
+	for idx := len(items) - 1; idx >= 0; idx-- {
+		sandbox := items[idx]
+		if sandbox.Scope == "SHARED" && sandbox.Status == domain.SandboxStatusReleased {
+			return sandbox, nil
+		}
+	}
+	return nil, newConflictError("no released shared sandbox available for preview")
 }
 
 func (s *Service) resolveTaskContractLocked(projectID string, task *domain.Task) (*domain.Contract, error) {
@@ -1944,10 +2259,14 @@ func (s *Service) clearProjectStateLocked(projectID string) {
 	for _, artifactID := range s.artifactOrder[projectID] {
 		delete(s.artifacts, artifactID)
 	}
+	for _, override := range s.overrides[projectID] {
+		delete(s.overrideIndex, override.ID)
+	}
 
 	delete(s.requirements, projectID)
 	delete(s.plans, projectID)
 	delete(s.contracts, projectID)
+	delete(s.overrides, projectID)
 	delete(s.sandboxes, projectID)
 	delete(s.taskOrder, projectID)
 	delete(s.runOrder, projectID)
@@ -2777,6 +3096,30 @@ func cloneSnapshot(snapshot *domain.Snapshot) *domain.Snapshot {
 		return nil
 	}
 	copy := *snapshot
+	return &copy
+}
+
+func cloneHumanOverride(override *domain.HumanOverride) *domain.HumanOverride {
+	if override == nil {
+		return nil
+	}
+	copy := *override
+	return &copy
+}
+
+func cloneCodeLock(lock *domain.CodeLock) *domain.CodeLock {
+	if lock == nil {
+		return nil
+	}
+	copy := *lock
+	return &copy
+}
+
+func clonePreview(preview *domain.Preview) *domain.Preview {
+	if preview == nil {
+		return nil
+	}
+	copy := *preview
 	return &copy
 }
 

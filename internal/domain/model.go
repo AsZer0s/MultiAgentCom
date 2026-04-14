@@ -126,13 +126,46 @@ type Snapshot struct {
 	CreatedAt        time.Time `json:"createdAt"`
 }
 
+type HumanOverride struct {
+	ID          string    `json:"id"`
+	ProjectID   string    `json:"projectId"`
+	TaskID      string    `json:"taskId"`
+	Operator    string    `json:"operator"`
+	Instruction string    `json:"instruction"`
+	LockScope   string    `json:"lockScope,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+	AppliedAt   time.Time `json:"appliedAt,omitempty"`
+}
+
+type CodeLock struct {
+	ID        string    `json:"id"`
+	ProjectID string    `json:"projectId"`
+	TaskID    string    `json:"taskId,omitempty"`
+	Path      string    `json:"path"`
+	Content   string    `json:"content"`
+	CreatedBy string    `json:"createdBy"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type Preview struct {
+	ID        string    `json:"id"`
+	ProjectID string    `json:"projectId"`
+	SandboxID string    `json:"sandboxId"`
+	Status    string    `json:"status"`
+	URL       string    `json:"url"`
+	Revision  string    `json:"revision"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 type TaskStatus string
 
 const (
-	TaskStatusCreated    TaskStatus = "CREATED"
-	TaskStatusInProgress TaskStatus = "IN_PROGRESS"
-	TaskStatusDone       TaskStatus = "DONE"
-	TaskStatusFailed     TaskStatus = "FAILED"
+	TaskStatusCreated       TaskStatus = "CREATED"
+	TaskStatusInProgress    TaskStatus = "IN_PROGRESS"
+	TaskStatusHumanOverride TaskStatus = "HUMAN_OVERRIDE"
+	TaskStatusDone          TaskStatus = "DONE"
+	TaskStatusFailed        TaskStatus = "FAILED"
 )
 
 type TaskTransition struct {
@@ -205,7 +238,9 @@ func isAllowedTransition(current, next TaskStatus) bool {
 	case TaskStatusCreated:
 		return next == TaskStatusInProgress
 	case TaskStatusInProgress:
-		return next == TaskStatusDone || next == TaskStatusFailed
+		return next == TaskStatusDone || next == TaskStatusFailed || next == TaskStatusHumanOverride
+	case TaskStatusHumanOverride:
+		return next == TaskStatusInProgress || next == TaskStatusDone || next == TaskStatusFailed
 	default:
 		return false
 	}

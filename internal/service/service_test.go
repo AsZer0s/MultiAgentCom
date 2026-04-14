@@ -987,6 +987,190 @@ func TestRollbackToSnapshotCreatesParallelBranchTimeline(t *testing.T) {
 	}
 }
 
+func TestApplyHumanOverrideAtSafetyCheckpoint(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-human-override",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Override Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo 列表的增删改查",
+		Content: "实现 Todo 列表的增删改查，并支持人工接管。",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForTaskStatus(t, svc, project.ID, runEnvelope.Run.ID, domain.TaskStatusInProgress)
+
+	overrideResult, err := svc.ApplyHumanOverride(ctx, project.ID, ApplyHumanOverrideInput{
+		TaskID:      planResult.Task.ID,
+		Operator:    "reviewer",
+		Instruction: "请优先保留 README 说明并按人工要求继续执行",
+		LockScope:   "TASK",
+	})
+	if err != nil {
+		t.Fatalf("apply human override: %v", err)
+	}
+	if overrideResult.Task.Status != domain.TaskStatusHumanOverride {
+		t.Fatalf("expected task to enter HUMAN_OVERRIDE, got %s", overrideResult.Task.Status)
+	}
+	if overrideResult.Run == nil || overrideResult.Run.ID != runEnvelope.Run.ID {
+		t.Fatalf("expected active run %s in override result, got %+v", runEnvelope.Run.ID, overrideResult.Run)
+	}
+
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run to succeed after override, got %s", status.Run.Status)
+	}
+	if !strings.Contains(status.Run.ResultSummary, "applied human override by reviewer") {
+		t.Fatalf("expected run summary to include applied override, got %s", status.Run.ResultSummary)
+	}
+	if status.Task.Status != domain.TaskStatusDone {
+		t.Fatalf("expected task DONE after override path, got %s", status.Task.Status)
+	}
+	foundOverrideTransition := false
+	for _, item := range status.Task.Audit {
+		if item.To == domain.TaskStatusHumanOverride {
+			foundOverrideTransition = true
+			break
+		}
+	}
+	if !foundOverrideTransition {
+		t.Fatal("expected task audit to include HUMAN_OVERRIDE transition")
+	}
+}
+
+func TestCodeLockPreservesHumanContent(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-code-lock",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Code Lock Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo 列表的增删改查",
+		Content: "实现 Todo 列表的增删改查，并支持人工锁定代码。",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	lockedSource := `package main
+
+import "fmt"
+
+func main() {
+	// LOCKED BY HUMAN
+	fmt.Println("human locked main")
+}
+`
+	lockResult, err := svc.ApplyCodeLock(ctx, project.ID, ApplyCodeLockInput{
+		TaskID:    planResult.Task.ID,
+		Path:      "generated-app/main.go",
+		Content:   lockedSource,
+		CreatedBy: "reviewer",
+	})
+	if err != nil {
+		t.Fatalf("apply code lock: %v", err)
+	}
+	if lockResult.Lock.Path != "generated-app/main.go" {
+		t.Fatalf("expected lock path generated-app/main.go, got %s", lockResult.Lock.Path)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s", status.Run.Status)
+	}
+
+	sandbox, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get run sandbox: %v", err)
+	}
+	mainPath := filepath.Join(sandbox.Sandbox.RootPath, "workspace", "bundle", "generated-app", "main.go")
+	data, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read locked main.go: %v", err)
+	}
+	if string(data) != lockedSource {
+		t.Fatalf("expected locked source to be preserved, got:\n%s", string(data))
+	}
+	conflictLog := filepath.Join(sandbox.Sandbox.RootPath, "workspace", "bundle", "metadata", "lock-conflicts.log")
+	if _, err := os.Stat(conflictLog); err != nil {
+		t.Fatalf("expected lock conflict log: %v", err)
+	}
+}
+
+func TestStartPreviewFromSharedSandbox(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-preview",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	if _, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	}); err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+
+	result, err := svc.StartPreview(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("start preview: %v", err)
+	}
+	if result.Preview.Status != "READY" {
+		t.Fatalf("expected preview READY, got %s", result.Preview.Status)
+	}
+	if !strings.Contains(result.Preview.URL, "/projects/"+project.ID+"/preview/") {
+		t.Fatalf("expected preview URL, got %s", result.Preview.URL)
+	}
+	if result.RefreshIntervalMs != 3000 {
+		t.Fatalf("expected refresh interval 3000, got %d", result.RefreshIntervalMs)
+	}
+}
+
 func prepareSharedSandboxMergeScenario(t *testing.T, svc *Service, ctx context.Context) (*domain.Project, *domain.Contract, []domain.Task) {
 	t.Helper()
 
@@ -1067,4 +1251,25 @@ func waitForRunTerminal(t *testing.T, svc *Service, projectID, runID string) *Ru
 
 	t.Fatalf("run %s did not reach terminal state before deadline", runID)
 	return nil
+}
+
+func waitForTaskStatus(t *testing.T, svc *Service, projectID, runID string, expected domain.TaskStatus) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := svc.GetRunStatus(context.Background(), projectID, runID)
+		if err != nil {
+			t.Fatalf("get run status: %v", err)
+		}
+		if status.Task.Status == expected {
+			return
+		}
+		if status.Run.Status == domain.RunStatusFailed {
+			t.Fatalf("run failed before reaching task status %s: %s", expected, status.Run.Error)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("run %s did not reach task status %s before deadline", runID, expected)
 }

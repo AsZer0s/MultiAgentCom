@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"multiagentcom/internal/config"
+	"multiagentcom/internal/domain"
 	"multiagentcom/internal/service"
 )
 
@@ -45,9 +46,14 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("GET /projects/{id}/tasks/{taskId}/context", server.handleGetTaskContext)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/context/generate", server.handleGenerateTaskContext)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/sandbox/fail", server.handleInjectSandboxFailure)
+	mux.HandleFunc("POST /projects/{id}/overrides", server.handleApplyHumanOverride)
+	mux.HandleFunc("POST /projects/{id}/locks", server.handleApplyCodeLock)
 	mux.HandleFunc("POST /projects/{id}/shared-sandbox/merge", server.handleMergeSharedSandbox)
 	mux.HandleFunc("GET /projects/{id}/snapshots", server.handleListSnapshots)
 	mux.HandleFunc("POST /projects/{id}/snapshots/rollback", server.handleRollbackSnapshot)
+	mux.HandleFunc("POST /projects/{id}/preview/start", server.handleStartPreview)
+	mux.HandleFunc("GET /projects/{id}/preview/{previewId}", server.handlePreviewPage)
+	mux.HandleFunc("GET /projects/{id}/preview/{previewId}/status", server.handleGetPreviewStatus)
 	mux.HandleFunc("POST /projects/{id}/tasks/run", server.handleStartRun)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/retry", server.handleRetryTask)
 	mux.HandleFunc("POST /projects/{id}/runs/parallel", server.handleStartParallelRun)
@@ -262,6 +268,38 @@ func (s *Server) handleInjectSandboxFailure(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+func (s *Server) handleApplyHumanOverride(w http.ResponseWriter, r *http.Request) {
+	var input service.ApplyHumanOverrideInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	result, err := s.svc.ApplyHumanOverride(r.Context(), r.PathValue("id"), input)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, result)
+}
+
+func (s *Server) handleApplyCodeLock(w http.ResponseWriter, r *http.Request) {
+	var input service.ApplyCodeLockInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	result, err := s.svc.ApplyCodeLock(r.Context(), r.PathValue("id"), input)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, result)
+}
+
 func (s *Server) handleMergeSharedSandbox(w http.ResponseWriter, r *http.Request) {
 	var input service.MergeSharedSandboxInput
 	if err := decodeJSON(r, &input); err != nil {
@@ -309,6 +347,37 @@ func (s *Server) handleRollbackSnapshot(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusCreated, result)
+}
+
+func (s *Server) handleStartPreview(w http.ResponseWriter, r *http.Request) {
+	result, err := s.svc.StartPreview(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, result)
+}
+
+func (s *Server) handleGetPreviewStatus(w http.ResponseWriter, r *http.Request) {
+	preview, err := s.svc.GetPreview(r.Context(), r.PathValue("id"), r.PathValue("previewId"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, preview)
+}
+
+func (s *Server) handlePreviewPage(w http.ResponseWriter, r *http.Request) {
+	preview, err := s.svc.GetPreview(r.Context(), r.PathValue("id"), r.PathValue("previewId"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(renderPreviewHTML(*preview)))
 }
 
 func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
@@ -541,6 +610,216 @@ func generateRequestID() string {
 	return time.Now().UTC().Format("20060102T150405.000000000")
 }
 
+func renderPreviewHTML(preview domain.Preview) string {
+	return fmt.Sprintf(`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Preview %s</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --card: #ffffff;
+      --ink: #18212f;
+      --muted: #5c6b7d;
+      --accent: #0f62fe;
+      --accent-soft: rgba(15, 98, 254, 0.12);
+      --line: #d7deea;
+      --done: #1f9d55;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(15, 98, 254, 0.12), transparent 30%%),
+        linear-gradient(180deg, #fbfdff 0%%, var(--bg) 100%%);
+    }
+    .app { max-width: 960px; margin: 0 auto; padding: 28px 18px 48px; }
+    .hero { display: grid; gap: 10px; margin-bottom: 22px; }
+    .eyebrow { font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+    h1 { margin: 0; font-size: clamp(28px, 4vw, 48px); line-height: 0.95; }
+    .sub { color: var(--muted); max-width: 680px; line-height: 1.6; }
+    .badge-row { display: flex; flex-wrap: wrap; gap: 10px; }
+    .badge {
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .layout { display: grid; gap: 18px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: 0 18px 48px rgba(24, 33, 47, 0.08);
+      padding: 20px;
+    }
+    .composer { display: grid; gap: 12px; grid-template-columns: 1fr auto; }
+    .composer input {
+      width: 100%%;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px 16px;
+      font: inherit;
+      background: #fff;
+    }
+    .composer button, .todo-actions button {
+      border: 0;
+      border-radius: 16px;
+      padding: 12px 16px;
+      font: inherit;
+      cursor: pointer;
+    }
+    .composer button { background: var(--accent); color: #fff; }
+    ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+    li {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+      background: #fff;
+    }
+    .todo-main { display: flex; gap: 12px; align-items: center; }
+    .todo-main input[type="text"] {
+      flex: 1;
+      border: 0;
+      font: inherit;
+      color: var(--ink);
+      background: transparent;
+    }
+    .todo-main input[type="text"]:focus { outline: none; }
+    .todo-actions { display: flex; gap: 8px; }
+    .todo-actions button { background: var(--accent-soft); color: var(--accent); }
+    .todo-main.done input[type="text"] { text-decoration: line-through; color: var(--muted); }
+    .hot { color: var(--done); font-weight: 600; }
+    @media (max-width: 640px) {
+      .composer { grid-template-columns: 1fr; }
+      .todo-main { align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <section class="hero">
+      <div class="eyebrow">Live Preview</div>
+      <h1>Todo Preview Workspace</h1>
+      <div class="sub">这是基于共享沙盒发布的最小预览页，支持 Todo 的新增、编辑、完成和删除，并通过 revision 轮询提供 MVP 级热更新。</div>
+      <div class="badge-row">
+        <div class="badge">Preview ID: %s</div>
+        <div class="badge">Sandbox: %s</div>
+        <div class="badge">Revision: <span id="revision">%s</span></div>
+        <div class="badge hot" id="hot-status">Hot reload watching</div>
+      </div>
+    </section>
+
+    <section class="layout">
+      <div class="card">
+        <div class="composer">
+          <input id="new-todo" type="text" placeholder="Add a todo and press Create">
+          <button id="add-btn" type="button">Create</button>
+        </div>
+      </div>
+      <div class="card">
+        <ul id="todo-list"></ul>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const todos = [
+      { id: crypto.randomUUID(), title: "Review shared sandbox merge", done: false },
+      { id: crypto.randomUUID(), title: "Verify rollback branch timeline", done: true }
+    ];
+    const list = document.getElementById("todo-list");
+    const input = document.getElementById("new-todo");
+    const addBtn = document.getElementById("add-btn");
+    const revisionNode = document.getElementById("revision");
+    let currentRevision = %q;
+
+    function render() {
+      list.innerHTML = "";
+      todos.forEach((todo) => {
+        const item = document.createElement("li");
+        const main = document.createElement("div");
+        main.className = "todo-main" + (todo.done ? " done" : "");
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = todo.done;
+        checkbox.addEventListener("change", () => {
+          todo.done = checkbox.checked;
+          render();
+        });
+
+        const title = document.createElement("input");
+        title.type = "text";
+        title.value = todo.title;
+        title.addEventListener("input", (event) => {
+          todo.title = event.target.value;
+        });
+
+        const actions = document.createElement("div");
+        actions.className = "todo-actions";
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.textContent = "Delete";
+        remove.addEventListener("click", () => {
+          const index = todos.findIndex((entry) => entry.id === todo.id);
+          if (index >= 0) {
+            todos.splice(index, 1);
+            render();
+          }
+        });
+        actions.appendChild(remove);
+
+        main.appendChild(checkbox);
+        main.appendChild(title);
+        item.appendChild(main);
+        item.appendChild(actions);
+        list.appendChild(item);
+      });
+    }
+
+    function createTodo() {
+      const title = input.value.trim();
+      if (!title) return;
+      todos.unshift({ id: crypto.randomUUID(), title, done: false });
+      input.value = "";
+      render();
+    }
+
+    addBtn.addEventListener("click", createTodo);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") createTodo();
+    });
+
+    async function pollRevision() {
+      try {
+        const resp = await fetch(window.location.pathname + "/status", { headers: { "Accept": "application/json" } });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        revisionNode.textContent = data.revision;
+        if (data.revision !== currentRevision) {
+          currentRevision = data.revision;
+          window.location.reload();
+        }
+      } catch (_) {
+      }
+    }
+
+    render();
+    window.setInterval(pollRevision, 3000);
+  </script>
+</body>
+</html>`, preview.ID, preview.ID, preview.SandboxID, preview.Revision, preview.Revision)
+}
+
 func renderStatusPanelHTML(serviceName string) string {
 	return fmt.Sprintf(`<!doctype html>
 <html lang="zh-CN">
@@ -560,6 +839,7 @@ func renderStatusPanelHTML(serviceName string) string {
       --ok: #0f8b4c;
       --warn: #b7791f;
       --bad: #b42318;
+      --hold: #8a3ffc;
       --idle: #7c8798;
     }
     * { box-sizing: border-box; }
@@ -666,6 +946,7 @@ func renderStatusPanelHTML(serviceName string) string {
     .RUNNING .dot { background: var(--accent); }
     .READY .dot { background: var(--warn); }
     .BLOCKED .dot { background: var(--bad); }
+    .HUMAN_OVERRIDE .dot { background: var(--hold); }
     .COMPLETED .dot { background: var(--ok); }
     .IDLE .dot { background: var(--idle); }
     table {
