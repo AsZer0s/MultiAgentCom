@@ -61,6 +61,12 @@ type Service struct {
 	sandboxIndex  map[string]*domain.Sandbox
 	sandboxes     map[string][]*domain.Sandbox
 	sandboxFaults map[string]string
+	snapshotIndex map[string]*domain.Snapshot
+	snapshots     map[string][]*domain.Snapshot
+	snapshotState map[string]*projectSnapshotState
+	projectBranch map[string]string
+	stableBranch  map[string]string
+	branchSeq     map[string]int
 	tasks         map[string]*domain.Task
 	taskOrder     map[string][]string
 	runs          map[string]*domain.AgentRun
@@ -207,8 +213,39 @@ type SharedSandboxMergeResult struct {
 	Passed            bool                         `json:"passed"`
 	ContractConflicts []ContractValidationConflict `json:"contractConflicts,omitempty"`
 	RemediationTask   *domain.Task                 `json:"remediationTask,omitempty"`
+	Rollback          *RollbackResult              `json:"rollback,omitempty"`
 	ArtifactIDs       []string                     `json:"artifactIds,omitempty"`
 	Message           string                       `json:"message,omitempty"`
+}
+
+type RollbackSnapshotInput struct {
+	SnapshotID string `json:"snapshotId"`
+	Reason     string `json:"reason"`
+}
+
+type RollbackResult struct {
+	Snapshot        domain.Snapshot `json:"snapshot"`
+	RestoredFrom    domain.Snapshot `json:"restoredFrom"`
+	PreviousBranch  string          `json:"previousBranch"`
+	ActiveBranch    string          `json:"activeBranch"`
+	ClearedContexts int             `json:"clearedContexts"`
+	RestoredTasks   int             `json:"restoredTasks"`
+	Message         string          `json:"message,omitempty"`
+}
+
+type projectSnapshotState struct {
+	project       *domain.Project
+	requirements  []*domain.Requirement
+	plans         []*domain.Plan
+	contracts     []*domain.Contract
+	contexts      map[string][]*domain.ContextInjection
+	sandboxes     []*domain.Sandbox
+	tasks         map[string]*domain.Task
+	taskOrder     []string
+	runs          map[string]*domain.AgentRun
+	runOrder      []string
+	artifacts     map[string]*domain.Artifact
+	artifactOrder []string
 }
 
 func New(cfg config.Config, logger *slog.Logger) *Service {
@@ -230,6 +267,12 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		sandboxIndex:  make(map[string]*domain.Sandbox),
 		sandboxes:     make(map[string][]*domain.Sandbox),
 		sandboxFaults: make(map[string]string),
+		snapshotIndex: make(map[string]*domain.Snapshot),
+		snapshots:     make(map[string][]*domain.Snapshot),
+		snapshotState: make(map[string]*projectSnapshotState),
+		projectBranch: make(map[string]string),
+		stableBranch:  make(map[string]string),
+		branchSeq:     make(map[string]int),
 		tasks:         make(map[string]*domain.Task),
 		taskOrder:     make(map[string][]string),
 		runs:          make(map[string]*domain.AgentRun),
@@ -256,6 +299,7 @@ func (s *Service) CreateProject(_ context.Context, input CreateProjectInput) (*d
 
 	s.mu.Lock()
 	s.projects[project.ID] = project
+	s.projectBranch[project.ID] = "main"
 	s.mu.Unlock()
 
 	return cloneProject(project), nil
@@ -305,6 +349,23 @@ func (s *Service) ListProjects(_ context.Context) ([]domain.Project, error) {
 	})
 
 	return projects, nil
+}
+
+func (s *Service) ListSnapshots(_ context.Context, projectID string) ([]domain.Snapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	items := s.snapshots[projectID]
+	result := make([]domain.Snapshot, 0, len(items))
+	for _, snapshot := range items {
+		result = append(result, *cloneSnapshot(snapshot))
+	}
+
+	return result, nil
 }
 
 func (s *Service) GetProject(_ context.Context, projectID string) (*domain.Project, error) {
@@ -720,7 +781,17 @@ func (s *Service) MergeToSharedSandbox(_ context.Context, projectID string, inpu
 		sharedSandbox.UpdatedAt = time.Now().UTC()
 		_ = writeFile(filepath.Join(sharedSandbox.RootPath, "integration-error.log"), []byte(sharedSandbox.FailureReason+"\n"))
 		result.Sandbox = *cloneSandbox(sharedSandbox)
-		result.Message = "merge blocked by shared sandbox integration failure"
+		if stableSnapshotID := s.stableBranch[projectID]; stableSnapshotID != "" {
+			rollback, rollbackErr := s.rollbackToSnapshotLocked(projectID, stableSnapshotID, "shared sandbox integration failure", sharedSandbox.UpdatedAt)
+			if rollbackErr != nil {
+				result.Message = "merge blocked by shared sandbox integration failure; automatic rollback failed: " + rollbackErr.Error()
+			} else {
+				result.Rollback = rollback
+				result.Message = "merge blocked by shared sandbox integration failure and rolled back to latest stable snapshot"
+			}
+		} else {
+			result.Message = "merge blocked by shared sandbox integration failure"
+		}
 		return result, nil
 	}
 
@@ -728,9 +799,36 @@ func (s *Service) MergeToSharedSandbox(_ context.Context, projectID string, inpu
 	sharedSandbox.UpdatedAt = time.Now().UTC()
 	result.Sandbox = *cloneSandbox(sharedSandbox)
 	result.Passed = true
+	snapshot, snapshotErr := s.recordSnapshotLocked(projectID, s.currentBranchLocked(projectID), "shared sandbox merge checkpoint", true, s.latestSnapshotIDLocked(projectID), sharedSandbox.UpdatedAt)
+	if snapshotErr != nil {
+		result.Message = "artifacts merged into shared sandbox, but checkpoint creation failed: " + snapshotErr.Error()
+		return result, nil
+	}
+	_ = snapshot
 	result.Message = "artifacts merged into shared sandbox"
 
 	return result, nil
+}
+
+func (s *Service) RollbackToSnapshot(_ context.Context, projectID string, input RollbackSnapshotInput) (*RollbackResult, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+	if strings.TrimSpace(input.SnapshotID) == "" {
+		return nil, newValidationError("snapshotId is required for rollback")
+	}
+
+	reason := strings.TrimSpace(input.Reason)
+	if reason == "" {
+		reason = "manual snapshot rollback"
+	}
+
+	return s.rollbackToSnapshotLocked(projectID, input.SnapshotID, reason, now)
 }
 
 func (s *Service) DispatchTasks(_ context.Context, projectID string) (*DispatchTasksResult, error) {
@@ -1646,6 +1744,229 @@ func (s *Service) writeSharedSandboxManifest(sharedSandbox *domain.Sandbox, task
 	return writeJSONFile(filepath.Join(sharedSandbox.RootPath, "workspace", "manifest.json"), manifest)
 }
 
+func (s *Service) currentBranchLocked(projectID string) string {
+	branch := strings.TrimSpace(s.projectBranch[projectID])
+	if branch == "" {
+		return "main"
+	}
+	return branch
+}
+
+func (s *Service) latestSnapshotIDLocked(projectID string) string {
+	items := s.snapshots[projectID]
+	if len(items) == 0 {
+		return ""
+	}
+	return items[len(items)-1].ID
+}
+
+func (s *Service) recordSnapshotLocked(projectID, branch, reason string, stable bool, sourceSnapshotID string, now time.Time) (*domain.Snapshot, error) {
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+	if strings.TrimSpace(branch) == "" {
+		branch = s.currentBranchLocked(projectID)
+	}
+
+	snapshot := &domain.Snapshot{
+		ID:               nextID("snapshot"),
+		ProjectID:        projectID,
+		Branch:           branch,
+		SourceSnapshotID: strings.TrimSpace(sourceSnapshotID),
+		Reason:           strings.TrimSpace(reason),
+		StateRef:         "",
+		Stable:           stable,
+		CreatedAt:        now,
+	}
+	snapshot.StateRef = "memory://" + snapshot.ID
+
+	s.snapshotIndex[snapshot.ID] = snapshot
+	s.snapshots[projectID] = append(s.snapshots[projectID], snapshot)
+	s.snapshotState[snapshot.ID] = s.captureProjectSnapshotStateLocked(projectID)
+	s.projectBranch[projectID] = branch
+	if stable {
+		s.stableBranch[projectID] = snapshot.ID
+	}
+
+	return snapshot, nil
+}
+
+func (s *Service) rollbackToSnapshotLocked(projectID, snapshotID, reason string, now time.Time) (*RollbackResult, error) {
+	snapshot, ok := s.snapshotIndex[snapshotID]
+	if !ok || snapshot.ProjectID != projectID {
+		return nil, newNotFoundError("snapshot not found")
+	}
+	state, ok := s.snapshotState[snapshotID]
+	if !ok {
+		return nil, newNotFoundError("snapshot state not found")
+	}
+
+	previousBranch := s.currentBranchLocked(projectID)
+	activeBranch := s.nextRollbackBranchLocked(projectID, snapshot.Branch)
+	s.restoreProjectFromSnapshotLocked(projectID, state)
+	clearedContexts := s.clearProjectContextsLocked(projectID)
+	if project := s.projects[projectID]; project != nil {
+		project.UpdatedAt = now
+	}
+
+	rollbackSnapshot, err := s.recordSnapshotLocked(projectID, activeBranch, reason, snapshot.Stable, snapshot.ID, now)
+	if err != nil {
+		return nil, err
+	}
+
+	return &RollbackResult{
+		Snapshot:        *cloneSnapshot(rollbackSnapshot),
+		RestoredFrom:    *cloneSnapshot(snapshot),
+		PreviousBranch:  previousBranch,
+		ActiveBranch:    activeBranch,
+		ClearedContexts: clearedContexts,
+		RestoredTasks:   len(s.taskOrder[projectID]),
+		Message:         "project rolled back to snapshot " + snapshot.ID,
+	}, nil
+}
+
+func (s *Service) nextRollbackBranchLocked(projectID, baseBranch string) string {
+	baseBranch = strings.TrimSpace(baseBranch)
+	if baseBranch == "" {
+		baseBranch = s.currentBranchLocked(projectID)
+	}
+	s.branchSeq[projectID]++
+	return fmt.Sprintf("%s-rollback-%d", baseBranch, s.branchSeq[projectID])
+}
+
+func (s *Service) captureProjectSnapshotStateLocked(projectID string) *projectSnapshotState {
+	state := &projectSnapshotState{
+		project:       cloneProject(s.projects[projectID]),
+		requirements:  cloneRequirements(s.requirements[projectID]),
+		plans:         clonePlans(s.plans[projectID]),
+		contracts:     cloneContracts(s.contracts[projectID]),
+		contexts:      make(map[string][]*domain.ContextInjection),
+		sandboxes:     cloneSandboxes(s.sandboxes[projectID]),
+		tasks:         make(map[string]*domain.Task),
+		taskOrder:     append([]string(nil), s.taskOrder[projectID]...),
+		runs:          make(map[string]*domain.AgentRun),
+		runOrder:      append([]string(nil), s.runOrder[projectID]...),
+		artifacts:     make(map[string]*domain.Artifact),
+		artifactOrder: append([]string(nil), s.artifactOrder[projectID]...),
+	}
+
+	for _, taskID := range state.taskOrder {
+		if task, ok := s.tasks[taskID]; ok {
+			state.tasks[taskID] = cloneTask(task)
+		}
+		if history := s.contexts[taskID]; len(history) > 0 {
+			state.contexts[taskID] = cloneContextHistory(history)
+		}
+	}
+	for _, runID := range state.runOrder {
+		if run, ok := s.runs[runID]; ok {
+			state.runs[runID] = cloneRun(run)
+		}
+	}
+	for _, artifactID := range state.artifactOrder {
+		if artifact, ok := s.artifacts[artifactID]; ok {
+			state.artifacts[artifactID] = cloneArtifact(artifact)
+		}
+	}
+
+	return state
+}
+
+func (s *Service) restoreProjectFromSnapshotLocked(projectID string, state *projectSnapshotState) {
+	s.clearProjectStateLocked(projectID)
+
+	s.projects[projectID] = cloneProject(state.project)
+	s.requirements[projectID] = cloneRequirements(state.requirements)
+	s.plans[projectID] = clonePlans(state.plans)
+	for _, plan := range s.plans[projectID] {
+		s.planIndex[plan.ID] = plan
+	}
+
+	s.contracts[projectID] = cloneContracts(state.contracts)
+	for _, contract := range s.contracts[projectID] {
+		s.contractIndex[contract.ID] = contract
+	}
+
+	s.taskOrder[projectID] = append([]string(nil), state.taskOrder...)
+	for _, taskID := range state.taskOrder {
+		if task, ok := state.tasks[taskID]; ok {
+			s.tasks[taskID] = cloneTask(task)
+		}
+		if history, ok := state.contexts[taskID]; ok {
+			s.contexts[taskID] = cloneContextHistory(history)
+			for _, injection := range s.contexts[taskID] {
+				s.contextIndex[injection.ID] = injection
+			}
+		}
+	}
+
+	s.sandboxes[projectID] = cloneSandboxes(state.sandboxes)
+	for _, sandbox := range s.sandboxes[projectID] {
+		s.sandboxIndex[sandbox.ID] = sandbox
+	}
+
+	s.runOrder[projectID] = append([]string(nil), state.runOrder...)
+	for _, runID := range state.runOrder {
+		if run, ok := state.runs[runID]; ok {
+			s.runs[runID] = cloneRun(run)
+		}
+	}
+
+	s.artifactOrder[projectID] = append([]string(nil), state.artifactOrder...)
+	for _, artifactID := range state.artifactOrder {
+		if artifact, ok := state.artifacts[artifactID]; ok {
+			s.artifacts[artifactID] = cloneArtifact(artifact)
+		}
+	}
+}
+
+func (s *Service) clearProjectStateLocked(projectID string) {
+	for _, plan := range s.plans[projectID] {
+		delete(s.planIndex, plan.ID)
+	}
+	for _, contract := range s.contracts[projectID] {
+		delete(s.contractIndex, contract.ID)
+	}
+	for _, taskID := range s.taskOrder[projectID] {
+		for _, injection := range s.contexts[taskID] {
+			delete(s.contextIndex, injection.ID)
+		}
+		delete(s.contexts, taskID)
+		delete(s.tasks, taskID)
+		delete(s.sandboxFaults, taskID)
+	}
+	for _, sandbox := range s.sandboxes[projectID] {
+		delete(s.sandboxIndex, sandbox.ID)
+	}
+	for _, runID := range s.runOrder[projectID] {
+		delete(s.runs, runID)
+	}
+	for _, artifactID := range s.artifactOrder[projectID] {
+		delete(s.artifacts, artifactID)
+	}
+
+	delete(s.requirements, projectID)
+	delete(s.plans, projectID)
+	delete(s.contracts, projectID)
+	delete(s.sandboxes, projectID)
+	delete(s.taskOrder, projectID)
+	delete(s.runOrder, projectID)
+	delete(s.artifactOrder, projectID)
+}
+
+func (s *Service) clearProjectContextsLocked(projectID string) int {
+	cleared := 0
+	for _, taskID := range s.taskOrder[projectID] {
+		history := s.contexts[taskID]
+		cleared += len(history)
+		for _, injection := range history {
+			delete(s.contextIndex, injection.ID)
+		}
+		delete(s.contexts, taskID)
+	}
+	return cleared
+}
+
 func (s *Service) resolveArtifactFromRunLocked(run *domain.AgentRun) (*domain.Artifact, error) {
 	if run.Status != domain.RunStatusSucceeded {
 		return nil, newConflictError("run has not completed successfully")
@@ -2350,6 +2671,14 @@ func cloneRequirement(requirement *domain.Requirement) *domain.Requirement {
 	return &copy
 }
 
+func cloneRequirements(items []*domain.Requirement) []*domain.Requirement {
+	result := make([]*domain.Requirement, 0, len(items))
+	for _, item := range items {
+		result = append(result, cloneRequirement(item))
+	}
+	return result
+}
+
 func clonePlan(plan *domain.Plan) *domain.Plan {
 	if plan == nil {
 		return nil
@@ -2360,6 +2689,14 @@ func clonePlan(plan *domain.Plan) *domain.Plan {
 	copy.AcceptanceCriteria = append([]string(nil), plan.AcceptanceCriteria...)
 	copy.Assumptions = append([]string(nil), plan.Assumptions...)
 	return &copy
+}
+
+func clonePlans(items []*domain.Plan) []*domain.Plan {
+	result := make([]*domain.Plan, 0, len(items))
+	for _, item := range items {
+		result = append(result, clonePlan(item))
+	}
+	return result
 }
 
 func cloneContract(contract *domain.Contract) *domain.Contract {
@@ -2376,6 +2713,14 @@ func cloneContract(contract *domain.Contract) *domain.Contract {
 		copy.Schemas = append(copy.Schemas, schemaCopy)
 	}
 	return &copy
+}
+
+func cloneContracts(items []*domain.Contract) []*domain.Contract {
+	result := make([]*domain.Contract, 0, len(items))
+	for _, item := range items {
+		result = append(result, cloneContract(item))
+	}
+	return result
 }
 
 func cloneTask(task *domain.Task) *domain.Task {
@@ -2403,11 +2748,35 @@ func cloneContextInjection(injection *domain.ContextInjection) *domain.ContextIn
 	return &copy
 }
 
+func cloneContextHistory(items []*domain.ContextInjection) []*domain.ContextInjection {
+	result := make([]*domain.ContextInjection, 0, len(items))
+	for _, item := range items {
+		result = append(result, cloneContextInjection(item))
+	}
+	return result
+}
+
 func cloneSandbox(sandbox *domain.Sandbox) *domain.Sandbox {
 	if sandbox == nil {
 		return nil
 	}
 	copy := *sandbox
+	return &copy
+}
+
+func cloneSandboxes(items []*domain.Sandbox) []*domain.Sandbox {
+	result := make([]*domain.Sandbox, 0, len(items))
+	for _, item := range items {
+		result = append(result, cloneSandbox(item))
+	}
+	return result
+}
+
+func cloneSnapshot(snapshot *domain.Snapshot) *domain.Snapshot {
+	if snapshot == nil {
+		return nil
+	}
+	copy := *snapshot
 	return &copy
 }
 

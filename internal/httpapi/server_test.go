@@ -709,6 +709,120 @@ func TestHTTPSharedSandboxMergeIntegrationFailure(t *testing.T) {
 	}
 }
 
+func TestHTTPSharedSandboxFailureAutoRollback(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-snapshot-auto-rollback",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	project, contract, dispatched := prepareHTTPSharedSandboxMergeScenario(t, server)
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/"+dispatched[0].ID+"/context/generate", map[string]any{})
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/"+dispatched[1].ID+"/context/generate", map[string]any{})
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/shared-sandbox/merge", map[string]any{
+		"taskIds":    []string{dispatched[0].ID, dispatched[1].ID},
+		"contractId": contract.ID,
+		"endpoints":  contract.Endpoints,
+		"schemas":    contract.Schemas,
+	})
+
+	failureBody := requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/shared-sandbox/merge", map[string]any{
+		"taskIds":         []string{dispatched[0].ID, dispatched[1].ID},
+		"contractId":      contract.ID,
+		"endpoints":       contract.Endpoints,
+		"schemas":         contract.Schemas,
+		"simulateFailure": true,
+	}, http.StatusConflict)
+
+	var result service.SharedSandboxMergeResult
+	decodeResponse(t, failureBody, &result)
+	if result.Rollback == nil {
+		t.Fatal("expected rollback details in response")
+	}
+	if result.Rollback.ActiveBranch == "main" {
+		t.Fatalf("expected auto rollback to move active branch, got %s", result.Rollback.ActiveBranch)
+	}
+
+	snapshotsBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/snapshots")
+	var snapshots struct {
+		Items []domain.Snapshot `json:"items"`
+		Count int               `json:"count"`
+	}
+	decodeResponse(t, snapshotsBody, &snapshots)
+	if snapshots.Count != 2 || len(snapshots.Items) != 2 {
+		t.Fatalf("expected stable snapshot plus rollback snapshot, got count=%d len=%d", snapshots.Count, len(snapshots.Items))
+	}
+}
+
+func TestHTTPRollbackSnapshotCreatesParallelBranchTimeline(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-snapshot-rollback",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	project, contract, dispatched := prepareHTTPSharedSandboxMergeScenario(t, server)
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/shared-sandbox/merge", map[string]any{
+		"taskIds":    []string{dispatched[0].ID, dispatched[1].ID},
+		"contractId": contract.ID,
+		"endpoints":  contract.Endpoints,
+		"schemas":    contract.Schemas,
+	})
+
+	snapshotsBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/snapshots")
+	var snapshots struct {
+		Items []domain.Snapshot `json:"items"`
+		Count int               `json:"count"`
+	}
+	decodeResponse(t, snapshotsBody, &snapshots)
+	if snapshots.Count != 1 {
+		t.Fatalf("expected 1 initial snapshot, got %d", snapshots.Count)
+	}
+
+	rollbackBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/snapshots/rollback", map[string]any{
+		"snapshotId": snapshots.Items[0].ID,
+		"reason":     "manual rollback verification",
+	})
+	var rollback service.RollbackResult
+	decodeResponse(t, rollbackBody, &rollback)
+	if rollback.ActiveBranch == rollback.PreviousBranch {
+		t.Fatalf("expected rollback to create a new branch, got %s", rollback.ActiveBranch)
+	}
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/shared-sandbox/merge", map[string]any{
+		"taskIds":    []string{dispatched[0].ID, dispatched[1].ID},
+		"contractId": contract.ID,
+		"endpoints":  contract.Endpoints,
+		"schemas":    contract.Schemas,
+	})
+
+	snapshotsBody = getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/snapshots")
+	decodeResponse(t, snapshotsBody, &snapshots)
+	if snapshots.Count != 3 {
+		t.Fatalf("expected 3 snapshots after rollback branch checkpoint, got %d", snapshots.Count)
+	}
+	if snapshots.Items[0].Branch != "main" {
+		t.Fatalf("expected original branch main, got %s", snapshots.Items[0].Branch)
+	}
+	if snapshots.Items[1].Branch != rollback.ActiveBranch || snapshots.Items[2].Branch != rollback.ActiveBranch {
+		t.Fatalf("expected rollback branch %s, got %s and %s", rollback.ActiveBranch, snapshots.Items[1].Branch, snapshots.Items[2].Branch)
+	}
+}
+
 func prepareHTTPSharedSandboxMergeScenario(t *testing.T, server *httptest.Server) (domain.Project, domain.Contract, []domain.Task) {
 	t.Helper()
 

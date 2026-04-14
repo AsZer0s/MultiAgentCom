@@ -46,6 +46,8 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/context/generate", server.handleGenerateTaskContext)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/sandbox/fail", server.handleInjectSandboxFailure)
 	mux.HandleFunc("POST /projects/{id}/shared-sandbox/merge", server.handleMergeSharedSandbox)
+	mux.HandleFunc("GET /projects/{id}/snapshots", server.handleListSnapshots)
+	mux.HandleFunc("POST /projects/{id}/snapshots/rollback", server.handleRollbackSnapshot)
 	mux.HandleFunc("POST /projects/{id}/tasks/run", server.handleStartRun)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/retry", server.handleRetryTask)
 	mux.HandleFunc("POST /projects/{id}/runs/parallel", server.handleStartParallelRun)
@@ -278,6 +280,35 @@ func (s *Server) handleMergeSharedSandbox(w http.ResponseWriter, r *http.Request
 		status = http.StatusConflict
 	}
 	writeJSON(w, status, result)
+}
+
+func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
+	snapshots, err := s.svc.ListSnapshots(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": snapshots,
+		"count": len(snapshots),
+	})
+}
+
+func (s *Server) handleRollbackSnapshot(w http.ResponseWriter, r *http.Request) {
+	var input service.RollbackSnapshotInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	result, err := s.svc.RollbackToSnapshot(r.Context(), r.PathValue("id"), input)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, result)
 }
 
 func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {

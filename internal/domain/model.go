@@ -115,6 +115,17 @@ type Sandbox struct {
 	UpdatedAt     time.Time     `json:"updatedAt"`
 }
 
+type Snapshot struct {
+	ID               string    `json:"id"`
+	ProjectID        string    `json:"projectId"`
+	Branch           string    `json:"branch"`
+	SourceSnapshotID string    `json:"sourceSnapshotId,omitempty"`
+	Reason           string    `json:"reason"`
+	StateRef         string    `json:"stateRef"`
+	Stable           bool      `json:"stable"`
+	CreatedAt        time.Time `json:"createdAt"`
+}
+
 type TaskStatus string
 
 const (

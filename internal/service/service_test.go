@@ -740,6 +740,17 @@ func TestMergeSharedSandboxSuccess(t *testing.T) {
 	if len(sandboxes) != 3 {
 		t.Fatalf("expected 3 sandboxes including shared merge gate, got %d", len(sandboxes))
 	}
+
+	snapshots, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("expected 1 stable snapshot after successful merge, got %d", len(snapshots))
+	}
+	if !snapshots[0].Stable || snapshots[0].Branch != "main" {
+		t.Fatalf("expected stable main snapshot, got %+v", snapshots[0])
+	}
 }
 
 func TestMergeSharedSandboxBlocksOnContractConflict(t *testing.T) {
@@ -827,6 +838,152 @@ func TestMergeSharedSandboxBlocksOnIntegrationFailure(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(result.Sandbox.RootPath, "integration-error.log")); err != nil {
 		t.Fatalf("expected integration error log: %v", err)
+	}
+}
+
+func TestSharedSandboxFailureAutoRollbackToLatestStableSnapshot(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-shared-sandbox-auto-rollback",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	if _, err := svc.GenerateTaskContext(ctx, project.ID, dispatched[0].ID); err != nil {
+		t.Fatalf("generate backend context: %v", err)
+	}
+	if _, err := svc.GenerateTaskContext(ctx, project.ID, dispatched[1].ID); err != nil {
+		t.Fatalf("generate frontend context: %v", err)
+	}
+
+	if _, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	}); err != nil {
+		t.Fatalf("create stable shared snapshot: %v", err)
+	}
+
+	snapshots, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("expected 1 snapshot before failure, got %d", len(snapshots))
+	}
+
+	result, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:         []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID:      contract.ID,
+		Endpoints:       append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:         append([]domain.ContractSchema(nil), contract.Schemas...),
+		SimulateFailure: true,
+	})
+	if err != nil {
+		t.Fatalf("merge shared sandbox with simulated failure: %v", err)
+	}
+	if result.Passed {
+		t.Fatal("expected failing merge")
+	}
+	if result.Rollback == nil {
+		t.Fatal("expected automatic rollback result")
+	}
+	if result.Rollback.RestoredFrom.ID != snapshots[0].ID {
+		t.Fatalf("expected rollback to snapshot %s, got %s", snapshots[0].ID, result.Rollback.RestoredFrom.ID)
+	}
+	if result.Rollback.ActiveBranch == "main" {
+		t.Fatalf("expected rollback to create a new branch, got %s", result.Rollback.ActiveBranch)
+	}
+	if result.Rollback.ClearedContexts < 2 {
+		t.Fatalf("expected rollback to clear generated contexts, got %d", result.Rollback.ClearedContexts)
+	}
+	if _, err := svc.GetLatestTaskContext(ctx, project.ID, dispatched[0].ID); err == nil {
+		t.Fatal("expected task context to be cleared after rollback")
+	}
+
+	sandboxes, err := svc.ListSandboxes(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list sandboxes: %v", err)
+	}
+	if len(sandboxes) != 3 {
+		t.Fatalf("expected rollback to restore 3 sandboxes, got %d", len(sandboxes))
+	}
+}
+
+func TestRollbackToSnapshotCreatesParallelBranchTimeline(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-snapshot-rollback-branch",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	if _, err := svc.GenerateTaskContext(ctx, project.ID, dispatched[0].ID); err != nil {
+		t.Fatalf("generate task context: %v", err)
+	}
+	if _, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	}); err != nil {
+		t.Fatalf("create initial stable snapshot: %v", err)
+	}
+
+	snapshots, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("expected 1 initial snapshot, got %d", len(snapshots))
+	}
+
+	rollback, err := svc.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{
+		SnapshotID: snapshots[0].ID,
+		Reason:     "manual rollback verification",
+	})
+	if err != nil {
+		t.Fatalf("rollback to snapshot: %v", err)
+	}
+	if rollback.ActiveBranch == rollback.PreviousBranch {
+		t.Fatalf("expected new branch after rollback, got previous=%s active=%s", rollback.PreviousBranch, rollback.ActiveBranch)
+	}
+	if rollback.Snapshot.SourceSnapshotID != snapshots[0].ID {
+		t.Fatalf("expected rollback snapshot source %s, got %s", snapshots[0].ID, rollback.Snapshot.SourceSnapshotID)
+	}
+
+	if _, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	}); err != nil {
+		t.Fatalf("create post-rollback checkpoint: %v", err)
+	}
+
+	snapshots, err = svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots after rollback branch work: %v", err)
+	}
+	if len(snapshots) != 3 {
+		t.Fatalf("expected 3 snapshots after rollback branch work, got %d", len(snapshots))
+	}
+	if snapshots[0].Branch != "main" {
+		t.Fatalf("expected original branch main, got %s", snapshots[0].Branch)
+	}
+	if snapshots[1].Branch != rollback.ActiveBranch || snapshots[2].Branch != rollback.ActiveBranch {
+		t.Fatalf("expected rollback branch snapshots on %s, got %s and %s", rollback.ActiveBranch, snapshots[1].Branch, snapshots[2].Branch)
 	}
 }
 
