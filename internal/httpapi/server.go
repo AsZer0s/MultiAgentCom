@@ -45,6 +45,7 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("GET /projects/{id}/tasks/{taskId}/context", server.handleGetTaskContext)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/context/generate", server.handleGenerateTaskContext)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/sandbox/fail", server.handleInjectSandboxFailure)
+	mux.HandleFunc("POST /projects/{id}/shared-sandbox/merge", server.handleMergeSharedSandbox)
 	mux.HandleFunc("POST /projects/{id}/tasks/run", server.handleStartRun)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/retry", server.handleRetryTask)
 	mux.HandleFunc("POST /projects/{id}/runs/parallel", server.handleStartParallelRun)
@@ -257,6 +258,26 @@ func (s *Server) handleInjectSandboxFailure(w http.ResponseWriter, r *http.Reque
 		"taskId":  r.PathValue("taskId"),
 		"message": "sandbox failure injected",
 	})
+}
+
+func (s *Server) handleMergeSharedSandbox(w http.ResponseWriter, r *http.Request) {
+	var input service.MergeSharedSandboxInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	result, err := s.svc.MergeToSharedSandbox(r.Context(), r.PathValue("id"), input)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	status := http.StatusCreated
+	if !result.Passed {
+		status = http.StatusConflict
+	}
+	writeJSON(w, status, result)
 }
 
 func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {

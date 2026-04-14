@@ -691,6 +691,184 @@ func TestPrivateSandboxIsolation(t *testing.T) {
 	}
 }
 
+func TestMergeSharedSandboxSuccess(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-shared-sandbox-success",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+
+	result, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	})
+	if err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	if !result.Passed {
+		t.Fatalf("expected merge to pass, got %+v", result)
+	}
+	if result.Sandbox.Scope != "SHARED" {
+		t.Fatalf("expected shared sandbox scope, got %s", result.Sandbox.Scope)
+	}
+	if result.Sandbox.Status != domain.SandboxStatusReleased {
+		t.Fatalf("expected shared sandbox RELEASED, got %s", result.Sandbox.Status)
+	}
+	if len(result.ArtifactIDs) != 2 {
+		t.Fatalf("expected 2 merged artifacts, got %d", len(result.ArtifactIDs))
+	}
+	if result.RemediationTask != nil {
+		t.Fatal("did not expect remediation task for successful merge")
+	}
+	if _, err := os.Stat(filepath.Join(result.Sandbox.RootPath, "workspace", "manifest.json")); err != nil {
+		t.Fatalf("expected shared sandbox manifest: %v", err)
+	}
+
+	sandboxes, err := svc.ListSandboxes(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list sandboxes: %v", err)
+	}
+	if len(sandboxes) != 3 {
+		t.Fatalf("expected 3 sandboxes including shared merge gate, got %d", len(sandboxes))
+	}
+}
+
+func TestMergeSharedSandboxBlocksOnContractConflict(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-shared-sandbox-conflict",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+
+	result, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints: []domain.ContractEndpoint{
+			{Name: "ListTodo", Method: "GET", Path: "/api/todos"},
+		},
+		Schemas: []domain.ContractSchema{
+			{
+				Name: "Todo",
+				Fields: []domain.ContractField{
+					{Name: "id", Type: "string", Required: true},
+					{Name: "title", Type: "number", Required: true},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	if result.Passed {
+		t.Fatal("expected merge to be blocked by contract conflict")
+	}
+	if result.Sandbox.Status != domain.SandboxStatusFailed {
+		t.Fatalf("expected shared sandbox FAILED, got %s", result.Sandbox.Status)
+	}
+	if len(result.ContractConflicts) == 0 {
+		t.Fatal("expected contract conflicts in merge result")
+	}
+	if result.RemediationTask == nil {
+		t.Fatal("expected remediation task when shared sandbox merge conflicts")
+	}
+	if result.RemediationTask.Type != "CONTRACT_REWORK" {
+		t.Fatalf("expected remediation task type CONTRACT_REWORK, got %s", result.RemediationTask.Type)
+	}
+}
+
+func TestMergeSharedSandboxBlocksOnIntegrationFailure(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-shared-sandbox-failure",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+
+	result, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:         []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID:      contract.ID,
+		Endpoints:       append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:         append([]domain.ContractSchema(nil), contract.Schemas...),
+		SimulateFailure: true,
+	})
+	if err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	if result.Passed {
+		t.Fatal("expected merge to be blocked by simulated integration failure")
+	}
+	if result.Sandbox.Status != domain.SandboxStatusFailed {
+		t.Fatalf("expected shared sandbox FAILED, got %s", result.Sandbox.Status)
+	}
+	if len(result.ContractConflicts) != 0 {
+		t.Fatalf("expected no contract conflicts for integration failure path, got %d", len(result.ContractConflicts))
+	}
+	if _, err := os.Stat(filepath.Join(result.Sandbox.RootPath, "integration-error.log")); err != nil {
+		t.Fatalf("expected integration error log: %v", err)
+	}
+}
+
+func prepareSharedSandboxMergeScenario(t *testing.T, svc *Service, ctx context.Context) (*domain.Project, *domain.Contract, []domain.Task) {
+	t.Helper()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Shared Sandbox Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:       "实现 Todo 全栈功能",
+		Content:     "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+		Constraints: []string{"后端使用 Go", "前端使用 Vue"},
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	contract, err := svc.GenerateContract(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+	dispatchResult, err := svc.DispatchTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("dispatch tasks: %v", err)
+	}
+
+	parallelResult, err := svc.StartParallelRun(ctx, project.ID, ParallelRunInput{
+		TaskIDs: []string{dispatchResult.Tasks[0].ID, dispatchResult.Tasks[1].ID},
+	})
+	if err != nil {
+		t.Fatalf("start parallel run: %v", err)
+	}
+	for _, started := range parallelResult.Started {
+		waitForSucceededRun(t, svc, project.ID, started.Run.ID)
+	}
+
+	return project, contract, dispatchResult.Tasks
+}
+
 func waitForSucceededRun(t *testing.T, svc *Service, projectID, runID string) {
 	t.Helper()
 

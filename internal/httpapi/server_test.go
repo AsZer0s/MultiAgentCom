@@ -583,6 +583,168 @@ func TestHTTPSandboxIsolationFlow(t *testing.T) {
 	}
 }
 
+func TestHTTPSharedSandboxMergeFlow(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-shared-sandbox",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	project, contract, dispatched := prepareHTTPSharedSandboxMergeScenario(t, server)
+
+	mergeBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/shared-sandbox/merge", map[string]any{
+		"taskIds":    []string{dispatched[0].ID, dispatched[1].ID},
+		"contractId": contract.ID,
+		"endpoints":  contract.Endpoints,
+		"schemas":    contract.Schemas,
+	})
+
+	var result service.SharedSandboxMergeResult
+	decodeResponse(t, mergeBody, &result)
+	if !result.Passed {
+		t.Fatalf("expected merge to pass, got %+v", result)
+	}
+	if result.Sandbox.Scope != "SHARED" {
+		t.Fatalf("expected shared sandbox scope, got %s", result.Sandbox.Scope)
+	}
+	if result.Sandbox.Status != domain.SandboxStatusReleased {
+		t.Fatalf("expected shared sandbox RELEASED, got %s", result.Sandbox.Status)
+	}
+
+	sandboxesBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/sandboxes")
+	var sandboxes struct {
+		Items []service.SandboxView `json:"items"`
+		Count int                   `json:"count"`
+	}
+	decodeResponse(t, sandboxesBody, &sandboxes)
+	if sandboxes.Count != 3 || len(sandboxes.Items) != 3 {
+		t.Fatalf("expected 3 sandboxes including shared gate, got count=%d len=%d", sandboxes.Count, len(sandboxes.Items))
+	}
+}
+
+func TestHTTPSharedSandboxMergeConflict(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-shared-sandbox-conflict",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	project, contract, dispatched := prepareHTTPSharedSandboxMergeScenario(t, server)
+
+	conflictBody := requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/shared-sandbox/merge", map[string]any{
+		"taskIds":    []string{dispatched[0].ID, dispatched[1].ID},
+		"contractId": contract.ID,
+		"endpoints": []map[string]any{
+			{"name": "ListTodo", "method": "GET", "path": "/api/todos"},
+		},
+		"schemas": []map[string]any{
+			{
+				"name": "Todo",
+				"fields": []map[string]any{
+					{"name": "id", "type": "string", "required": true},
+					{"name": "title", "type": "number", "required": true},
+				},
+			},
+		},
+	}, http.StatusConflict)
+
+	var result service.SharedSandboxMergeResult
+	decodeResponse(t, conflictBody, &result)
+	if result.Passed {
+		t.Fatal("expected merge to fail on contract conflicts")
+	}
+	if len(result.ContractConflicts) == 0 {
+		t.Fatal("expected contract conflicts in response")
+	}
+	if result.RemediationTask == nil {
+		t.Fatal("expected remediation task for conflicting merge")
+	}
+}
+
+func TestHTTPSharedSandboxMergeIntegrationFailure(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-shared-sandbox-failure",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	project, contract, dispatched := prepareHTTPSharedSandboxMergeScenario(t, server)
+
+	failureBody := requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/shared-sandbox/merge", map[string]any{
+		"taskIds":         []string{dispatched[0].ID, dispatched[1].ID},
+		"contractId":      contract.ID,
+		"endpoints":       contract.Endpoints,
+		"schemas":         contract.Schemas,
+		"simulateFailure": true,
+	}, http.StatusConflict)
+
+	var result service.SharedSandboxMergeResult
+	decodeResponse(t, failureBody, &result)
+	if result.Passed {
+		t.Fatal("expected merge to fail on simulated integration failure")
+	}
+	if result.Sandbox.Status != domain.SandboxStatusFailed {
+		t.Fatalf("expected shared sandbox FAILED, got %s", result.Sandbox.Status)
+	}
+	if len(result.ContractConflicts) != 0 {
+		t.Fatalf("expected no contract conflicts, got %d", len(result.ContractConflicts))
+	}
+}
+
+func prepareHTTPSharedSandboxMergeScenario(t *testing.T, server *httptest.Server) (domain.Project, domain.Contract, []domain.Task) {
+	t.Helper()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Todo Shared Sandbox Demo",
+	})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{
+		"title":       "实现 Todo 全栈功能",
+		"content":     "实现 Todo 全栈功能，后端提供 API，前端提供页面。",
+		"constraints": []string{"后端使用 Go", "前端使用 Vue"},
+	})
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{})
+
+	contractBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/contracts/generate", map[string]any{})
+	var contract domain.Contract
+	decodeResponse(t, contractBody, &contract)
+
+	dispatchBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/dispatch", map[string]any{})
+	var dispatchResult service.DispatchTasksResult
+	decodeResponse(t, dispatchBody, &dispatchResult)
+
+	parallelBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/runs/parallel", map[string]any{
+		"taskIds": []string{dispatchResult.Tasks[0].ID, dispatchResult.Tasks[1].ID},
+	})
+	var parallelResult service.ParallelRunResult
+	decodeResponse(t, parallelBody, &parallelResult)
+	for _, started := range parallelResult.Started {
+		waitForHTTPRun(t, server, project.ID, started.Run.ID)
+	}
+
+	return project, contract, dispatchResult.Tasks
+}
+
 func requestJSON(t *testing.T, client *http.Client, method, url string, payload any) []byte {
 	t.Helper()
 

@@ -194,6 +194,23 @@ type InjectSandboxFailureInput struct {
 	Reason string `json:"reason"`
 }
 
+type MergeSharedSandboxInput struct {
+	TaskIDs         []string                  `json:"taskIds"`
+	ContractID      string                    `json:"contractId"`
+	Endpoints       []domain.ContractEndpoint `json:"endpoints"`
+	Schemas         []domain.ContractSchema   `json:"schemas"`
+	SimulateFailure bool                      `json:"simulateFailure"`
+}
+
+type SharedSandboxMergeResult struct {
+	Sandbox           domain.Sandbox               `json:"sandbox"`
+	Passed            bool                         `json:"passed"`
+	ContractConflicts []ContractValidationConflict `json:"contractConflicts,omitempty"`
+	RemediationTask   *domain.Task                 `json:"remediationTask,omitempty"`
+	ArtifactIDs       []string                     `json:"artifactIds,omitempty"`
+	Message           string                       `json:"message,omitempty"`
+}
+
 func New(cfg config.Config, logger *slog.Logger) *Service {
 	if strings.TrimSpace(cfg.SandboxRoot) == "" {
 		cfg.SandboxRoot = filepath.Join(os.TempDir(), "multiagentcom", "sandboxes")
@@ -255,19 +272,14 @@ func (s *Service) ListSandboxes(_ context.Context, projectID string) ([]SandboxV
 	items := s.sandboxes[projectID]
 	result := make([]SandboxView, 0, len(items))
 	for _, sandbox := range items {
-		run, ok := s.runs[sandbox.RunID]
-		if !ok {
-			continue
+		view := SandboxView{Sandbox: *cloneSandbox(sandbox)}
+		if run, ok := s.runs[sandbox.RunID]; ok {
+			view.Run = *cloneRun(run)
 		}
-		task, ok := s.tasks[sandbox.TaskID]
-		if !ok {
-			continue
+		if task, ok := s.tasks[sandbox.TaskID]; ok {
+			view.Task = *cloneTask(task)
 		}
-		result = append(result, SandboxView{
-			Sandbox: *cloneSandbox(sandbox),
-			Run:     *cloneRun(run),
-			Task:    *cloneTask(task),
-		})
+		result = append(result, view)
 	}
 
 	return result, nil
@@ -638,6 +650,89 @@ func (s *Service) MarkTaskSandboxFailure(_ context.Context, projectID, taskID, r
 	return nil
 }
 
+func (s *Service) MergeToSharedSandbox(_ context.Context, projectID string, input MergeSharedSandboxInput) (*SharedSandboxMergeResult, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	project, ok := s.projects[projectID]
+	if !ok {
+		return nil, newNotFoundError("project not found")
+	}
+	if len(input.TaskIDs) == 0 {
+		return nil, newValidationError("taskIds are required for shared sandbox merge")
+	}
+
+	tasks, artifactIDs, err := s.resolveMergeTasksLocked(projectID, input.TaskIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	var contract *domain.Contract
+	if input.ContractID != "" || len(input.Endpoints) > 0 || len(input.Schemas) > 0 {
+		contract, err = s.resolveContractLocked(projectID, input.ContractID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		contracts := s.contracts[projectID]
+		if len(contracts) > 0 {
+			contract = contracts[len(contracts)-1]
+		}
+	}
+
+	sharedSandbox := s.createSharedSandboxLocked(projectID, tasks, now)
+	project.UpdatedAt = now
+
+	result := &SharedSandboxMergeResult{
+		Sandbox:     *cloneSandbox(sharedSandbox),
+		ArtifactIDs: append([]string(nil), artifactIDs...),
+	}
+
+	if contract != nil && (len(input.Endpoints) > 0 || len(input.Schemas) > 0) {
+		conflicts := validateContractDefinition(contract, input.Endpoints, input.Schemas)
+		if len(conflicts) > 0 {
+			sharedSandbox.Status = domain.SandboxStatusFailed
+			sharedSandbox.FailureReason = "contract validation failed in shared sandbox gate"
+			sharedSandbox.UpdatedAt = time.Now().UTC()
+			remediationTask := s.createContractRemediationTaskLocked(projectID, contract, sharedSandbox.UpdatedAt)
+			result.Sandbox = *cloneSandbox(sharedSandbox)
+			result.ContractConflicts = conflicts
+			result.RemediationTask = cloneTask(remediationTask)
+			result.Message = "merge blocked by contract conflicts"
+			return result, nil
+		}
+	}
+
+	if err := s.writeSharedSandboxManifest(sharedSandbox, tasks, artifactIDs); err != nil {
+		sharedSandbox.Status = domain.SandboxStatusFailed
+		sharedSandbox.FailureReason = err.Error()
+		sharedSandbox.UpdatedAt = time.Now().UTC()
+		result.Sandbox = *cloneSandbox(sharedSandbox)
+		result.Message = "merge blocked because shared sandbox manifest could not be created"
+		return result, nil
+	}
+
+	if input.SimulateFailure {
+		sharedSandbox.Status = domain.SandboxStatusFailed
+		sharedSandbox.FailureReason = "simulated shared sandbox integration failure"
+		sharedSandbox.UpdatedAt = time.Now().UTC()
+		_ = writeFile(filepath.Join(sharedSandbox.RootPath, "integration-error.log"), []byte(sharedSandbox.FailureReason+"\n"))
+		result.Sandbox = *cloneSandbox(sharedSandbox)
+		result.Message = "merge blocked by shared sandbox integration failure"
+		return result, nil
+	}
+
+	sharedSandbox.Status = domain.SandboxStatusReleased
+	sharedSandbox.UpdatedAt = time.Now().UTC()
+	result.Sandbox = *cloneSandbox(sharedSandbox)
+	result.Passed = true
+	result.Message = "artifacts merged into shared sandbox"
+
+	return result, nil
+}
+
 func (s *Service) DispatchTasks(_ context.Context, projectID string) (*DispatchTasksResult, error) {
 	now := time.Now().UTC()
 
@@ -740,20 +835,7 @@ func (s *Service) ValidateContract(_ context.Context, projectID string, input Va
 	}
 
 	now := time.Now().UTC()
-	task := domain.NewTask(
-		nextID("task"),
-		projectID,
-		contract.PlanID,
-		fmt.Sprintf("Resolve contract conflicts for v%d", contract.Version),
-		"CONTRACT_REWORK",
-		s.cfg.DefaultAgent,
-		nil,
-		fmt.Sprintf("contract://%s", contract.ID),
-		now,
-	)
-
-	s.tasks[task.ID] = task
-	s.taskOrder[projectID] = append(s.taskOrder[projectID], task.ID)
+	task := s.createContractRemediationTaskLocked(projectID, contract, now)
 	project.UpdatedAt = now
 	result.RemediationTask = cloneTask(task)
 
@@ -1407,6 +1489,27 @@ func (s *Service) createPrivateSandboxLocked(projectID string, task *domain.Task
 	return sandbox
 }
 
+func (s *Service) createSharedSandboxLocked(projectID string, tasks []*domain.Task, now time.Time) *domain.Sandbox {
+	sandbox := &domain.Sandbox{
+		ID:        nextID("sandbox"),
+		ProjectID: projectID,
+		AgentType: "shared-merge-gate",
+		Scope:     "SHARED",
+		Status:    domain.SandboxStatusActive,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if len(tasks) > 0 {
+		sandbox.TaskID = tasks[len(tasks)-1].ID
+	}
+	sandbox.RootPath = filepath.Join(s.cfg.SandboxRoot, "shared", projectID, sandbox.ID)
+	_ = os.MkdirAll(filepath.Join(sandbox.RootPath, "workspace"), 0o755)
+
+	s.sandboxIndex[sandbox.ID] = sandbox
+	s.sandboxes[projectID] = append(s.sandboxes[projectID], sandbox)
+	return sandbox
+}
+
 func (s *Service) sandboxFailureForTask(taskID string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1434,6 +1537,113 @@ func (s *Service) resolveContractLocked(projectID, contractID string) (*domain.C
 	}
 
 	return order[len(order)-1], nil
+}
+
+func (s *Service) resolveMergeTasksLocked(projectID string, taskIDs []string) ([]*domain.Task, []string, error) {
+	selected := make([]*domain.Task, 0, len(taskIDs))
+	artifactIDs := make([]string, 0, len(taskIDs))
+	seen := make(map[string]struct{}, len(taskIDs))
+
+	for _, taskID := range taskIDs {
+		task, err := s.resolveTaskLocked(projectID, taskID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, ok := seen[task.ID]; ok {
+			continue
+		}
+		seen[task.ID] = struct{}{}
+
+		if task.Status != domain.TaskStatusDone {
+			return nil, nil, newConflictError("only completed tasks can be merged into shared sandbox")
+		}
+
+		artifact, err := s.resolveLatestSucceededArtifactForTaskLocked(projectID, task.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		selected = append(selected, task)
+		artifactIDs = append(artifactIDs, artifact.ID)
+	}
+
+	if len(selected) == 0 {
+		return nil, nil, newValidationError("taskIds are required for shared sandbox merge")
+	}
+
+	return selected, artifactIDs, nil
+}
+
+func (s *Service) resolveLatestSucceededArtifactForTaskLocked(projectID, taskID string) (*domain.Artifact, error) {
+	runIDs := s.runOrder[projectID]
+	for idx := len(runIDs) - 1; idx >= 0; idx-- {
+		run, ok := s.runs[runIDs[idx]]
+		if !ok || run.TaskID != taskID || run.Status != domain.RunStatusSucceeded {
+			continue
+		}
+		artifact, err := s.resolveArtifactFromRunLocked(run)
+		if err == nil {
+			return artifact, nil
+		}
+	}
+	return nil, newConflictError("completed task has no successful artifact to merge")
+}
+
+func (s *Service) createContractRemediationTaskLocked(projectID string, contract *domain.Contract, now time.Time) *domain.Task {
+	task := domain.NewTask(
+		nextID("task"),
+		projectID,
+		contract.PlanID,
+		fmt.Sprintf("Resolve contract conflicts for v%d", contract.Version),
+		"CONTRACT_REWORK",
+		s.cfg.DefaultAgent,
+		nil,
+		fmt.Sprintf("contract://%s", contract.ID),
+		now,
+	)
+
+	s.tasks[task.ID] = task
+	s.taskOrder[projectID] = append(s.taskOrder[projectID], task.ID)
+	return task
+}
+
+func (s *Service) writeSharedSandboxManifest(sharedSandbox *domain.Sandbox, tasks []*domain.Task, artifactIDs []string) error {
+	type sharedArtifactRef struct {
+		ID        string `json:"id"`
+		TaskID    string `json:"taskId"`
+		RunID     string `json:"runId"`
+		Kind      string `json:"kind"`
+		URI       string `json:"uri"`
+		Checksum  string `json:"checksum"`
+		SizeBytes int64  `json:"sizeBytes"`
+	}
+
+	artifactRefs := make([]sharedArtifactRef, 0, len(artifactIDs))
+	for _, artifactID := range artifactIDs {
+		artifact, ok := s.artifacts[artifactID]
+		if !ok {
+			return newNotFoundError("artifact not found for shared sandbox merge")
+		}
+		artifactRefs = append(artifactRefs, sharedArtifactRef{
+			ID:        artifact.ID,
+			TaskID:    artifact.TaskID,
+			RunID:     artifact.RunID,
+			Kind:      artifact.Kind,
+			URI:       artifact.URI,
+			Checksum:  artifact.Checksum,
+			SizeBytes: artifact.SizeBytes,
+		})
+	}
+
+	manifest := map[string]any{
+		"sandbox":     cloneSandbox(sharedSandbox),
+		"tasks":       cloneTasks(tasks),
+		"artifacts":   artifactRefs,
+		"createdAt":   time.Now().UTC(),
+		"mergePassed": true,
+	}
+
+	return writeJSONFile(filepath.Join(sharedSandbox.RootPath, "workspace", "manifest.json"), manifest)
 }
 
 func (s *Service) resolveArtifactFromRunLocked(run *domain.AgentRun) (*domain.Artifact, error) {

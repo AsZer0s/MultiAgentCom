@@ -20,6 +20,7 @@
 - `POST /projects/{id}/tasks/{taskId}/context/generate`：为指定任务生成上下文切片
 - `GET /projects/{id}/tasks/{taskId}/context`：查看该任务最新上下文注入结果
 - `POST /projects/{id}/tasks/{taskId}/sandbox/fail`：为指定任务注入一次性私有沙盒失败
+- `POST /projects/{id}/shared-sandbox/merge`：将多个已完成任务的产物送入共享沙盒并执行合并闸门
 - `POST /projects/{id}/tasks/run`：触发单 Agent 串行执行
 - `POST /projects/{id}/tasks/{taskId}/retry`：为失败任务创建独立重试任务
 - `POST /projects/{id}/runs/parallel`：并行触发多个已就绪任务
@@ -40,6 +41,7 @@
 - Context Engine 当前支持**按任务角色切片注入**：后端任务会拿到 API/Schema 重点，前端任务会拿到 UX/验收重点；每次生成都会记录 `version` 和 `sources`，可回查最新注入结果。
 - 状态矩阵面板当前支持**最小可视化监控**：可查看项目级任务矩阵、Agent 状态汇总，并在 `/status/panel` 中按项目过滤与自动刷新。
 - 私有沙盒运行时当前支持**每个 run 独立工作目录**：系统会为每次执行分配显式 `sandboxId` 和独立 `rootPath`；单个沙盒失败会标记为 `FAILED`，不会影响其他并行任务继续产生产物。
+- 共享沙盒当前支持**最小合并闸门**：只有 `DONE` 任务的成功产物才可进入 `SHARED` 沙盒；可在合并前执行契约校验并生成修复任务，或在模拟集成失败时阻断进入主交付链路。
 
 ## 本地运行
 
