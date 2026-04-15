@@ -20,6 +20,7 @@ bash scripts/release-check.sh
 - `go test ./...` 通过
 - `bash scripts/security-check.sh` 通过
 - `bash scripts/demo.sh` 端到端执行通过
+- `bash scripts/alert-smoke.sh` 验证失败告警与 webhook 推送通过
 - 预览环境可访问
 - 导出 ZIP 交付包结构符合 AC-15
 - Sprint 4 验收文档存在
@@ -44,12 +45,19 @@ bash scripts/demo.sh
 RUNS=3 bash scripts/demo.sh
 ```
 
+验证主动告警通知：
+
+```bash
+bash scripts/alert-smoke.sh
+```
+
 ## Manual Verification Points
 
 - `GET /status/panel` 页面包含 `Agent Message Log`
 - `GET /status/panel` 页面包含 `Failure Alerts`
 - `GET /status/panel` 页面包含 `Token Cost Trend`
 - `GET /projects/{id}/alerts` 返回关键失败告警流
+- 配置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，失败告警可推送到外部 webhook sink
 - `GET /projects/{id}/communications?taskId=...` 返回 `checksum`
 - `GET /projects/{id}/audit-logs` 返回关键操作审计流
 - `GET /projects/{id}/token-costs?taskId=...` 返回 `totalTokens`

@@ -161,6 +161,10 @@
 - `POST /projects/{id}/contracts/generate`
 - `POST /projects/{id}/tasks/run`
 - `GET /projects/{id}/runs/{runId}/status`
+- `GET /projects/{id}/communications`
+- `GET /projects/{id}/audit-logs`
+- `GET /projects/{id}/alerts`
+- `GET /projects/{id}/token-costs`
 - `POST /projects/{id}/overrides`
 - `POST /projects/{id}/snapshots/rollback`
 - `POST /projects/{id}/preview/start`
@@ -173,6 +177,7 @@
 - 沙盒网络默认最小权限，按需放开。
 - 人工锁定区域写保护，需管理员权限解除。
 - 关键操作（回滚、覆盖、导出）写审计日志。
+- 关键失败事件应写入告警流，并可按需通过 webhook 推送到外部接收端。
 
 ## 10. 可观测性指标（建议初始仪表盘）
 
@@ -181,6 +186,7 @@
 - 契约冲突次数与冲突类型。
 - 回滚触发次数与恢复成功率。
 - Token 消耗与单位任务成本趋势。
+- 告警数量、失败类型、webhook 推送成功率。
 
 ## 11. 演进路线
 
@@ -197,4 +203,3 @@
 - 同步实现 `Contract Hub` 最小版本（创建/查询/校验）。
 - 预留 `HITL` 与 `Timeline` 的事件接口，不阻塞主链路。
 - 用 `docker-compose` 统一本地开发环境（Postgres/Redis/MinIO）。
-

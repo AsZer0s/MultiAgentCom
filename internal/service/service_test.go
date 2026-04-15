@@ -3,10 +3,14 @@ package service
 import (
 	"archive/zip"
 	"context"
+	"encoding/json"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1277,6 +1281,141 @@ func TestListAlertsIncludesRunFailures(t *testing.T) {
 	}
 	if items[0].Type != "RUN_FAILURE" || items[0].Severity != "ERROR" {
 		t.Fatalf("expected RUN_FAILURE ERROR alert, got %+v", items[0])
+	}
+}
+
+func TestAlertWebhookReceivesRunFailureNotification(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-alert-webhook",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+
+	var (
+		mu       sync.Mutex
+		received []domain.Alert
+	)
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var payload struct {
+			Service string       `json:"service"`
+			Alert   domain.Alert `json:"alert"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode webhook payload: %v", err)
+		}
+		mu.Lock()
+		received = append(received, payload.Alert)
+		mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer sink.Close()
+	cfg.AlertWebhookURL = sink.URL
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Webhook Alert Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo 列表的增删改查",
+		Content: "实现 Todo 列表的增删改查，并模拟私有沙盒失败。",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if err := svc.MarkTaskSandboxFailure(ctx, project.ID, planResult.Task.ID, "simulated crash"); err != nil {
+		t.Fatalf("mark sandbox failure: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusFailed {
+		t.Fatalf("expected failed run, got %s", status.Run.Status)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		count := len(received)
+		var alert domain.Alert
+		if count > 0 {
+			alert = received[0]
+		}
+		mu.Unlock()
+		if count > 0 {
+			if alert.Type != "RUN_FAILURE" {
+				t.Fatalf("expected RUN_FAILURE webhook alert, got %+v", alert)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatal("expected alert webhook notification")
+}
+
+func TestListAlertsIncludesRollbackEvents(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-rollback-alerts",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	if _, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	}); err != nil {
+		t.Fatalf("create initial stable snapshot: %v", err)
+	}
+
+	snapshots, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	if len(snapshots) == 0 {
+		t.Fatal("expected at least one snapshot")
+	}
+
+	if _, err := svc.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{
+		SnapshotID: snapshots[0].ID,
+		Reason:     "manual rollback verification",
+	}); err != nil {
+		t.Fatalf("rollback to snapshot: %v", err)
+	}
+
+	items, err := svc.ListAlerts(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list alerts: %v", err)
+	}
+	found := false
+	for _, item := range items {
+		if item.Type == "SNAPSHOT_ROLLBACK" && item.Severity == "WARN" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected SNAPSHOT_ROLLBACK WARN alert, got %+v", items)
 	}
 }
 

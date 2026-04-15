@@ -55,6 +55,7 @@
 - 补充检查：
   - `bash scripts/security-check.sh`
   - `bash scripts/demo.sh`
+  - `bash scripts/alert-smoke.sh`
   - `bash scripts/release-check.sh`
 
 ## Demo Entry
@@ -62,6 +63,7 @@
 - 状态面板：`GET /status/panel`
 - 通信日志：`GET /projects/{id}/communications`
 - 审计日志：`GET /projects/{id}/audit-logs`
+- 告警流：`GET /projects/{id}/alerts`
 - Token 成本：`GET /projects/{id}/token-costs`
 - 预览启动：`POST /projects/{id}/preview/start`
 - 交付导出：`POST /projects/{id}/delivery/export`

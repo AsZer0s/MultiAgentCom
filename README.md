@@ -61,6 +61,7 @@
 - Timeline 当前支持**最小快照与回滚**：共享沙盒成功合并后会自动生成稳定快照；共享沙盒集成失败时会自动回滚到最近稳定快照，并创建新的 branch 保留原时间线；手动回滚也会清理旧的上下文注入记录。
 - Preview Service 当前支持**最小可验收预览**：共享沙盒合并完成后可启动带 revision 检查的 Todo 预览页，便于验收演示。
 - 安全基线当前支持**最小单租户鉴权与审计**：设置 `MULTI_AGENT_API_TOKEN` 后，API 需携带 `Authorization: Bearer <token>`；关键操作会写入 `/projects/{id}/audit-logs` 审计流。
+- 告警通知当前支持**最小 webhook 主动推送**：设置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，run 失败和回滚事件会异步推送结构化 alert 到外部接收端。
 
 ## 本地运行
 

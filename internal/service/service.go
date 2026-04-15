@@ -2,6 +2,7 @@ package service
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -46,8 +48,9 @@ func newConflictError(message string) *AppError {
 }
 
 type Service struct {
-	cfg    config.Config
-	logger *slog.Logger
+	cfg         config.Config
+	logger      *slog.Logger
+	alertClient *http.Client
 
 	mu             sync.RWMutex
 	projects       map[string]*domain.Project
@@ -340,6 +343,7 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 	return &Service{
 		cfg:            cfg,
 		logger:         logger,
+		alertClient:    &http.Client{Timeout: 3 * time.Second},
 		projects:       make(map[string]*domain.Project),
 		requirements:   make(map[string][]*domain.Requirement),
 		planIndex:      make(map[string]*domain.Plan),
@@ -1174,6 +1178,7 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 			} else {
 				result.Rollback = rollback
 				result.Message = "merge blocked by shared sandbox integration failure and rolled back to latest stable snapshot"
+				s.recordAlertLocked(projectID, "WARN", "SNAPSHOT_ROLLBACK", rollback.Snapshot.ID, result.Message, sharedSandbox.UpdatedAt)
 			}
 		} else {
 			result.Message = "merge blocked by shared sandbox integration failure"
@@ -1221,6 +1226,7 @@ func (s *Service) RollbackToSnapshot(ctx context.Context, projectID string, inpu
 	if err != nil {
 		return nil, err
 	}
+	s.recordAlertLocked(projectID, "WARN", "SNAPSHOT_ROLLBACK", result.Snapshot.ID, result.Message, now)
 	s.recordAuditLocked(ctx, projectID, "SNAPSHOT_ROLLBACK", "snapshot", result.Snapshot.ID, result.Message, now)
 	return result, nil
 }
@@ -2036,6 +2042,46 @@ func (s *Service) recordAlertLocked(projectID, severity, alertType, resourceID, 
 		Timestamp:  now,
 	}
 	s.alerts[projectID] = append(s.alerts[projectID], entry)
+	s.notifyAlertAsync(cloneAlert(entry))
+}
+
+func (s *Service) notifyAlertAsync(alert *domain.Alert) {
+	if alert == nil || strings.TrimSpace(s.cfg.AlertWebhookURL) == "" {
+		return
+	}
+
+	webhookURL := s.cfg.AlertWebhookURL
+	client := s.alertClient
+	logger := s.logger
+	serviceName := s.cfg.ServiceName
+	go func() {
+		payload, err := json.Marshal(map[string]any{
+			"service": serviceName,
+			"alert":   alert,
+		})
+		if err != nil {
+			logger.Error("alert webhook marshal failed", "error", err, "alertId", alert.ID)
+			return
+		}
+
+		req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewReader(payload))
+		if err != nil {
+			logger.Error("alert webhook request failed", "error", err, "alertId", alert.ID)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.Error("alert webhook delivery failed", "error", err, "alertId", alert.ID)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 300 {
+			logger.Error("alert webhook rejected response", "status", resp.StatusCode, "alertId", alert.ID)
+		}
+	}()
 }
 
 func (s *Service) communicationCountForTaskLocked(projectID, taskID string) int {
