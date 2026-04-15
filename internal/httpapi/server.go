@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"multiagentcom/internal/config"
@@ -45,6 +46,10 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("POST /projects/{id}/tasks/dispatch", server.handleDispatchTasks)
 	mux.HandleFunc("GET /projects/{id}/tasks/{taskId}/context", server.handleGetTaskContext)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/context/generate", server.handleGenerateTaskContext)
+	mux.HandleFunc("GET /projects/{id}/communications", server.handleListCommunications)
+	mux.HandleFunc("GET /projects/{id}/audit-logs", server.handleListAuditLogs)
+	mux.HandleFunc("GET /projects/{id}/alerts", server.handleListAlerts)
+	mux.HandleFunc("GET /projects/{id}/token-costs", server.handleGetTokenCosts)
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/sandbox/fail", server.handleInjectSandboxFailure)
 	mux.HandleFunc("POST /projects/{id}/overrides", server.handleApplyHumanOverride)
 	mux.HandleFunc("POST /projects/{id}/locks", server.handleApplyCodeLock)
@@ -63,7 +68,7 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("POST /projects/{id}/delivery/export", server.handleExportDelivery)
 	mux.HandleFunc("GET /projects/{id}/artifacts/{artifactId}/download", server.handleDownloadArtifact)
 
-	return withMiddleware(logger, mux)
+	return withMiddleware(cfg, logger, mux)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -248,6 +253,55 @@ func (s *Server) handleGenerateTaskContext(w http.ResponseWriter, r *http.Reques
 	}
 
 	writeJSON(w, http.StatusCreated, result)
+}
+
+func (s *Server) handleListCommunications(w http.ResponseWriter, r *http.Request) {
+	items, err := s.svc.ListCommunicationLogs(r.Context(), r.PathValue("id"), r.URL.Query().Get("taskId"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": items,
+		"count": len(items),
+	})
+}
+
+func (s *Server) handleGetTokenCosts(w http.ResponseWriter, r *http.Request) {
+	trend, err := s.svc.GetTokenCostTrend(r.Context(), r.PathValue("id"), r.URL.Query().Get("taskId"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, trend)
+}
+
+func (s *Server) handleListAuditLogs(w http.ResponseWriter, r *http.Request) {
+	items, err := s.svc.ListAuditLogs(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": items,
+		"count": len(items),
+	})
+}
+
+func (s *Server) handleListAlerts(w http.ResponseWriter, r *http.Request) {
+	items, err := s.svc.ListAlerts(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": items,
+		"count": len(items),
+	})
 }
 
 func (s *Server) handleInjectSandboxFailure(w http.ResponseWriter, r *http.Request) {
@@ -536,9 +590,10 @@ func writeServiceError(w http.ResponseWriter, err error) {
 type contextKey string
 
 const requestIDKey contextKey = "request_id"
+const authActorKey contextKey = "auth_actor"
 
-func withMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
-	return requestIDMiddleware(recoveryMiddleware(logger)(loggingMiddleware(logger)(next)))
+func withMiddleware(cfg config.Config, logger *slog.Logger, next http.Handler) http.Handler {
+	return requestIDMiddleware(authMiddleware(cfg)(recoveryMiddleware(logger)(loggingMiddleware(logger)(next))))
 }
 
 func requestIDMiddleware(next http.Handler) http.Handler {
@@ -567,8 +622,44 @@ func loggingMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 				"path", r.URL.Path,
 				"status", writer.status,
 				"duration_ms", time.Since(start).Milliseconds(),
+				"actor", actorFromRequest(r),
 				"requestId", requestIDFromContext(r.Context()),
 			)
+		})
+	}
+}
+
+func authMiddleware(cfg config.Config) func(http.Handler) http.Handler {
+	requiredToken := strings.TrimSpace(cfg.APIToken)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if requiredToken == "" || r.URL.Path == "/health" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			if token == "" {
+				token = strings.TrimSpace(r.Header.Get("X-API-Key"))
+			}
+			if token == "" {
+				token = strings.TrimSpace(r.URL.Query().Get("token"))
+			}
+			if token != requiredToken {
+				writeJSON(w, http.StatusUnauthorized, map[string]any{
+					"code":    "UNAUTHORIZED",
+					"message": "missing or invalid api token",
+				})
+				return
+			}
+
+			actor := strings.TrimSpace(r.Header.Get("X-Actor"))
+			if actor == "" {
+				actor = "api-token"
+			}
+			ctx := context.WithValue(r.Context(), authActorKey, actor)
+			ctx = service.WithActor(ctx, actor)
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
@@ -589,6 +680,14 @@ func recoveryMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func actorFromRequest(r *http.Request) string {
+	actor, _ := r.Context().Value(authActorKey).(string)
+	if strings.TrimSpace(actor) == "" {
+		return "anonymous"
+	}
+	return actor
 }
 
 type statusRecorder struct {
@@ -732,6 +831,7 @@ func renderPreviewHTML(preview domain.Preview) string {
   </main>
 
   <script>
+    const authQuery = window.location.search || "";
     const todos = [
       { id: crypto.randomUUID(), title: "Review shared sandbox merge", done: false },
       { id: crypto.randomUUID(), title: "Verify rollback branch timeline", done: true }
@@ -801,7 +901,7 @@ func renderPreviewHTML(preview domain.Preview) string {
 
     async function pollRevision() {
       try {
-        const resp = await fetch(window.location.pathname + "/status", { headers: { "Accept": "application/json" } });
+        const resp = await fetch(window.location.pathname + "/status" + authQuery, { headers: { "Accept": "application/json" } });
         if (!resp.ok) return;
         const data = await resp.json();
         revisionNode.textContent = data.revision;
@@ -887,6 +987,7 @@ func renderStatusPanelHTML(serviceName string) string {
       margin: 20px 0 28px;
     }
     .toolbar select,
+    .toolbar input,
     .toolbar button {
       border: 1px solid var(--line);
       border-radius: 999px;
@@ -965,6 +1066,76 @@ func renderStatusPanelHTML(serviceName string) string {
       color: var(--muted);
       font-weight: 600;
     }
+    .task-meta {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      word-break: break-all;
+    }
+    .task-row.highlight td {
+      background: var(--accent-soft);
+    }
+    .trend-list {
+      display: grid;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .alert-list {
+      display: grid;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .alert-item {
+      border: 1px solid rgba(214, 202, 184, 0.7);
+      border-radius: 18px;
+      padding: 12px 14px;
+      background: rgba(255,255,255,0.6);
+    }
+    .alert-item.CRITICAL {
+      border-color: rgba(180, 35, 24, 0.45);
+      box-shadow: inset 0 0 0 1px rgba(180, 35, 24, 0.12);
+    }
+    .alert-item.ERROR {
+      border-color: rgba(183, 121, 31, 0.45);
+      box-shadow: inset 0 0 0 1px rgba(183, 121, 31, 0.12);
+    }
+    .trend-row {
+      border: 1px solid rgba(214, 202, 184, 0.7);
+      border-radius: 18px;
+      padding: 12px 14px;
+      background: rgba(255,255,255,0.6);
+    }
+    .trend-row.highlight {
+      border-color: rgba(22, 93, 255, 0.4);
+      box-shadow: inset 0 0 0 1px rgba(22, 93, 255, 0.16);
+    }
+    .trend-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+      margin-bottom: 8px;
+    }
+    .trend-head strong {
+      display: block;
+    }
+    .bar-track {
+      width: 100%%;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(22, 93, 255, 0.12);
+      overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #165dff 0%%, #0f8b4c 100%%);
+    }
+    .statline {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
     .empty {
       padding: 28px;
       border: 1px dashed var(--line);
@@ -994,23 +1165,38 @@ func renderStatusPanelHTML(serviceName string) string {
     </div>
     <div class="toolbar">
       <select id="projectFilter"></select>
+      <input id="taskLogFilter" type="text" placeholder="Filter communications by taskId">
       <button id="refreshBtn" type="button">Refresh Now</button>
       <div id="generatedAt" class="pill">loading...</div>
     </div>
     <div id="app" class="grid"></div>
+    <div id="alertPanel" class="panel" style="margin-top:18px;"></div>
+    <div id="commPanel" class="panel" style="margin-top:18px;"></div>
+    <div id="costPanel" class="panel" style="margin-top:18px;"></div>
   </div>
   <script>
+    const authQuery = new URLSearchParams(window.location.search).get("token");
     const filter = document.getElementById("projectFilter");
+    const taskLogFilter = document.getElementById("taskLogFilter");
     const refreshBtn = document.getElementById("refreshBtn");
     const app = document.getElementById("app");
     const generatedAt = document.getElementById("generatedAt");
+    const alertPanel = document.getElementById("alertPanel");
+    const commPanel = document.getElementById("commPanel");
+    const costPanel = document.getElementById("costPanel");
 
     function statusBadge(status) {
       return '<span class="status ' + status + '"><span class="dot"></span>' + status + '</span>';
     }
 
+    function withAuth(path) {
+      if (!authQuery) return path;
+      return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(authQuery);
+    }
+
     function renderMatrix(view) {
       const selected = view.selectedProjectId || "";
+      const selectedTaskId = taskLogFilter.value.trim();
       const options = ['<option value="">All Projects</option>']
         .concat((view.projects || []).map(project =>
           '<option value="' + project.id + '"' + (project.id === selected ? ' selected' : '') + '>' + project.name + '</option>'
@@ -1037,8 +1223,9 @@ func renderStatusPanelHTML(serviceName string) string {
         }).join("");
 
         const taskRows = (matrix.taskMatrix || []).map(function(task) {
-          return '<tr>'
-            + '<td>' + task.name + '</td>'
+          const rowClass = selectedTaskId && task.id === selectedTaskId ? ' class="task-row highlight"' : ' class="task-row"';
+          return '<tr' + rowClass + '>'
+            + '<td>' + task.name + '<div class="task-meta">' + task.id + '</div></td>'
             + '<td>' + (task.assigneeAgent || '-') + '</td>'
             + '<td>' + task.type + '</td>'
             + '<td>' + task.status + '</td>'
@@ -1072,14 +1259,109 @@ func renderStatusPanelHTML(serviceName string) string {
       }).join("");
     }
 
+    function renderCommunications(projectId, payload) {
+      if (!projectId) {
+        commPanel.innerHTML = '<div class="empty">选择一个项目后可查看内部通信日志。</div>';
+        return;
+      }
+
+      const rows = (payload.items || []).map(function(item) {
+        return '<tr>'
+          + '<td>' + item.version + '</td>'
+          + '<td>' + item.from + '</td>'
+          + '<td>' + item.to + '</td>'
+          + '<td>' + item.type + '</td>'
+          + '<td>' + item.taskId + '</td>'
+          + '<td>' + item.checksum + '</td>'
+          + '</tr>';
+      }).join("");
+
+      commPanel.innerHTML = '<div class="project-head">'
+        + '<div><div class="eyebrow">Communications</div><h2 style="margin:6px 0 0;">Agent Message Log</h2></div>'
+        + '<div class="meta"><span class="pill">Project ' + projectId + '</span><span class="pill">Count ' + (payload.count || 0) + '</span>' + (taskLogFilter.value.trim() ? ('<span class="pill">Task ' + taskLogFilter.value.trim() + '</span>') : '') + '</div>'
+        + '</div>'
+        + '<table>'
+        + '<thead><tr><th>Version</th><th>From</th><th>To</th><th>Type</th><th>Task</th><th>Checksum</th></tr></thead>'
+        + '<tbody>' + (rows || '<tr><td colspan="6">No communication log entries</td></tr>') + '</tbody>'
+        + '</table>';
+    }
+
+    function renderAlerts(projectId, payload) {
+      if (!projectId) {
+        alertPanel.innerHTML = '<div class="empty">选择一个项目后可查看失败告警。</div>';
+        return;
+      }
+
+      const rows = (payload.items || []).map(function(item) {
+        return '<div class="alert-item ' + item.severity + '">'
+          + '<div class="trend-head"><div><strong>' + item.type + '</strong><div class="task-meta">' + item.resourceId + '</div></div><strong>' + item.severity + '</strong></div>'
+          + '<div class="statline">' + item.message + '</div>'
+          + '</div>';
+      }).join("");
+
+      alertPanel.innerHTML = '<div class="project-head">'
+        + '<div><div class="eyebrow">Alerts</div><h2 style="margin:6px 0 0;">Failure Alerts</h2></div>'
+        + '<div class="meta"><span class="pill">Project ' + projectId + '</span><span class="pill">Count ' + (payload.count || 0) + '</span></div>'
+        + '</div>'
+        + ((payload.items || []).length ? ('<div class="alert-list">' + rows + '</div>') : '<div class="empty">No active alerts</div>');
+    }
+
+    function renderCosts(projectId, payload) {
+      if (!projectId) {
+        costPanel.innerHTML = '<div class="empty">选择一个项目后可查看 Token 与成本趋势。</div>';
+        return;
+      }
+
+      const maxTokens = Math.max(payload.maxTokens || 0, 1);
+      const rows = (payload.points || []).map(function(item) {
+        const width = Math.max(8, Math.round((item.totalTokens / maxTokens) * 100));
+        const highlight = taskLogFilter.value.trim() && item.taskId === taskLogFilter.value.trim() ? ' highlight' : '';
+        return '<div class="trend-row' + highlight + '">'
+          + '<div class="trend-head"><div><strong>' + item.taskName + '</strong><div class="task-meta">' + item.taskId + ' · ' + item.agentType + '</div></div><strong>' + item.totalTokens + ' tok</strong></div>'
+          + '<div class="bar-track"><div class="bar-fill" style="width:' + width + '%%;"></div></div>'
+          + '<div class="statline">Prompt ' + item.promptTokens + ' · Completion ' + item.completionTokens + ' · Cost $' + Number(item.estimatedCostUsd || 0).toFixed(4) + '</div>'
+          + '</div>';
+      }).join("");
+
+      costPanel.innerHTML = '<div class="project-head">'
+        + '<div><div class="eyebrow">Token Cost</div><h2 style="margin:6px 0 0;">Token Cost Trend</h2></div>'
+        + '<div class="meta"><span class="pill">Project ' + projectId + '</span><span class="pill">Total ' + (payload.totalTokens || 0) + ' tok</span><span class="pill">Cost $' + Number(payload.estimatedCostUsd || 0).toFixed(4) + '</span></div>'
+        + '</div>'
+        + ((payload.points || []).length ? ('<div class="trend-list">' + rows + '</div>') : '<div class="empty">No token usage recorded yet</div>');
+    }
+
     async function load() {
       const value = filter.value ? '?projectId=' + encodeURIComponent(filter.value) : '';
-      const response = await fetch('/status/matrix' + value, { headers: { 'Accept': 'application/json' } });
+      const response = await fetch(withAuth('/status/matrix' + value), { headers: { 'Accept': 'application/json' } });
       const data = await response.json();
       renderMatrix(data);
+
+      const projectId = filter.value || '';
+      if (!projectId) {
+        renderAlerts('', { items: [], count: 0 });
+        renderCommunications('', { items: [], count: 0 });
+        renderCosts('', { points: [], totalTokens: 0, estimatedCostUsd: 0, maxTokens: 0 });
+        return;
+      }
+      const taskId = taskLogFilter.value.trim();
+      const alertURL = '/projects/' + encodeURIComponent(projectId) + '/alerts';
+      const alertResponse = await fetch(withAuth(alertURL), { headers: { 'Accept': 'application/json' } });
+      const alertData = await alertResponse.json();
+      renderAlerts(projectId, alertData);
+
+      const commURL = '/projects/' + encodeURIComponent(projectId) + '/communications' + (taskId ? ('?taskId=' + encodeURIComponent(taskId)) : '');
+      const commResponse = await fetch(withAuth(commURL), { headers: { 'Accept': 'application/json' } });
+      const commData = await commResponse.json();
+      renderCommunications(projectId, commData);
+
+      const costURL = '/projects/' + encodeURIComponent(projectId) + '/token-costs' + (taskId ? ('?taskId=' + encodeURIComponent(taskId)) : '');
+      const costResponse = await fetch(withAuth(costURL), { headers: { 'Accept': 'application/json' } });
+      const costData = await costResponse.json();
+      renderCosts(projectId, costData);
     }
 
     filter.addEventListener('change', load);
+    taskLogFilter.addEventListener('change', load);
     refreshBtn.addEventListener('click', load);
     load();
     setInterval(load, 4000);

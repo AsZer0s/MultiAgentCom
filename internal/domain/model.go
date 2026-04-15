@@ -158,6 +158,40 @@ type Preview struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
+type CommunicationLog struct {
+	ID         string    `json:"id"`
+	ProjectID  string    `json:"projectId"`
+	Version    string    `json:"version"`
+	From       string    `json:"from"`
+	To         string    `json:"to"`
+	Type       string    `json:"type"`
+	TaskID     string    `json:"taskId"`
+	PayloadRef string    `json:"payloadRef,omitempty"`
+	Checksum   string    `json:"checksum"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+type AuditLog struct {
+	ID           string    `json:"id"`
+	ProjectID    string    `json:"projectId"`
+	Actor        string    `json:"actor"`
+	Action       string    `json:"action"`
+	ResourceType string    `json:"resourceType"`
+	ResourceID   string    `json:"resourceId"`
+	Summary      string    `json:"summary"`
+	Timestamp    time.Time `json:"timestamp"`
+}
+
+type Alert struct {
+	ID         string    `json:"id"`
+	ProjectID  string    `json:"projectId"`
+	Severity   string    `json:"severity"`
+	Type       string    `json:"type"`
+	ResourceID string    `json:"resourceId"`
+	Message    string    `json:"message"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
 type TaskStatus string
 
 const (
@@ -256,18 +290,22 @@ const (
 )
 
 type AgentRun struct {
-	ID            string    `json:"id"`
-	ProjectID     string    `json:"projectId"`
-	TaskID        string    `json:"taskId"`
-	AgentType     string    `json:"agentType"`
-	Model         string    `json:"model"`
-	SandboxID     string    `json:"sandboxId,omitempty"`
-	Status        RunStatus `json:"status"`
-	ResultSummary string    `json:"resultSummary,omitempty"`
-	Error         string    `json:"error,omitempty"`
-	ArtifactIDs   []string  `json:"artifactIds,omitempty"`
-	StartedAt     time.Time `json:"startedAt"`
-	EndedAt       time.Time `json:"endedAt,omitempty"`
+	ID               string    `json:"id"`
+	ProjectID        string    `json:"projectId"`
+	TaskID           string    `json:"taskId"`
+	AgentType        string    `json:"agentType"`
+	Model            string    `json:"model"`
+	SandboxID        string    `json:"sandboxId,omitempty"`
+	Status           RunStatus `json:"status"`
+	PromptTokens     int       `json:"promptTokens,omitempty"`
+	CompletionTokens int       `json:"completionTokens,omitempty"`
+	TotalTokens      int       `json:"totalTokens,omitempty"`
+	EstimatedCostUSD float64   `json:"estimatedCostUsd,omitempty"`
+	ResultSummary    string    `json:"resultSummary,omitempty"`
+	Error            string    `json:"error,omitempty"`
+	ArtifactIDs      []string  `json:"artifactIds,omitempty"`
+	StartedAt        time.Time `json:"startedAt"`
+	EndedAt          time.Time `json:"endedAt,omitempty"`
 }
 
 type Artifact struct {

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
 	"io"
@@ -88,6 +89,21 @@ func TestHTTPFlow(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected download status 200, got %d", resp.StatusCode)
 	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read artifact payload: %v", err)
+	}
+	assertZipPayloadContains(t, payload,
+		"README.md",
+		"docker-compose.yml",
+		"generated-app/go.mod",
+		"generated-app/main.go",
+		"generated-app/Dockerfile",
+		"web-app/package.json",
+		"web-app/server.js",
+		"web-app/index.html",
+		"web-app/Dockerfile",
+	)
 }
 
 func TestHTTPContractFlow(t *testing.T) {
@@ -384,6 +400,12 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "Status Matrix") {
 		t.Fatalf("expected status panel html to contain title, got %s", string(body))
+	}
+	if !strings.Contains(string(body), "Agent Message Log") || !strings.Contains(string(body), "Filter communications by taskId") {
+		t.Fatalf("expected status panel html to contain communications controls, got %s", string(body))
+	}
+	if !strings.Contains(string(body), "Token Cost Trend") {
+		t.Fatalf("expected status panel html to contain token cost panel, got %s", string(body))
 	}
 }
 
@@ -939,6 +961,254 @@ func TestHTTPApplyCodeLock(t *testing.T) {
 	}
 }
 
+func TestHTTPListCommunicationLogs(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-communications",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	project, _, dispatched := prepareHTTPSharedSandboxMergeScenario(t, server)
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/"+dispatched[0].ID+"/context/generate", map[string]any{})
+
+	body := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/communications")
+	var communications struct {
+		Items []domain.CommunicationLog `json:"items"`
+		Count int                       `json:"count"`
+	}
+	decodeResponse(t, body, &communications)
+	if communications.Count != len(communications.Items) {
+		t.Fatalf("expected count %d to match items length %d", communications.Count, len(communications.Items))
+	}
+	if len(communications.Items) < 6 {
+		t.Fatalf("expected at least 6 communication logs, got %d", len(communications.Items))
+	}
+
+	filteredBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/communications?taskId="+dispatched[0].ID)
+	var filtered struct {
+		Items []domain.CommunicationLog `json:"items"`
+		Count int                       `json:"count"`
+	}
+	decodeResponse(t, filteredBody, &filtered)
+	if filtered.Count != len(filtered.Items) {
+		t.Fatalf("expected filtered count %d to match items length %d", filtered.Count, len(filtered.Items))
+	}
+	if len(filtered.Items) < 3 {
+		t.Fatalf("expected at least 3 filtered communication logs, got %d", len(filtered.Items))
+	}
+	for _, item := range filtered.Items {
+		if item.TaskID != dispatched[0].ID {
+			t.Fatalf("expected filtered task id %s, got %s", dispatched[0].ID, item.TaskID)
+		}
+	}
+}
+
+func TestHTTPGetTokenCosts(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-token-costs",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	project, _, dispatched := prepareHTTPSharedSandboxMergeScenario(t, server)
+
+	body := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/token-costs")
+	var trend service.TokenCostTrend
+	decodeResponse(t, body, &trend)
+	if len(trend.Points) != 2 {
+		t.Fatalf("expected 2 token cost points, got %d", len(trend.Points))
+	}
+	if trend.TotalTokens <= 0 || trend.EstimatedCostUSD <= 0 {
+		t.Fatalf("expected positive token totals and cost, got %+v", trend)
+	}
+
+	filteredBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/token-costs?taskId="+dispatched[0].ID)
+	var filtered service.TokenCostTrend
+	decodeResponse(t, filteredBody, &filtered)
+	if len(filtered.Points) != 1 {
+		t.Fatalf("expected 1 filtered token cost point, got %d", len(filtered.Points))
+	}
+	if filtered.Points[0].TaskID != dispatched[0].ID {
+		t.Fatalf("expected filtered task id %s, got %s", dispatched[0].ID, filtered.Points[0].TaskID)
+	}
+}
+
+func TestHTTPAuditLogs(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-audit-logs",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Todo Audit Demo",
+	}, nil)
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{
+		"title":   "实现 Todo 列表的增删改查",
+		"content": "实现 Todo 列表的增删改查，并导出标准交付包。",
+	}, nil)
+	planBody := requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{}, nil)
+	var planResult service.PlanResult
+	decodeResponse(t, planBody, &planResult)
+
+	runBody := requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/run", map[string]any{
+		"taskId": planResult.Task.ID,
+	}, nil)
+	var runEnvelope service.RunEnvelope
+	decodeResponse(t, runBody, &runEnvelope)
+	waitForHTTPRun(t, server, project.ID, runEnvelope.Run.ID)
+
+	requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/delivery/export", map[string]any{
+		"runId": runEnvelope.Run.ID,
+	}, nil)
+
+	body := getJSONWithHeaders(t, server.Client(), server.URL+"/projects/"+project.ID+"/audit-logs", nil)
+	var logs struct {
+		Items []domain.AuditLog `json:"items"`
+		Count int               `json:"count"`
+	}
+	decodeResponse(t, body, &logs)
+	if logs.Count != len(logs.Items) {
+		t.Fatalf("expected count %d to match items length %d", logs.Count, len(logs.Items))
+	}
+	if len(logs.Items) < 4 {
+		t.Fatalf("expected at least 4 audit log entries, got %d", len(logs.Items))
+	}
+	foundExport := false
+	for _, item := range logs.Items {
+		if item.Action == "DELIVERY_EXPORT" {
+			foundExport = true
+			break
+		}
+	}
+	if !foundExport {
+		t.Fatalf("expected DELIVERY_EXPORT audit entry, got %+v", logs.Items)
+	}
+}
+
+func TestHTTPAuthMiddleware(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-auth",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+		APIToken:     "demo-token",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	healthResp, err := server.Client().Get(server.URL + "/health")
+	if err != nil {
+		t.Fatalf("get health: %v", err)
+	}
+	defer healthResp.Body.Close()
+	if healthResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected health 200, got %d", healthResp.StatusCode)
+	}
+
+	unauthorized := requestJSONExpectStatusWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Unauthorized Demo",
+	}, http.StatusUnauthorized, nil)
+	assertContainsBody(t, unauthorized, `"code":"UNAUTHORIZED"`)
+
+	headers := map[string]string{
+		"Authorization": "Bearer demo-token",
+		"X-Actor":       "release-manager",
+	}
+	projectBody := requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Authorized Demo",
+	}, headers)
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	auditBody := getJSONWithHeaders(t, server.Client(), server.URL+"/projects/"+project.ID+"/audit-logs", headers)
+	var logs struct {
+		Items []domain.AuditLog `json:"items"`
+	}
+	decodeResponse(t, auditBody, &logs)
+	if len(logs.Items) == 0 || logs.Items[0].Actor != "release-manager" {
+		t.Fatalf("expected release-manager audit actor, got %+v", logs.Items)
+	}
+}
+
+func TestHTTPAlerts(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-alerts",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Todo Alert Demo",
+	})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{
+		"title":   "实现 Todo 列表的增删改查",
+		"content": "实现 Todo 列表的增删改查，并模拟私有沙盒失败。",
+	})
+	planBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{})
+	var planResult service.PlanResult
+	decodeResponse(t, planBody, &planResult)
+
+	requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/"+planResult.Task.ID+"/sandbox/fail", map[string]any{
+		"reason": "simulated crash",
+	}, http.StatusAccepted)
+	runBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/run", map[string]any{
+		"taskId": planResult.Task.ID,
+	})
+	var runEnvelope service.RunEnvelope
+	decodeResponse(t, runBody, &runEnvelope)
+	status := waitForHTTPRunTerminal(t, server, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusFailed {
+		t.Fatalf("expected failed run, got %s", status.Run.Status)
+	}
+
+	body := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/alerts")
+	var alerts struct {
+		Items []domain.Alert `json:"items"`
+		Count int            `json:"count"`
+	}
+	decodeResponse(t, body, &alerts)
+	if alerts.Count == 0 || len(alerts.Items) == 0 {
+		t.Fatal("expected alert entries")
+	}
+	if alerts.Items[0].Type != "RUN_FAILURE" {
+		t.Fatalf("expected RUN_FAILURE alert, got %+v", alerts.Items[0])
+	}
+}
+
 func TestHTTPStartPreview(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",
@@ -1030,6 +1300,11 @@ func prepareHTTPSharedSandboxMergeScenario(t *testing.T, server *httptest.Server
 
 func requestJSON(t *testing.T, client *http.Client, method, url string, payload any) []byte {
 	t.Helper()
+	return requestJSONWithHeaders(t, client, method, url, payload, nil)
+}
+
+func requestJSONWithHeaders(t *testing.T, client *http.Client, method, url string, payload any, headers map[string]string) []byte {
+	t.Helper()
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1041,6 +1316,9 @@ func requestJSON(t *testing.T, client *http.Client, method, url string, payload 
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1062,6 +1340,11 @@ func requestJSON(t *testing.T, client *http.Client, method, url string, payload 
 
 func requestJSONExpectStatus(t *testing.T, client *http.Client, method, url string, payload any, expectedStatus int) []byte {
 	t.Helper()
+	return requestJSONExpectStatusWithHeaders(t, client, method, url, payload, expectedStatus, nil)
+}
+
+func requestJSONExpectStatusWithHeaders(t *testing.T, client *http.Client, method, url string, payload any, expectedStatus int, headers map[string]string) []byte {
+	t.Helper()
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1073,6 +1356,9 @@ func requestJSONExpectStatus(t *testing.T, client *http.Client, method, url stri
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1094,8 +1380,21 @@ func requestJSONExpectStatus(t *testing.T, client *http.Client, method, url stri
 
 func getJSON(t *testing.T, client *http.Client, url string) []byte {
 	t.Helper()
+	return getJSONWithHeaders(t, client, url, nil)
+}
 
-	resp, err := client.Get(url)
+func getJSONWithHeaders(t *testing.T, client *http.Client, url string, headers map[string]string) []byte {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new get request: %v", err)
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("get request: %v", err)
 	}
@@ -1111,6 +1410,13 @@ func getJSON(t *testing.T, client *http.Client, url string) []byte {
 	}
 
 	return data
+}
+
+func assertContainsBody(t *testing.T, body []byte, fragment string) {
+	t.Helper()
+	if !strings.Contains(string(body), fragment) {
+		t.Fatalf("expected body to contain %s, got %s", fragment, string(body))
+	}
 }
 
 func decodeResponse(t *testing.T, body []byte, target any) {
@@ -1202,4 +1508,23 @@ func sectionTitles(items []domain.ContextSection) string {
 		titles = append(titles, item.Title)
 	}
 	return strings.Join(titles, "|")
+}
+
+func assertZipPayloadContains(t *testing.T, payload []byte, expected ...string) {
+	t.Helper()
+
+	reader, err := zip.NewReader(bytes.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		t.Fatalf("open zip payload: %v", err)
+	}
+
+	entries := make(map[string]struct{}, len(reader.File))
+	for _, file := range reader.File {
+		entries[file.Name] = struct{}{}
+	}
+	for _, item := range expected {
+		if _, ok := entries[item]; !ok {
+			t.Fatalf("expected zip payload to contain %s", item)
+		}
+	}
 }

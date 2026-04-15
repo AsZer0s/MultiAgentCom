@@ -49,36 +49,39 @@ type Service struct {
 	cfg    config.Config
 	logger *slog.Logger
 
-	mu            sync.RWMutex
-	projects      map[string]*domain.Project
-	requirements  map[string][]*domain.Requirement
-	planIndex     map[string]*domain.Plan
-	plans         map[string][]*domain.Plan
-	contractIndex map[string]*domain.Contract
-	contracts     map[string][]*domain.Contract
-	contextIndex  map[string]*domain.ContextInjection
-	contexts      map[string][]*domain.ContextInjection
-	overrideIndex map[string]*domain.HumanOverride
-	overrides     map[string][]*domain.HumanOverride
-	lockIndex     map[string]*domain.CodeLock
-	locks         map[string][]*domain.CodeLock
-	previewIndex  map[string]*domain.Preview
-	previews      map[string][]*domain.Preview
-	sandboxIndex  map[string]*domain.Sandbox
-	sandboxes     map[string][]*domain.Sandbox
-	sandboxFaults map[string]string
-	snapshotIndex map[string]*domain.Snapshot
-	snapshots     map[string][]*domain.Snapshot
-	snapshotState map[string]*projectSnapshotState
-	projectBranch map[string]string
-	stableBranch  map[string]string
-	branchSeq     map[string]int
-	tasks         map[string]*domain.Task
-	taskOrder     map[string][]string
-	runs          map[string]*domain.AgentRun
-	runOrder      map[string][]string
-	artifacts     map[string]*domain.Artifact
-	artifactOrder map[string][]string
+	mu             sync.RWMutex
+	projects       map[string]*domain.Project
+	requirements   map[string][]*domain.Requirement
+	planIndex      map[string]*domain.Plan
+	plans          map[string][]*domain.Plan
+	contractIndex  map[string]*domain.Contract
+	contracts      map[string][]*domain.Contract
+	contextIndex   map[string]*domain.ContextInjection
+	contexts       map[string][]*domain.ContextInjection
+	overrideIndex  map[string]*domain.HumanOverride
+	overrides      map[string][]*domain.HumanOverride
+	lockIndex      map[string]*domain.CodeLock
+	locks          map[string][]*domain.CodeLock
+	previewIndex   map[string]*domain.Preview
+	previews       map[string][]*domain.Preview
+	communications map[string][]*domain.CommunicationLog
+	auditLogs      map[string][]*domain.AuditLog
+	alerts         map[string][]*domain.Alert
+	sandboxIndex   map[string]*domain.Sandbox
+	sandboxes      map[string][]*domain.Sandbox
+	sandboxFaults  map[string]string
+	snapshotIndex  map[string]*domain.Snapshot
+	snapshots      map[string][]*domain.Snapshot
+	snapshotState  map[string]*projectSnapshotState
+	projectBranch  map[string]string
+	stableBranch   map[string]string
+	branchSeq      map[string]int
+	tasks          map[string]*domain.Task
+	taskOrder      map[string][]string
+	runs           map[string]*domain.AgentRun
+	runOrder       map[string][]string
+	artifacts      map[string]*domain.Artifact
+	artifactOrder  map[string][]string
 }
 
 type CreateProjectInput struct {
@@ -198,6 +201,48 @@ type StatusMatrixView struct {
 	GeneratedAt       time.Time             `json:"generatedAt"`
 }
 
+type TokenCostPoint struct {
+	RunID            string           `json:"runId"`
+	TaskID           string           `json:"taskId"`
+	TaskName         string           `json:"taskName"`
+	AgentType        string           `json:"agentType"`
+	Status           domain.RunStatus `json:"status"`
+	PromptTokens     int              `json:"promptTokens"`
+	CompletionTokens int              `json:"completionTokens"`
+	TotalTokens      int              `json:"totalTokens"`
+	EstimatedCostUSD float64          `json:"estimatedCostUsd"`
+	Timestamp        time.Time        `json:"timestamp"`
+}
+
+type TokenCostTrend struct {
+	ProjectID             string           `json:"projectId"`
+	TaskID                string           `json:"taskId,omitempty"`
+	TotalPromptTokens     int              `json:"totalPromptTokens"`
+	TotalCompletionTokens int              `json:"totalCompletionTokens"`
+	TotalTokens           int              `json:"totalTokens"`
+	EstimatedCostUSD      float64          `json:"estimatedCostUsd"`
+	MaxTokens             int              `json:"maxTokens"`
+	Points                []TokenCostPoint `json:"points"`
+}
+
+type auditActorKey struct{}
+
+func WithActor(ctx context.Context, actor string) context.Context {
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, auditActorKey{}, actor)
+}
+
+func ActorFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	actor, _ := ctx.Value(auditActorKey{}).(string)
+	return strings.TrimSpace(actor)
+}
+
 type SandboxView struct {
 	Sandbox domain.Sandbox  `json:"sandbox"`
 	Run     domain.AgentRun `json:"run"`
@@ -293,41 +338,44 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 	}
 
 	return &Service{
-		cfg:           cfg,
-		logger:        logger,
-		projects:      make(map[string]*domain.Project),
-		requirements:  make(map[string][]*domain.Requirement),
-		planIndex:     make(map[string]*domain.Plan),
-		plans:         make(map[string][]*domain.Plan),
-		contractIndex: make(map[string]*domain.Contract),
-		contracts:     make(map[string][]*domain.Contract),
-		contextIndex:  make(map[string]*domain.ContextInjection),
-		contexts:      make(map[string][]*domain.ContextInjection),
-		overrideIndex: make(map[string]*domain.HumanOverride),
-		overrides:     make(map[string][]*domain.HumanOverride),
-		lockIndex:     make(map[string]*domain.CodeLock),
-		locks:         make(map[string][]*domain.CodeLock),
-		previewIndex:  make(map[string]*domain.Preview),
-		previews:      make(map[string][]*domain.Preview),
-		sandboxIndex:  make(map[string]*domain.Sandbox),
-		sandboxes:     make(map[string][]*domain.Sandbox),
-		sandboxFaults: make(map[string]string),
-		snapshotIndex: make(map[string]*domain.Snapshot),
-		snapshots:     make(map[string][]*domain.Snapshot),
-		snapshotState: make(map[string]*projectSnapshotState),
-		projectBranch: make(map[string]string),
-		stableBranch:  make(map[string]string),
-		branchSeq:     make(map[string]int),
-		tasks:         make(map[string]*domain.Task),
-		taskOrder:     make(map[string][]string),
-		runs:          make(map[string]*domain.AgentRun),
-		runOrder:      make(map[string][]string),
-		artifacts:     make(map[string]*domain.Artifact),
-		artifactOrder: make(map[string][]string),
+		cfg:            cfg,
+		logger:         logger,
+		projects:       make(map[string]*domain.Project),
+		requirements:   make(map[string][]*domain.Requirement),
+		planIndex:      make(map[string]*domain.Plan),
+		plans:          make(map[string][]*domain.Plan),
+		contractIndex:  make(map[string]*domain.Contract),
+		contracts:      make(map[string][]*domain.Contract),
+		contextIndex:   make(map[string]*domain.ContextInjection),
+		contexts:       make(map[string][]*domain.ContextInjection),
+		overrideIndex:  make(map[string]*domain.HumanOverride),
+		overrides:      make(map[string][]*domain.HumanOverride),
+		lockIndex:      make(map[string]*domain.CodeLock),
+		locks:          make(map[string][]*domain.CodeLock),
+		previewIndex:   make(map[string]*domain.Preview),
+		previews:       make(map[string][]*domain.Preview),
+		communications: make(map[string][]*domain.CommunicationLog),
+		auditLogs:      make(map[string][]*domain.AuditLog),
+		alerts:         make(map[string][]*domain.Alert),
+		sandboxIndex:   make(map[string]*domain.Sandbox),
+		sandboxes:      make(map[string][]*domain.Sandbox),
+		sandboxFaults:  make(map[string]string),
+		snapshotIndex:  make(map[string]*domain.Snapshot),
+		snapshots:      make(map[string][]*domain.Snapshot),
+		snapshotState:  make(map[string]*projectSnapshotState),
+		projectBranch:  make(map[string]string),
+		stableBranch:   make(map[string]string),
+		branchSeq:      make(map[string]int),
+		tasks:          make(map[string]*domain.Task),
+		taskOrder:      make(map[string][]string),
+		runs:           make(map[string]*domain.AgentRun),
+		runOrder:       make(map[string][]string),
+		artifacts:      make(map[string]*domain.Artifact),
+		artifactOrder:  make(map[string][]string),
 	}
 }
 
-func (s *Service) CreateProject(_ context.Context, input CreateProjectInput) (*domain.Project, error) {
+func (s *Service) CreateProject(ctx context.Context, input CreateProjectInput) (*domain.Project, error) {
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
 		return nil, newValidationError("project name is required")
@@ -345,6 +393,7 @@ func (s *Service) CreateProject(_ context.Context, input CreateProjectInput) (*d
 	s.mu.Lock()
 	s.projects[project.ID] = project
 	s.projectBranch[project.ID] = "main"
+	s.recordAuditLocked(ctx, project.ID, "PROJECT_CREATE", "project", project.ID, "project created", now)
 	s.mu.Unlock()
 
 	return cloneProject(project), nil
@@ -413,6 +462,128 @@ func (s *Service) ListSnapshots(_ context.Context, projectID string) ([]domain.S
 	return result, nil
 }
 
+func (s *Service) ListCommunicationLogs(_ context.Context, projectID, taskID string) ([]domain.CommunicationLog, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	items := s.communications[projectID]
+	result := make([]domain.CommunicationLog, 0, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		if taskID != "" && item.TaskID != taskID {
+			continue
+		}
+		result = append(result, *cloneCommunicationLog(item))
+	}
+
+	return result, nil
+}
+
+func (s *Service) ListAuditLogs(_ context.Context, projectID string) ([]domain.AuditLog, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	items := s.auditLogs[projectID]
+	result := make([]domain.AuditLog, 0, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		result = append(result, *cloneAuditLog(item))
+	}
+
+	return result, nil
+}
+
+func (s *Service) ListAlerts(_ context.Context, projectID string) ([]domain.Alert, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	items := s.alerts[projectID]
+	result := make([]domain.Alert, 0, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		result = append(result, *cloneAlert(item))
+	}
+
+	return result, nil
+}
+
+func (s *Service) GetTokenCostTrend(_ context.Context, projectID, taskID string) (*TokenCostTrend, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	result := &TokenCostTrend{
+		ProjectID: strings.TrimSpace(projectID),
+		TaskID:    strings.TrimSpace(taskID),
+		Points:    make([]TokenCostPoint, 0),
+	}
+	for _, runID := range s.runOrder[projectID] {
+		run, ok := s.runs[runID]
+		if !ok || run == nil {
+			continue
+		}
+		if result.TaskID != "" && run.TaskID != result.TaskID {
+			continue
+		}
+		if run.TotalTokens <= 0 {
+			continue
+		}
+
+		taskName := run.TaskID
+		if task, ok := s.tasks[run.TaskID]; ok && task != nil && strings.TrimSpace(task.Name) != "" {
+			taskName = task.Name
+		}
+		timestamp := run.EndedAt
+		if timestamp.IsZero() {
+			timestamp = run.StartedAt
+		}
+
+		point := TokenCostPoint{
+			RunID:            run.ID,
+			TaskID:           run.TaskID,
+			TaskName:         taskName,
+			AgentType:        run.AgentType,
+			Status:           run.Status,
+			PromptTokens:     run.PromptTokens,
+			CompletionTokens: run.CompletionTokens,
+			TotalTokens:      run.TotalTokens,
+			EstimatedCostUSD: run.EstimatedCostUSD,
+			Timestamp:        timestamp,
+		}
+		result.Points = append(result.Points, point)
+		result.TotalPromptTokens += point.PromptTokens
+		result.TotalCompletionTokens += point.CompletionTokens
+		result.TotalTokens += point.TotalTokens
+		result.EstimatedCostUSD += point.EstimatedCostUSD
+		if point.TotalTokens > result.MaxTokens {
+			result.MaxTokens = point.TotalTokens
+		}
+	}
+
+	return result, nil
+}
+
 func (s *Service) GetProject(_ context.Context, projectID string) (*domain.Project, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -425,7 +596,7 @@ func (s *Service) GetProject(_ context.Context, projectID string) (*domain.Proje
 	return cloneProject(project), nil
 }
 
-func (s *Service) AddRequirement(_ context.Context, projectID string, input AddRequirementInput) (*domain.Requirement, error) {
+func (s *Service) AddRequirement(ctx context.Context, projectID string, input AddRequirementInput) (*domain.Requirement, error) {
 	title := strings.TrimSpace(input.Title)
 	content := strings.TrimSpace(input.Content)
 	if title == "" {
@@ -457,6 +628,7 @@ func (s *Service) AddRequirement(_ context.Context, projectID string, input AddR
 
 	s.requirements[projectID] = append(s.requirements[projectID], req)
 	project.UpdatedAt = now
+	s.recordAuditLocked(ctx, projectID, "REQUIREMENT_ADD", "requirement", req.ID, "requirement added", now)
 
 	return cloneRequirement(req), nil
 }
@@ -478,7 +650,7 @@ func (s *Service) ListRequirements(_ context.Context, projectID string) ([]domai
 	return result, nil
 }
 
-func (s *Service) GeneratePlan(_ context.Context, projectID string) (*PlanResult, error) {
+func (s *Service) GeneratePlan(ctx context.Context, projectID string) (*PlanResult, error) {
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -514,6 +686,7 @@ func (s *Service) GeneratePlan(_ context.Context, projectID string) (*PlanResult
 	s.tasks[task.ID] = task
 	s.taskOrder[projectID] = append(s.taskOrder[projectID], task.ID)
 	project.UpdatedAt = now
+	s.recordAuditLocked(ctx, projectID, "PLAN_GENERATE", "plan", plan.ID, "plan generated from latest requirement", now)
 
 	return &PlanResult{
 		Plan: *clonePlan(plan),
@@ -615,6 +788,7 @@ func (s *Service) GenerateTaskContext(_ context.Context, projectID, taskID strin
 	injection := buildTaskContextInjection(task, plan, contract, requirement, version, now)
 	s.contextIndex[injection.ID] = injection
 	s.contexts[task.ID] = append(s.contexts[task.ID], injection)
+	s.recordCommunicationLocked(projectID, "context-engine", task.AssigneeAgent, "CONTEXT_INJECTION", task.ID, "context://"+injection.ID, now)
 
 	return &TaskContextEnvelope{
 		Task:    *cloneTask(task),
@@ -647,7 +821,7 @@ func (s *Service) GetLatestTaskContext(_ context.Context, projectID, taskID stri
 	}, nil
 }
 
-func (s *Service) ApplyHumanOverride(_ context.Context, projectID string, input ApplyHumanOverrideInput) (*HumanOverrideResult, error) {
+func (s *Service) ApplyHumanOverride(ctx context.Context, projectID string, input ApplyHumanOverrideInput) (*HumanOverrideResult, error) {
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -690,6 +864,8 @@ func (s *Service) ApplyHumanOverride(_ context.Context, projectID string, input 
 
 	s.overrideIndex[override.ID] = override
 	s.overrides[projectID] = append(s.overrides[projectID], override)
+	s.recordCommunicationLocked(projectID, "human:"+override.Operator, task.AssigneeAgent, "HUMAN_OVERRIDE", task.ID, "override://"+override.ID, now)
+	s.recordAuditLocked(ctx, projectID, "HUMAN_OVERRIDE_APPLY", "override", override.ID, "human override queued for task "+task.ID, now)
 	project.UpdatedAt = now
 
 	result := &HumanOverrideResult{
@@ -704,7 +880,7 @@ func (s *Service) ApplyHumanOverride(_ context.Context, projectID string, input 
 	return result, nil
 }
 
-func (s *Service) ApplyCodeLock(_ context.Context, projectID string, input ApplyCodeLockInput) (*CodeLockResult, error) {
+func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input ApplyCodeLockInput) (*CodeLockResult, error) {
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -750,6 +926,8 @@ func (s *Service) ApplyCodeLock(_ context.Context, projectID string, input Apply
 
 	s.lockIndex[lock.ID] = lock
 	s.locks[projectID] = append(s.locks[projectID], lock)
+	s.recordCommunicationLocked(projectID, "human:"+lock.CreatedBy, "delivery-engine", "CODE_LOCK", lock.TaskID, "lock://"+lock.ID, now)
+	s.recordAuditLocked(ctx, projectID, "CODE_LOCK_APPLY", "code_lock", lock.ID, "code lock registered for "+lock.Path, now)
 	project.UpdatedAt = now
 
 	return &CodeLockResult{
@@ -758,7 +936,7 @@ func (s *Service) ApplyCodeLock(_ context.Context, projectID string, input Apply
 	}, nil
 }
 
-func (s *Service) StartPreview(_ context.Context, projectID string) (*PreviewStartResult, error) {
+func (s *Service) StartPreview(ctx context.Context, projectID string) (*PreviewStartResult, error) {
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -787,6 +965,7 @@ func (s *Service) StartPreview(_ context.Context, projectID string) (*PreviewSta
 
 	s.previewIndex[preview.ID] = preview
 	s.previews[projectID] = append(s.previews[projectID], preview)
+	s.recordAuditLocked(ctx, projectID, "PREVIEW_START", "preview", preview.ID, "preview started from shared sandbox "+sandbox.ID, now)
 	project.UpdatedAt = now
 
 	return &PreviewStartResult{
@@ -916,7 +1095,7 @@ func (s *Service) MarkTaskSandboxFailure(_ context.Context, projectID, taskID, r
 	return nil
 }
 
-func (s *Service) MergeToSharedSandbox(_ context.Context, projectID string, input MergeSharedSandboxInput) (*SharedSandboxMergeResult, error) {
+func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, input MergeSharedSandboxInput) (*SharedSandboxMergeResult, error) {
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -967,6 +1146,7 @@ func (s *Service) MergeToSharedSandbox(_ context.Context, projectID string, inpu
 			result.ContractConflicts = conflicts
 			result.RemediationTask = cloneTask(remediationTask)
 			result.Message = "merge blocked by contract conflicts"
+			s.recordAuditLocked(ctx, projectID, "SHARED_SANDBOX_MERGE_BLOCKED", "sandbox", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
 			return result, nil
 		}
 	}
@@ -977,6 +1157,7 @@ func (s *Service) MergeToSharedSandbox(_ context.Context, projectID string, inpu
 		sharedSandbox.UpdatedAt = time.Now().UTC()
 		result.Sandbox = *cloneSandbox(sharedSandbox)
 		result.Message = "merge blocked because shared sandbox manifest could not be created"
+		s.recordAuditLocked(ctx, projectID, "SHARED_SANDBOX_MERGE_BLOCKED", "sandbox", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
 		return result, nil
 	}
 
@@ -997,6 +1178,8 @@ func (s *Service) MergeToSharedSandbox(_ context.Context, projectID string, inpu
 		} else {
 			result.Message = "merge blocked by shared sandbox integration failure"
 		}
+		s.recordAlertLocked(projectID, "CRITICAL", "SHARED_SANDBOX_FAILURE", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
+		s.recordAuditLocked(ctx, projectID, "SHARED_SANDBOX_MERGE_BLOCKED", "sandbox", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
 		return result, nil
 	}
 
@@ -1011,11 +1194,12 @@ func (s *Service) MergeToSharedSandbox(_ context.Context, projectID string, inpu
 	}
 	_ = snapshot
 	result.Message = "artifacts merged into shared sandbox"
+	s.recordAuditLocked(ctx, projectID, "SHARED_SANDBOX_MERGE", "sandbox", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
 
 	return result, nil
 }
 
-func (s *Service) RollbackToSnapshot(_ context.Context, projectID string, input RollbackSnapshotInput) (*RollbackResult, error) {
+func (s *Service) RollbackToSnapshot(ctx context.Context, projectID string, input RollbackSnapshotInput) (*RollbackResult, error) {
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -1033,7 +1217,12 @@ func (s *Service) RollbackToSnapshot(_ context.Context, projectID string, input 
 		reason = "manual snapshot rollback"
 	}
 
-	return s.rollbackToSnapshotLocked(projectID, input.SnapshotID, reason, now)
+	result, err := s.rollbackToSnapshotLocked(projectID, input.SnapshotID, reason, now)
+	if err != nil {
+		return nil, err
+	}
+	s.recordAuditLocked(ctx, projectID, "SNAPSHOT_ROLLBACK", "snapshot", result.Snapshot.ID, result.Message, now)
+	return result, nil
 }
 
 func (s *Service) DispatchTasks(_ context.Context, projectID string) (*DispatchTasksResult, error) {
@@ -1099,6 +1288,7 @@ func (s *Service) DispatchTasks(_ context.Context, projectID string) (*DispatchT
 	for _, task := range dispatched {
 		s.tasks[task.ID] = task
 		s.taskOrder[projectID] = append(s.taskOrder[projectID], task.ID)
+		s.recordCommunicationLocked(projectID, "manager-agent", task.AssigneeAgent, "TASK_DISPATCH", task.ID, task.InputRef, now)
 	}
 	project.UpdatedAt = now
 
@@ -1271,9 +1461,9 @@ func (s *Service) GetRunStatus(_ context.Context, projectID, runID string) (*Run
 	}, nil
 }
 
-func (s *Service) ExportDelivery(_ context.Context, projectID string, input ExportDeliveryInput) (*domain.Artifact, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Service) ExportDelivery(ctx context.Context, projectID string, input ExportDeliveryInput) (*domain.Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if _, ok := s.projects[projectID]; !ok {
 		return nil, newNotFoundError("project not found")
@@ -1288,6 +1478,7 @@ func (s *Service) ExportDelivery(_ context.Context, projectID string, input Expo
 		if err != nil {
 			return nil, err
 		}
+		s.recordAuditLocked(ctx, projectID, "DELIVERY_EXPORT", "artifact", artifact.ID, "delivery export requested for run "+run.ID, time.Now().UTC())
 		return cloneArtifact(artifact), nil
 	}
 
@@ -1299,6 +1490,7 @@ func (s *Service) ExportDelivery(_ context.Context, projectID string, input Expo
 		}
 		artifact, err := s.resolveArtifactFromRunLocked(run)
 		if err == nil {
+			s.recordAuditLocked(ctx, projectID, "DELIVERY_EXPORT", "artifact", artifact.ID, "delivery export requested from latest successful run", time.Now().UTC())
 			return cloneArtifact(artifact), nil
 		}
 	}
@@ -1368,7 +1560,13 @@ func (s *Service) executeRun(runID string) {
 	s.artifacts[artifact.ID] = artifact
 	s.artifactOrder[artifact.ProjectID] = append(s.artifactOrder[artifact.ProjectID], artifact.ID)
 
+	communicationCount := s.communicationCountForTaskLocked(project.ID, storedTask.ID)
+	promptTokens, completionTokens, totalTokens, estimatedCostUSD := estimateRunCost(storedTask, plan, communicationCount, false)
 	storedRun.Status = domain.RunStatusSucceeded
+	storedRun.PromptTokens = promptTokens
+	storedRun.CompletionTokens = completionTokens
+	storedRun.TotalTokens = totalTokens
+	storedRun.EstimatedCostUSD = estimatedCostUSD
 	if appliedOverride != nil {
 		summary += "; applied human override by " + appliedOverride.Operator + ": " + appliedOverride.Instruction
 	}
@@ -1436,6 +1634,7 @@ func (s *Service) failRun(runID string, failure error) {
 	run.Status = domain.RunStatusFailed
 	run.Error = failure.Error()
 	run.EndedAt = now
+	s.recordAlertLocked(run.ProjectID, "ERROR", "RUN_FAILURE", run.ID, failure.Error(), now)
 	if run.SandboxID != "" {
 		if sandbox, exists := s.sandboxIndex[run.SandboxID]; exists {
 			sandbox.Status = domain.SandboxStatusFailed
@@ -1449,6 +1648,20 @@ func (s *Service) failRun(runID string, failure error) {
 			s.logger.Error("failed to transition task to failed", "taskId", task.ID, "error", err)
 		}
 	}
+	var task *domain.Task
+	if existing, ok := s.tasks[run.TaskID]; ok {
+		task = existing
+	}
+	var plan *domain.Plan
+	if task != nil {
+		plan = s.planIndex[task.PlanID]
+	}
+	communicationCount := s.communicationCountForTaskLocked(run.ProjectID, run.TaskID)
+	promptTokens, completionTokens, totalTokens, estimatedCostUSD := estimateRunCost(task, plan, communicationCount, true)
+	run.PromptTokens = promptTokens
+	run.CompletionTokens = completionTokens
+	run.TotalTokens = totalTokens
+	run.EstimatedCostUSD = estimatedCostUSD
 }
 
 func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.Task, plan *domain.Plan, run *domain.AgentRun, sandbox *domain.Sandbox) (*domain.Artifact, string, error) {
@@ -1471,7 +1684,25 @@ func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.T
 	if err := writeFile(filepath.Join(bundleDir, "generated-app", "main.go"), []byte(renderGeneratedSource(project, plan))); err != nil {
 		return nil, "", err
 	}
+	if err := writeFile(filepath.Join(bundleDir, "generated-app", "Dockerfile"), []byte(renderBackendDockerfile())); err != nil {
+		return nil, "", err
+	}
 	if err := s.applyProjectLocksToBundle(project.ID, task.ID, bundleDir); err != nil {
+		return nil, "", err
+	}
+	if err := writeFile(filepath.Join(bundleDir, "web-app", "package.json"), []byte(renderFrontendPackageJSON(project))); err != nil {
+		return nil, "", err
+	}
+	if err := writeFile(filepath.Join(bundleDir, "web-app", "server.js"), []byte(renderFrontendServerJS(project, plan))); err != nil {
+		return nil, "", err
+	}
+	if err := writeFile(filepath.Join(bundleDir, "web-app", "index.html"), []byte(renderFrontendIndexHTML(project, plan))); err != nil {
+		return nil, "", err
+	}
+	if err := writeFile(filepath.Join(bundleDir, "web-app", "Dockerfile"), []byte(renderFrontendDockerfile())); err != nil {
+		return nil, "", err
+	}
+	if err := writeFile(filepath.Join(bundleDir, "docker-compose.yml"), []byte(renderDockerCompose())); err != nil {
 		return nil, "", err
 	}
 
@@ -1516,7 +1747,7 @@ func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.T
 		CreatedAt: time.Now().UTC(),
 	}
 
-	summary := fmt.Sprintf("generated delivery bundle for plan v%d at %s", plan.Version, zipPath)
+	summary := fmt.Sprintf("generated standard delivery bundle for plan v%d at %s", plan.Version, zipPath)
 	return artifact, summary, nil
 }
 
@@ -1749,6 +1980,113 @@ func (s *Service) resolveLatestReleasedSharedSandboxLocked(projectID string) (*d
 	return nil, newConflictError("no released shared sandbox available for preview")
 }
 
+func (s *Service) recordCommunicationLocked(projectID, from, to, messageType, taskID, payloadRef string, now time.Time) {
+	base := strings.Join([]string{
+		"v1",
+		strings.TrimSpace(from),
+		strings.TrimSpace(to),
+		strings.TrimSpace(messageType),
+		strings.TrimSpace(taskID),
+		strings.TrimSpace(payloadRef),
+		now.Format(time.RFC3339Nano),
+	}, "|")
+	sum := sha256.Sum256([]byte(base))
+
+	entry := &domain.CommunicationLog{
+		ID:         nextID("comm"),
+		ProjectID:  projectID,
+		Version:    "v1",
+		From:       strings.TrimSpace(from),
+		To:         strings.TrimSpace(to),
+		Type:       strings.TrimSpace(messageType),
+		TaskID:     strings.TrimSpace(taskID),
+		PayloadRef: strings.TrimSpace(payloadRef),
+		Checksum:   hex.EncodeToString(sum[:4]),
+		Timestamp:  now,
+	}
+	s.communications[projectID] = append(s.communications[projectID], entry)
+}
+
+func (s *Service) recordAuditLocked(ctx context.Context, projectID, action, resourceType, resourceID, summary string, now time.Time) {
+	actor := ActorFromContext(ctx)
+	if actor == "" {
+		actor = "system"
+	}
+	entry := &domain.AuditLog{
+		ID:           nextID("audit"),
+		ProjectID:    projectID,
+		Actor:        actor,
+		Action:       strings.TrimSpace(action),
+		ResourceType: strings.TrimSpace(resourceType),
+		ResourceID:   strings.TrimSpace(resourceID),
+		Summary:      strings.TrimSpace(summary),
+		Timestamp:    now,
+	}
+	s.auditLogs[projectID] = append(s.auditLogs[projectID], entry)
+}
+
+func (s *Service) recordAlertLocked(projectID, severity, alertType, resourceID, message string, now time.Time) {
+	entry := &domain.Alert{
+		ID:         nextID("alert"),
+		ProjectID:  projectID,
+		Severity:   strings.TrimSpace(severity),
+		Type:       strings.TrimSpace(alertType),
+		ResourceID: strings.TrimSpace(resourceID),
+		Message:    strings.TrimSpace(message),
+		Timestamp:  now,
+	}
+	s.alerts[projectID] = append(s.alerts[projectID], entry)
+}
+
+func (s *Service) communicationCountForTaskLocked(projectID, taskID string) int {
+	if strings.TrimSpace(taskID) == "" {
+		return 0
+	}
+	count := 0
+	for _, item := range s.communications[projectID] {
+		if item == nil || item.TaskID != taskID {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func estimateRunCost(task *domain.Task, plan *domain.Plan, communicationCount int, failed bool) (int, int, int, float64) {
+	promptTokens := 220 + communicationCount*36
+	completionTokens := 180 + communicationCount*24
+
+	if plan != nil {
+		promptTokens += len(plan.Scope) * 42
+		promptTokens += len(plan.Constraints) * 28
+		completionTokens += len(plan.AcceptanceCriteria) * 30
+	}
+	if task != nil {
+		promptTokens += len(task.DependsOn) * 32
+		switch task.Type {
+		case "BACKEND_IMPLEMENTATION":
+			promptTokens += 160
+			completionTokens += 240
+		case "FRONTEND_IMPLEMENTATION":
+			promptTokens += 140
+			completionTokens += 220
+		case "INTEGRATION_REVIEW":
+			promptTokens += 120
+			completionTokens += 180
+		default:
+			promptTokens += 100
+			completionTokens += 140
+		}
+	}
+	if failed {
+		completionTokens /= 2
+	}
+
+	totalTokens := promptTokens + completionTokens
+	estimatedCostUSD := float64(promptTokens)*0.0000015 + float64(completionTokens)*0.0000025
+	return promptTokens, completionTokens, totalTokens, estimatedCostUSD
+}
+
 func (s *Service) resolveTaskContractLocked(projectID string, task *domain.Task) (*domain.Contract, error) {
 	if strings.HasPrefix(task.InputRef, "contract://") {
 		contractID := strings.TrimPrefix(task.InputRef, "contract://")
@@ -1876,6 +2214,7 @@ func (s *Service) startTaskRunLocked(projectID string, task *domain.Task, now ti
 
 	s.runs[run.ID] = run
 	s.runOrder[projectID] = append(s.runOrder[projectID], run.ID)
+	s.recordCommunicationLocked(projectID, "orchestrator", agentType, "RUN_START", task.ID, "run://"+run.ID, now)
 
 	return &RunEnvelope{
 		Task: *cloneTask(task),
@@ -2774,9 +3113,9 @@ func deriveScope(content string) []string {
 }
 
 func renderBundleReadme(project *domain.Project, task *domain.Task, plan *domain.Plan) string {
-	return fmt.Sprintf(`# %s - Sprint 1 Delivery Bundle
+	return fmt.Sprintf(`# %s - Standard Delivery Bundle
 
-此交付包由 MultiAgentCom 的任务执行器生成，用于验证当前开发闭环。
+此交付包由 MultiAgentCom 的交付引擎生成，包含最小可运行的后端、前端和本地编排文件。
 
 ## Project
 
@@ -2798,9 +3137,18 @@ func renderBundleReadme(project *domain.Project, task *domain.Task, plan *domain
 
 %s
 
+## Quick Start
+
+1. 安装 Docker 和 Docker Compose。
+2. 在交付包根目录执行: docker compose up --build
+3. 打开: http://127.0.0.1:3000 验证前端预览。
+4. 访问: http://127.0.0.1:8081/health 验证后端服务。
+
 ## Bundle Contents
 
-- generated-app/: 占位源码
+- generated-app/: Go 后端服务，包含 go.mod、main.go、Dockerfile
+- web-app/: Node 前端服务，包含 package.json、server.js、index.html、Dockerfile
+- docker-compose.yml: 本地一键启动编排文件
 - metadata/prd.json: 结构化 PRD
 - metadata/task.json: 任务快照
 - metadata/run.json: 执行快照
@@ -2809,17 +3157,179 @@ func renderBundleReadme(project *domain.Project, task *domain.Task, plan *domain
 }
 
 func renderGeneratedSource(project *domain.Project, plan *domain.Plan) string {
-	return fmt.Sprintf(`package main
-
-import "fmt"
-
-func main() {
-	fmt.Println("MultiAgentCom generated scaffold")
-	fmt.Println("Project: %s")
-	fmt.Println("Plan: %s")
-	fmt.Println("Goal: %s")
+	return fmt.Sprintf("package main\n\n"+
+		"import (\n"+
+		"\t\"encoding/json\"\n"+
+		"\t\"fmt\"\n"+
+		"\t\"net/http\"\n"+
+		")\n\n"+
+		"type todo struct {\n"+
+		"\tID        string `json:\"id\"`\n"+
+		"\tTitle     string `json:\"title\"`\n"+
+		"\tCompleted bool   `json:\"completed\"`\n"+
+		"}\n\n"+
+		"func main() {\n"+
+		"\tmux := http.NewServeMux()\n"+
+		"\tmux.HandleFunc(\"/health\", func(w http.ResponseWriter, r *http.Request) {\n"+
+		"\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n"+
+		"\t\t_ = json.NewEncoder(w).Encode(map[string]any{\n"+
+		"\t\t\t\"status\": \"ok\",\n"+
+		"\t\t\t\"project\": %q,\n"+
+		"\t\t\t\"plan\": %q,\n"+
+		"\t\t})\n"+
+		"\t})\n"+
+		"\tmux.HandleFunc(\"/api/todos\", func(w http.ResponseWriter, r *http.Request) {\n"+
+		"\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n"+
+		"\t\t_ = json.NewEncoder(w).Encode([]todo{\n"+
+		"\t\t\t{ID: \"todo-1\", Title: \"Review delivery bundle\", Completed: false},\n"+
+		"\t\t\t{ID: \"todo-2\", Title: \"Verify docker compose startup\", Completed: true},\n"+
+		"\t\t})\n"+
+		"\t})\n\n"+
+		"\tfmt.Println(\"MultiAgentCom generated backend listening on :8081\")\n"+
+		"\tif err := http.ListenAndServe(\":8081\", mux); err != nil {\n"+
+		"\t\tpanic(err)\n"+
+		"\t}\n"+
+		"}\n",
+		project.Name,
+		plan.Title,
+	)
 }
-`, escapeForDoubleQuotedString(project.Name), escapeForDoubleQuotedString(plan.Title), escapeForDoubleQuotedString(plan.Goal))
+
+func renderBackendDockerfile() string {
+	return `FROM golang:1.25-alpine
+WORKDIR /app
+COPY . .
+RUN go build -o service .
+EXPOSE 8081
+CMD ["./service"]
+`
+}
+
+func renderFrontendPackageJSON(project *domain.Project) string {
+	return fmt.Sprintf(`{
+  "name": "%s-preview",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  }
+}
+`, strings.ToLower(strings.ReplaceAll(project.Name, " ", "-")))
+}
+
+func renderFrontendServerJS(project *domain.Project, plan *domain.Plan) string {
+	return fmt.Sprintf(`const http = require("http");
+const fs = require("fs");
+const path = require("path");
+
+const indexPath = path.join(__dirname, "index.html");
+const revision = %q;
+
+http.createServer((req, res) => {
+  if (req.url === "/status") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", revision }));
+    return;
+  }
+
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(fs.readFileSync(indexPath, "utf8"));
+}).listen(3000, () => {
+  console.log("Preview server for %s / %s listening on :3000");
+});
+`, escapeForDoubleQuotedString(project.ID+"-"+plan.ID), escapeForDoubleQuotedString(project.Name), escapeForDoubleQuotedString(plan.Title))
+}
+
+func renderFrontendIndexHTML(project *domain.Project, plan *domain.Plan) string {
+	return fmt.Sprintf(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>%s Preview</title>
+  <style>
+    body { font-family: "Avenir Next", "Segoe UI", sans-serif; margin: 0; background: #f4f7fb; color: #1f2937; }
+    main { max-width: 880px; margin: 0 auto; padding: 32px 20px 48px; }
+    .hero { background: white; border-radius: 24px; padding: 24px; box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08); margin-bottom: 20px; }
+    .todo { background: white; border-radius: 24px; padding: 20px; box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08); }
+    ul { list-style: none; padding: 0; display: grid; gap: 12px; }
+    li { display: flex; gap: 10px; align-items: center; border: 1px solid #d7deea; border-radius: 16px; padding: 14px; }
+    button { border: 0; border-radius: 999px; background: #0f62fe; color: white; padding: 10px 16px; cursor: pointer; }
+    input[type="text"] { flex: 1; border: 0; font: inherit; background: transparent; }
+    .muted { color: #6b7280; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <p class="muted">Generated Preview</p>
+      <h1>%s</h1>
+      <p>%s</p>
+      <button type="button" onclick="fetch('/status').then((r) => r.json()).then((data) => alert('Revision: ' + data.revision))">Check hot reload revision</button>
+    </section>
+    <section class="todo">
+      <h2>Todo demo</h2>
+      <ul id="todos"></ul>
+    </section>
+  </main>
+  <script>
+    const todos = [
+      { id: "todo-1", title: "Open preview URL", completed: true },
+      { id: "todo-2", title: "Verify README startup steps", completed: false },
+      { id: "todo-3", title: "Export delivery bundle", completed: false }
+    ];
+    const root = document.getElementById("todos");
+    function render() {
+      root.innerHTML = "";
+      todos.forEach((todo) => {
+        const li = document.createElement("li");
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = todo.completed;
+        checkbox.onchange = () => {
+          todo.completed = checkbox.checked;
+          render();
+        };
+        const input = document.createElement("input");
+        input.type = "text";
+        input.value = todo.title;
+        input.oninput = (event) => {
+          todo.title = event.target.value;
+        };
+        li.appendChild(checkbox);
+        li.appendChild(input);
+        root.appendChild(li);
+      });
+    }
+    render();
+  </script>
+</body>
+</html>
+`, escapeForDoubleQuotedString(project.Name), escapeForDoubleQuotedString(project.Name), escapeForDoubleQuotedString(plan.Goal))
+}
+
+func renderFrontendDockerfile() string {
+	return `FROM node:22-alpine
+WORKDIR /app
+COPY . .
+EXPOSE 3000
+CMD ["npm", "run", "start"]
+`
+}
+
+func renderDockerCompose() string {
+	return `services:
+  backend:
+    build: ./generated-app
+    ports:
+      - "8081:8081"
+  frontend:
+    build: ./web-app
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+`
 }
 
 func renderBulletList(items []string) string {
@@ -3120,6 +3630,30 @@ func clonePreview(preview *domain.Preview) *domain.Preview {
 		return nil
 	}
 	copy := *preview
+	return &copy
+}
+
+func cloneCommunicationLog(item *domain.CommunicationLog) *domain.CommunicationLog {
+	if item == nil {
+		return nil
+	}
+	copy := *item
+	return &copy
+}
+
+func cloneAuditLog(item *domain.AuditLog) *domain.AuditLog {
+	if item == nil {
+		return nil
+	}
+	copy := *item
+	return &copy
+}
+
+func cloneAlert(item *domain.Alert) *domain.Alert {
+	if item == nil {
+		return nil
+	}
+	copy := *item
 	return &copy
 }
 

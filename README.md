@@ -19,12 +19,19 @@
 - `GET /projects/{id}/tasks`：查看项目任务列表与依赖
 - `POST /projects/{id}/tasks/{taskId}/context/generate`：为指定任务生成上下文切片
 - `GET /projects/{id}/tasks/{taskId}/context`：查看该任务最新上下文注入结果
+- `GET /projects/{id}/communications`：查看项目内部通信日志，支持 `taskId` 过滤
+- `GET /projects/{id}/audit-logs`：查看项目关键操作审计日志
+- `GET /projects/{id}/alerts`：查看项目关键失败告警流
+- `GET /projects/{id}/token-costs`：查看按任务聚合的 Token 与成本趋势，支持 `taskId` 过滤
 - `POST /projects/{id}/tasks/{taskId}/sandbox/fail`：为指定任务注入一次性私有沙盒失败
 - `POST /projects/{id}/overrides`：为运行中的任务注入人工高优指令，在安全检查点进入并恢复 `HUMAN_OVERRIDE`
 - `POST /projects/{id}/locks`：注册带 `LOCKED BY HUMAN` 标记的人工代码片段，后续自动产物生成时保留为真值
 - `POST /projects/{id}/shared-sandbox/merge`：将多个已完成任务的产物送入共享沙盒并执行合并闸门
 - `GET /projects/{id}/snapshots`：查看项目时间线快照与分支
 - `POST /projects/{id}/snapshots/rollback`：回滚到指定快照并创建新的平行时间线分支
+- `POST /projects/{id}/preview/start`：基于最新共享沙盒启动预览服务
+- `GET /projects/{id}/preview/{previewId}`：打开预览页面
+- `GET /projects/{id}/preview/{previewId}/status`：查询预览运行状态与 revision
 - `POST /projects/{id}/tasks/run`：触发单 Agent 串行执行
 - `POST /projects/{id}/tasks/{taskId}/retry`：为失败任务创建独立重试任务
 - `POST /projects/{id}/runs/parallel`：并行触发多个已就绪任务
@@ -38,17 +45,22 @@
 
 - 后端使用 Go 标准库先跑通最小闭环，领域层与 HTTP 层已解耦，后续可按 `docs/Tech-Stack-Decision.md` 平滑替换为 Gin。
 - 当前使用**内存存储**，用于验证 Sprint 1 核心链路。
-- 单 Agent 执行器当前为**规则驱动的占位实现**：会基于 PRD 生成最小交付包（README、占位源码、元数据）。
+- 单 Agent 执行器当前为**规则驱动的最小交付实现**：会基于 PRD 生成标准交付包（README、Go 后端、Node 预览前端、Dockerfile、Compose、元数据）。
 - Contract Hub 当前为**最小可演示实现**：支持基于最新 PRD 规则生成 CRUD 风格 API/Schema 契约，并按版本保存在内存中。
 - 契约校验当前支持**合并前最小闸门**：可检查候选 endpoints/schemas 与契约的缺失、类型不一致、额外字段；若存在冲突，会拒绝校验并自动创建修复任务。
 - 并行调度当前支持**双 Agent + 简单 DAG**：可生成后端/前端实现任务，并在依赖满足后触发集成任务；失败任务可单独创建 retry 任务，不影响其他任务继续推进。
 - Context Engine 当前支持**按任务角色切片注入**：后端任务会拿到 API/Schema 重点，前端任务会拿到 UX/验收重点；每次生成都会记录 `version` 和 `sources`，可回查最新注入结果。
 - 状态矩阵面板当前支持**最小可视化监控**：可查看项目级任务矩阵、Agent 状态汇总，并在 `/status/panel` 中按项目过滤与自动刷新。
+- 通信日志当前支持**最小链路可视化**：会记录任务派发、上下文注入、运行启动、人工接管、代码锁等内部消息，并可在 `/projects/{id}/communications` 或 `/status/panel` 中按 `taskId` 过滤和高亮查看。
+- 告警基线当前支持**最小失败通知**：run 失败和共享沙盒关键失败会沉淀为 `/projects/{id}/alerts` 中的告警流，并在 `/status/panel` 里直接展示。
+- Token 成本监控当前支持**最小趋势观测**：系统会基于每次 run 的执行阶段生成模拟 Prompt/Completion Token 与估算成本，可通过 `/projects/{id}/token-costs` 或 `/status/panel` 查看按任务的趋势条目。
 - 私有沙盒运行时当前支持**每个 run 独立工作目录**：系统会为每次执行分配显式 `sandboxId` 和独立 `rootPath`；单个沙盒失败会标记为 `FAILED`，不会影响其他并行任务继续产生产物。
 - HITL 当前支持**最小人工接管**：运行中的任务可通过 `POST /projects/{id}/overrides` 进入 `HUMAN_OVERRIDE`，执行器会在安全检查点应用指令并恢复执行，任务审计与运行摘要会记录这次接管。
 - 代码锁定当前支持**最小人工真值保护**：人类可通过 `POST /projects/{id}/locks` 注册包含 `LOCKED BY HUMAN` 标记的文件内容；后续自动生成 bundle 时会保留这段人工内容，并在 `metadata/lock-conflicts.log` 记录跳过覆盖行为。
 - 共享沙盒当前支持**最小合并闸门**：只有 `DONE` 任务的成功产物才可进入 `SHARED` 沙盒；可在合并前执行契约校验并生成修复任务，或在模拟集成失败时阻断进入主交付链路。
 - Timeline 当前支持**最小快照与回滚**：共享沙盒成功合并后会自动生成稳定快照；共享沙盒集成失败时会自动回滚到最近稳定快照，并创建新的 branch 保留原时间线；手动回滚也会清理旧的上下文注入记录。
+- Preview Service 当前支持**最小可验收预览**：共享沙盒合并完成后可启动带 revision 检查的 Todo 预览页，便于验收演示。
+- 安全基线当前支持**最小单租户鉴权与审计**：设置 `MULTI_AGENT_API_TOKEN` 后，API 需携带 `Authorization: Bearer <token>`；关键操作会写入 `/projects/{id}/audit-logs` 审计流。
 
 ## 本地运行
 
@@ -73,3 +85,27 @@ go run ./cmd/server
 # 新开终端
 bash scripts/demo.sh
 ```
+
+如需连续回归三轮演示：
+
+```bash
+RUNS=3 bash scripts/demo.sh
+```
+
+如需执行完整发布检查：
+
+```bash
+bash scripts/release-check.sh
+```
+
+如需执行安全扫描：
+
+```bash
+bash scripts/security-check.sh
+```
+
+CI 基线：
+
+- GitHub Actions 会在 `push` / `pull_request` 上自动执行 `go test ./...`
+- 同时会执行 `DEMO_RUNS=1 bash scripts/release-check.sh` 作为 release smoke，保证预览、交付包和关键脚本链路可用
+- 本地发布前仍建议执行默认三轮的 `bash scripts/release-check.sh`

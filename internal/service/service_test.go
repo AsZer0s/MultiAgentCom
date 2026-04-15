@@ -1,6 +1,7 @@
 package service
 
 import (
+	"archive/zip"
 	"context"
 	"log/slog"
 	"os"
@@ -63,6 +64,17 @@ func TestSprintOneFlow(t *testing.T) {
 			if _, err := os.Stat(status.Artifacts[0].URI); err != nil {
 				t.Fatalf("artifact file missing: %v", err)
 			}
+			assertZipContains(t, status.Artifacts[0].URI,
+				"README.md",
+				"docker-compose.yml",
+				"generated-app/go.mod",
+				"generated-app/main.go",
+				"generated-app/Dockerfile",
+				"web-app/package.json",
+				"web-app/server.js",
+				"web-app/index.html",
+				"web-app/Dockerfile",
+			)
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -1058,6 +1070,216 @@ func TestApplyHumanOverrideAtSafetyCheckpoint(t *testing.T) {
 	}
 }
 
+func TestListCommunicationLogsWithTaskFilter(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-communications",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, _, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	if _, err := svc.GenerateTaskContext(ctx, project.ID, dispatched[0].ID); err != nil {
+		t.Fatalf("generate task context: %v", err)
+	}
+
+	items, err := svc.ListCommunicationLogs(ctx, project.ID, "")
+	if err != nil {
+		t.Fatalf("list communication logs: %v", err)
+	}
+	if len(items) < 6 {
+		t.Fatalf("expected at least 6 communication log entries, got %d", len(items))
+	}
+
+	foundDispatch := false
+	foundRunStart := false
+	foundContext := false
+	for _, item := range items {
+		switch item.Type {
+		case "TASK_DISPATCH":
+			foundDispatch = true
+		case "RUN_START":
+			foundRunStart = true
+		case "CONTEXT_INJECTION":
+			foundContext = true
+		}
+	}
+	if !foundDispatch || !foundRunStart || !foundContext {
+		t.Fatalf("expected dispatch/run/context communication types, got %+v", items)
+	}
+
+	filtered, err := svc.ListCommunicationLogs(ctx, project.ID, dispatched[0].ID)
+	if err != nil {
+		t.Fatalf("list filtered communication logs: %v", err)
+	}
+	if len(filtered) < 3 {
+		t.Fatalf("expected at least 3 communication log entries for task %s, got %d", dispatched[0].ID, len(filtered))
+	}
+	for _, item := range filtered {
+		if item.TaskID != dispatched[0].ID {
+			t.Fatalf("expected filtered task id %s, got %s", dispatched[0].ID, item.TaskID)
+		}
+	}
+}
+
+func TestGetTokenCostTrendByTask(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-token-costs",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, _, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+
+	trend, err := svc.GetTokenCostTrend(ctx, project.ID, "")
+	if err != nil {
+		t.Fatalf("get token cost trend: %v", err)
+	}
+	if len(trend.Points) != 2 {
+		t.Fatalf("expected 2 token cost points, got %d", len(trend.Points))
+	}
+	if trend.TotalTokens <= 0 || trend.EstimatedCostUSD <= 0 {
+		t.Fatalf("expected positive token totals and cost, got %+v", trend)
+	}
+
+	filtered, err := svc.GetTokenCostTrend(ctx, project.ID, dispatched[0].ID)
+	if err != nil {
+		t.Fatalf("get filtered token cost trend: %v", err)
+	}
+	if len(filtered.Points) != 1 {
+		t.Fatalf("expected 1 filtered token cost point, got %d", len(filtered.Points))
+	}
+	if filtered.Points[0].TaskID != dispatched[0].ID {
+		t.Fatalf("expected filtered task id %s, got %s", dispatched[0].ID, filtered.Points[0].TaskID)
+	}
+	if filtered.Points[0].TotalTokens <= 0 || filtered.Points[0].EstimatedCostUSD <= 0 {
+		t.Fatalf("expected positive filtered token totals and cost, got %+v", filtered.Points[0])
+	}
+}
+
+func TestListAuditLogsTracksCriticalActions(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-audit-logs",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := WithActor(context.Background(), "qa-reviewer")
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Audit Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo 列表的增删改查",
+		Content: "实现 Todo 列表的增删改查，并导出标准交付包。",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+
+	if _, err := svc.ExportDelivery(ctx, project.ID, ExportDeliveryInput{RunID: runEnvelope.Run.ID}); err != nil {
+		t.Fatalf("export delivery: %v", err)
+	}
+
+	items, err := svc.ListAuditLogs(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list audit logs: %v", err)
+	}
+	if len(items) < 4 {
+		t.Fatalf("expected at least 4 audit entries, got %d", len(items))
+	}
+
+	foundProjectCreate := false
+	foundExport := false
+	for _, item := range items {
+		if item.Actor != "qa-reviewer" {
+			t.Fatalf("expected audit actor qa-reviewer, got %s", item.Actor)
+		}
+		switch item.Action {
+		case "PROJECT_CREATE":
+			foundProjectCreate = true
+		case "DELIVERY_EXPORT":
+			foundExport = true
+		}
+	}
+	if !foundProjectCreate || !foundExport {
+		t.Fatalf("expected audit entries for create and export, got %+v", items)
+	}
+}
+
+func TestListAlertsIncludesRunFailures(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-alerts",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Alert Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo 列表的增删改查",
+		Content: "实现 Todo 列表的增删改查，并模拟私有沙盒失败。",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if err := svc.MarkTaskSandboxFailure(ctx, project.ID, planResult.Task.ID, "simulated crash"); err != nil {
+		t.Fatalf("mark sandbox failure: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusFailed {
+		t.Fatalf("expected failed run, got %s", status.Run.Status)
+	}
+
+	items, err := svc.ListAlerts(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list alerts: %v", err)
+	}
+	if len(items) == 0 {
+		t.Fatal("expected at least one alert")
+	}
+	if items[0].Type != "RUN_FAILURE" || items[0].Severity != "ERROR" {
+		t.Fatalf("expected RUN_FAILURE ERROR alert, got %+v", items[0])
+	}
+}
+
 func TestCodeLockPreservesHumanContent(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",
@@ -1272,4 +1494,24 @@ func waitForTaskStatus(t *testing.T, svc *Service, projectID, runID string, expe
 	}
 
 	t.Fatalf("run %s did not reach task status %s before deadline", runID, expected)
+}
+
+func assertZipContains(t *testing.T, zipPath string, expected ...string) {
+	t.Helper()
+
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("open zip %s: %v", zipPath, err)
+	}
+	defer reader.Close()
+
+	entries := make(map[string]struct{}, len(reader.File))
+	for _, file := range reader.File {
+		entries[file.Name] = struct{}{}
+	}
+	for _, item := range expected {
+		if _, ok := entries[item]; !ok {
+			t.Fatalf("expected zip %s to contain %s", zipPath, item)
+		}
+	}
 }
