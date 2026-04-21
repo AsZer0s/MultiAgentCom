@@ -21,6 +21,7 @@ bash scripts/release-check.sh
 - `bash scripts/security-check.sh` 通过
 - `bash scripts/demo.sh` 端到端执行通过
 - `bash scripts/alert-smoke.sh` 验证失败告警与 webhook 推送通过
+- `bash scripts/auth-smoke.sh` 验证单租户 token 鉴权通过
 - 预览环境可访问
 - 导出 ZIP 交付包结构符合 AC-15
 - Sprint 4 验收文档存在
@@ -51,10 +52,17 @@ RUNS=3 bash scripts/demo.sh
 bash scripts/alert-smoke.sh
 ```
 
+验证鉴权基线：
+
+```bash
+API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
+```
+
 ## Manual Verification Points
 
 - `GET /status/panel` 页面包含 `Agent Message Log`
 - `GET /status/panel` 页面包含 `Failure Alerts`
+- `GET /status/panel` 页面包含 `Audit Trail`
 - `GET /status/panel` 页面包含 `Token Cost Trend`
 - `GET /projects/{id}/alerts` 返回关键失败告警流
 - 配置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，失败告警可推送到外部 webhook sink
@@ -62,6 +70,7 @@ bash scripts/alert-smoke.sh
 - `GET /projects/{id}/audit-logs` 返回关键操作审计流
 - `GET /projects/{id}/token-costs?taskId=...` 返回 `totalTokens`
 - 配置 `MULTI_AGENT_API_TOKEN` 后，未带 token 的 API 请求返回 `401`
+- 配置 `MULTI_AGENT_API_TOKEN` 后，带 token 的 API 请求可正常创建项目并写入审计
 - `POST /projects/{id}/preview/start` 后预览页可访问
 - 下载交付包后包含：
   - `README.md`

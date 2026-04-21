@@ -62,6 +62,7 @@
 - Preview Service 当前支持**最小可验收预览**：共享沙盒合并完成后可启动带 revision 检查的 Todo 预览页，便于验收演示。
 - 安全基线当前支持**最小单租户鉴权与审计**：设置 `MULTI_AGENT_API_TOKEN` 后，API 需携带 `Authorization: Bearer <token>`；关键操作会写入 `/projects/{id}/audit-logs` 审计流。
 - 告警通知当前支持**最小 webhook 主动推送**：设置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，run 失败和回滚事件会异步推送结构化 alert 到外部接收端。
+- 状态面板当前支持**最小运维总览**：同一页面可查看任务矩阵、失败告警、审计轨迹、通信日志和 Token 成本趋势。
 
 ## 本地运行
 
@@ -103,6 +104,12 @@ bash scripts/release-check.sh
 
 ```bash
 bash scripts/security-check.sh
+```
+
+如需执行鉴权 smoke：
+
+```bash
+API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 ```
 
 CI 基线：

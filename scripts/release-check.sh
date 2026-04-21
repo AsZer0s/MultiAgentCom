@@ -7,11 +7,17 @@ LOG_FILE="${LOG_FILE:-${TMPDIR:-/tmp}/multiagentcom-release-check.log}"
 DEMO_RUNS="${DEMO_RUNS:-3}"
 ALERT_WEBHOOK_PORT="${ALERT_WEBHOOK_PORT:-18081}"
 ALERT_WEBHOOK_LOG="${ALERT_WEBHOOK_LOG:-${TMPDIR:-/tmp}/multiagentcom-alert-webhook.log}"
+AUTH_SMOKE_PORT="${AUTH_SMOKE_PORT:-18082}"
+AUTH_SMOKE_TOKEN="${AUTH_SMOKE_TOKEN:-release-check-token}"
 
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]]; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
     wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${AUTH_SERVER_PID:-}" ]]; then
+    kill "$AUTH_SERVER_PID" >/dev/null 2>&1 || true
+    wait "$AUTH_SERVER_PID" 2>/dev/null || true
   fi
   if [[ -n "${WEBHOOK_PID:-}" ]]; then
     kill "$WEBHOOK_PID" >/dev/null 2>&1 || true
@@ -23,6 +29,7 @@ trap cleanup EXIT
 echo "== syntax checks =="
 bash -n "$ROOT_DIR/scripts/demo.sh"
 bash -n "$ROOT_DIR/scripts/alert-smoke.sh"
+bash -n "$ROOT_DIR/scripts/auth-smoke.sh"
 bash -n "$ROOT_DIR/scripts/release-check.sh"
 bash -n "$ROOT_DIR/scripts/security-check.sh"
 
@@ -80,6 +87,23 @@ RUNS="$DEMO_RUNS" BASE_URL="$BASE_URL" ARTIFACT_DIR="${TMPDIR:-/tmp}/multiagentc
 echo
 echo "== alert webhook smoke verification =="
 BASE_URL="$BASE_URL" ALERT_WEBHOOK_LOG="$ALERT_WEBHOOK_LOG" bash "$ROOT_DIR/scripts/alert-smoke.sh"
+
+echo
+echo "== authenticated api smoke verification =="
+(cd "$ROOT_DIR" && MULTI_AGENT_ADDR=":$AUTH_SMOKE_PORT" MULTI_AGENT_API_TOKEN="$AUTH_SMOKE_TOKEN" MULTI_AGENT_ALERT_WEBHOOK_URL="http://127.0.0.1:$ALERT_WEBHOOK_PORT" go run ./cmd/server >"${LOG_FILE}.auth" 2>&1) &
+AUTH_SERVER_PID="$!"
+
+for _ in $(seq 1 60); do
+  if curl -sS "http://127.0.0.1:$AUTH_SMOKE_PORT/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.2
+done
+curl -sS "http://127.0.0.1:$AUTH_SMOKE_PORT/health" >/dev/null
+BASE_URL="http://127.0.0.1:$AUTH_SMOKE_PORT" API_TOKEN="$AUTH_SMOKE_TOKEN" bash "$ROOT_DIR/scripts/auth-smoke.sh"
+kill "$AUTH_SERVER_PID" >/dev/null 2>&1 || true
+wait "$AUTH_SERVER_PID" 2>/dev/null || true
+unset AUTH_SERVER_PID
 
 echo
 echo "== docs check =="

@@ -1085,6 +1085,17 @@ func renderStatusPanelHTML(serviceName string) string {
       gap: 12px;
       margin-top: 12px;
     }
+    .audit-list {
+      display: grid;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .audit-item {
+      border: 1px solid rgba(214, 202, 184, 0.7);
+      border-radius: 18px;
+      padding: 12px 14px;
+      background: rgba(255,255,255,0.6);
+    }
     .alert-item {
       border: 1px solid rgba(214, 202, 184, 0.7);
       border-radius: 18px;
@@ -1171,6 +1182,7 @@ func renderStatusPanelHTML(serviceName string) string {
     </div>
     <div id="app" class="grid"></div>
     <div id="alertPanel" class="panel" style="margin-top:18px;"></div>
+    <div id="auditPanel" class="panel" style="margin-top:18px;"></div>
     <div id="commPanel" class="panel" style="margin-top:18px;"></div>
     <div id="costPanel" class="panel" style="margin-top:18px;"></div>
   </div>
@@ -1182,6 +1194,7 @@ func renderStatusPanelHTML(serviceName string) string {
     const app = document.getElementById("app");
     const generatedAt = document.getElementById("generatedAt");
     const alertPanel = document.getElementById("alertPanel");
+    const auditPanel = document.getElementById("auditPanel");
     const commPanel = document.getElementById("commPanel");
     const costPanel = document.getElementById("costPanel");
 
@@ -1306,6 +1319,26 @@ func renderStatusPanelHTML(serviceName string) string {
         + ((payload.items || []).length ? ('<div class="alert-list">' + rows + '</div>') : '<div class="empty">No active alerts</div>');
     }
 
+    function renderAuditLogs(projectId, payload) {
+      if (!projectId) {
+        auditPanel.innerHTML = '<div class="empty">选择一个项目后可查看关键操作审计。</div>';
+        return;
+      }
+
+      const rows = (payload.items || []).map(function(item) {
+        return '<div class="audit-item">'
+          + '<div class="trend-head"><div><strong>' + item.action + '</strong><div class="task-meta">' + item.resourceType + ' · ' + item.resourceId + '</div></div><strong>' + item.actor + '</strong></div>'
+          + '<div class="statline">' + item.summary + '</div>'
+          + '</div>';
+      }).join("");
+
+      auditPanel.innerHTML = '<div class="project-head">'
+        + '<div><div class="eyebrow">Audit</div><h2 style="margin:6px 0 0;">Audit Trail</h2></div>'
+        + '<div class="meta"><span class="pill">Project ' + projectId + '</span><span class="pill">Count ' + (payload.count || 0) + '</span></div>'
+        + '</div>'
+        + ((payload.items || []).length ? ('<div class="audit-list">' + rows + '</div>') : '<div class="empty">No audit events recorded</div>');
+    }
+
     function renderCosts(projectId, payload) {
       if (!projectId) {
         costPanel.innerHTML = '<div class="empty">选择一个项目后可查看 Token 与成本趋势。</div>';
@@ -1339,6 +1372,7 @@ func renderStatusPanelHTML(serviceName string) string {
       const projectId = filter.value || '';
       if (!projectId) {
         renderAlerts('', { items: [], count: 0 });
+        renderAuditLogs('', { items: [], count: 0 });
         renderCommunications('', { items: [], count: 0 });
         renderCosts('', { points: [], totalTokens: 0, estimatedCostUsd: 0, maxTokens: 0 });
         return;
@@ -1348,6 +1382,11 @@ func renderStatusPanelHTML(serviceName string) string {
       const alertResponse = await fetch(withAuth(alertURL), { headers: { 'Accept': 'application/json' } });
       const alertData = await alertResponse.json();
       renderAlerts(projectId, alertData);
+
+      const auditURL = '/projects/' + encodeURIComponent(projectId) + '/audit-logs';
+      const auditResponse = await fetch(withAuth(auditURL), { headers: { 'Accept': 'application/json' } });
+      const auditData = await auditResponse.json();
+      renderAuditLogs(projectId, auditData);
 
       const commURL = '/projects/' + encodeURIComponent(projectId) + '/communications' + (taskId ? ('?taskId=' + encodeURIComponent(taskId)) : '');
       const commResponse = await fetch(withAuth(commURL), { headers: { 'Accept': 'application/json' } });

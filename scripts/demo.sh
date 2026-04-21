@@ -231,6 +231,7 @@ run_demo_once() {
   local panel_html
   panel_html="$(get_page "$BASE_URL/status/panel")"
   assert_contains "$panel_html" 'Agent Message Log' "status panel should include communications section"
+  assert_contains "$panel_html" 'Audit Trail' "status panel should include audit section"
   assert_contains "$panel_html" 'Token Cost Trend' "status panel should include token cost section"
 
   echo "demo run $index passed"

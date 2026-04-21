@@ -404,6 +404,9 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 	if !strings.Contains(string(body), "Agent Message Log") || !strings.Contains(string(body), "Filter communications by taskId") {
 		t.Fatalf("expected status panel html to contain communications controls, got %s", string(body))
 	}
+	if !strings.Contains(string(body), "Audit Trail") {
+		t.Fatalf("expected status panel html to contain audit panel, got %s", string(body))
+	}
 	if !strings.Contains(string(body), "Token Cost Trend") {
 		t.Fatalf("expected status panel html to contain token cost panel, got %s", string(body))
 	}
