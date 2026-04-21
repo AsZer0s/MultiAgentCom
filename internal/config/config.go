@@ -1,6 +1,10 @@
 package config
 
-import "os"
+import (
+	"os"
+	"strings"
+	"time"
+)
 
 type Config struct {
 	Address         string
@@ -10,6 +14,9 @@ type Config struct {
 	DefaultAgent    string
 	APIToken        string
 	AlertWebhookURL string
+	RuntimeProvider string
+	RuntimeEndpoint string
+	RuntimeTimeout  time.Duration
 }
 
 func Load() Config {
@@ -21,6 +28,9 @@ func Load() Config {
 		DefaultAgent:    getenv("MULTI_AGENT_DEFAULT_AGENT", "manager-agent-sprint1"),
 		APIToken:        getenv("MULTI_AGENT_API_TOKEN", ""),
 		AlertWebhookURL: getenv("MULTI_AGENT_ALERT_WEBHOOK_URL", ""),
+		RuntimeProvider: getenv("MULTI_AGENT_RUNTIME_PROVIDER", "local"),
+		RuntimeEndpoint: getenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", ""),
+		RuntimeTimeout:  getenvDuration("MULTI_AGENT_RUNTIME_HTTP_TIMEOUT", 30*time.Second),
 	}
 }
 
@@ -30,4 +40,17 @@ func getenv(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func getenvDuration(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return fallback
+	}
+	return duration
 }

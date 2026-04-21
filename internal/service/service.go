@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"multiagentcom/internal/agentruntime"
 	"multiagentcom/internal/config"
 	"multiagentcom/internal/domain"
 )
@@ -48,9 +49,10 @@ func newConflictError(message string) *AppError {
 }
 
 type Service struct {
-	cfg         config.Config
-	logger      *slog.Logger
-	alertClient *http.Client
+	cfg             config.Config
+	logger          *slog.Logger
+	alertClient     *http.Client
+	runtimeRegistry *agentruntime.Registry
 
 	mu             sync.RWMutex
 	projects       map[string]*domain.Project
@@ -339,44 +341,90 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 	if strings.TrimSpace(cfg.SandboxRoot) == "" {
 		cfg.SandboxRoot = filepath.Join(os.TempDir(), "multiagentcom", "sandboxes")
 	}
+	if cfg.RuntimeTimeout <= 0 {
+		cfg.RuntimeTimeout = 30 * time.Second
+	}
+
+	runtimeRegistry := agentruntime.NewRegistry()
+	_ = runtimeRegistry.Register("local", agentruntime.NewMockRunner())
+
+	if endpoint := strings.TrimSpace(cfg.RuntimeEndpoint); endpoint != "" {
+		if runner, err := agentruntime.NewHTTPRunner(endpoint, &http.Client{Timeout: cfg.RuntimeTimeout}); err != nil {
+			if logger != nil {
+				logger.Warn("failed to initialize http runtime runner", "endpoint", endpoint, "error", err)
+			}
+		} else if err := runtimeRegistry.Register("http", runner); err != nil {
+			if logger != nil {
+				logger.Warn("failed to register http runtime runner", "endpoint", endpoint, "error", err)
+			}
+		}
+	}
+
+	runtimeProvider := strings.TrimSpace(cfg.RuntimeProvider)
+	if runtimeProvider == "" {
+		runtimeProvider = "local"
+	}
+	if err := runtimeRegistry.SetDefault(runtimeProvider); err != nil {
+		if logger != nil {
+			logger.Warn("configured runtime provider unavailable, falling back to local", "provider", runtimeProvider, "error", err)
+		}
+		_ = runtimeRegistry.SetDefault("local")
+		cfg.RuntimeProvider = "local"
+	} else {
+		cfg.RuntimeProvider = runtimeProvider
+	}
 
 	return &Service{
-		cfg:            cfg,
-		logger:         logger,
-		alertClient:    &http.Client{Timeout: 3 * time.Second},
-		projects:       make(map[string]*domain.Project),
-		requirements:   make(map[string][]*domain.Requirement),
-		planIndex:      make(map[string]*domain.Plan),
-		plans:          make(map[string][]*domain.Plan),
-		contractIndex:  make(map[string]*domain.Contract),
-		contracts:      make(map[string][]*domain.Contract),
-		contextIndex:   make(map[string]*domain.ContextInjection),
-		contexts:       make(map[string][]*domain.ContextInjection),
-		overrideIndex:  make(map[string]*domain.HumanOverride),
-		overrides:      make(map[string][]*domain.HumanOverride),
-		lockIndex:      make(map[string]*domain.CodeLock),
-		locks:          make(map[string][]*domain.CodeLock),
-		previewIndex:   make(map[string]*domain.Preview),
-		previews:       make(map[string][]*domain.Preview),
-		communications: make(map[string][]*domain.CommunicationLog),
-		auditLogs:      make(map[string][]*domain.AuditLog),
-		alerts:         make(map[string][]*domain.Alert),
-		sandboxIndex:   make(map[string]*domain.Sandbox),
-		sandboxes:      make(map[string][]*domain.Sandbox),
-		sandboxFaults:  make(map[string]string),
-		snapshotIndex:  make(map[string]*domain.Snapshot),
-		snapshots:      make(map[string][]*domain.Snapshot),
-		snapshotState:  make(map[string]*projectSnapshotState),
-		projectBranch:  make(map[string]string),
-		stableBranch:   make(map[string]string),
-		branchSeq:      make(map[string]int),
-		tasks:          make(map[string]*domain.Task),
-		taskOrder:      make(map[string][]string),
-		runs:           make(map[string]*domain.AgentRun),
-		runOrder:       make(map[string][]string),
-		artifacts:      make(map[string]*domain.Artifact),
-		artifactOrder:  make(map[string][]string),
+		cfg:             cfg,
+		logger:          logger,
+		alertClient:     &http.Client{Timeout: 3 * time.Second},
+		runtimeRegistry: runtimeRegistry,
+		projects:        make(map[string]*domain.Project),
+		requirements:    make(map[string][]*domain.Requirement),
+		planIndex:       make(map[string]*domain.Plan),
+		plans:           make(map[string][]*domain.Plan),
+		contractIndex:   make(map[string]*domain.Contract),
+		contracts:       make(map[string][]*domain.Contract),
+		contextIndex:    make(map[string]*domain.ContextInjection),
+		contexts:        make(map[string][]*domain.ContextInjection),
+		overrideIndex:   make(map[string]*domain.HumanOverride),
+		overrides:       make(map[string][]*domain.HumanOverride),
+		lockIndex:       make(map[string]*domain.CodeLock),
+		locks:           make(map[string][]*domain.CodeLock),
+		previewIndex:    make(map[string]*domain.Preview),
+		previews:        make(map[string][]*domain.Preview),
+		communications:  make(map[string][]*domain.CommunicationLog),
+		auditLogs:       make(map[string][]*domain.AuditLog),
+		alerts:          make(map[string][]*domain.Alert),
+		sandboxIndex:    make(map[string]*domain.Sandbox),
+		sandboxes:       make(map[string][]*domain.Sandbox),
+		sandboxFaults:   make(map[string]string),
+		snapshotIndex:   make(map[string]*domain.Snapshot),
+		snapshots:       make(map[string][]*domain.Snapshot),
+		snapshotState:   make(map[string]*projectSnapshotState),
+		projectBranch:   make(map[string]string),
+		stableBranch:    make(map[string]string),
+		branchSeq:       make(map[string]int),
+		tasks:           make(map[string]*domain.Task),
+		taskOrder:       make(map[string][]string),
+		runs:            make(map[string]*domain.AgentRun),
+		runOrder:        make(map[string][]string),
+		artifacts:       make(map[string]*domain.Artifact),
+		artifactOrder:   make(map[string][]string),
 	}
+}
+
+func (s *Service) runtimeProviderName() string {
+	provider := strings.TrimSpace(s.cfg.RuntimeProvider)
+	if provider != "" {
+		return provider
+	}
+	if s.runtimeRegistry != nil {
+		if fallback := strings.TrimSpace(s.runtimeRegistry.DefaultProvider()); fallback != "" {
+			return fallback
+		}
+	}
+	return "local"
 }
 
 func (s *Service) CreateProject(ctx context.Context, input CreateProjectInput) (*domain.Project, error) {
@@ -1542,6 +1590,13 @@ func (s *Service) executeRun(runID string) {
 		return
 	}
 
+	runtimeResponse, err := s.executeRuntimeRun(run, task, plan, project, sandbox)
+	if err != nil {
+		s.logger.Error("runtime execution failed", "runId", run.ID, "taskId", task.ID, "error", err)
+		s.failRun(runID, err)
+		return
+	}
+
 	artifact, summary, err := s.generateDeliveryBundle(project, task, plan, run, sandbox)
 	if err != nil {
 		s.logger.Error("run execution failed", "runId", run.ID, "taskId", task.ID, "error", err)
@@ -1568,11 +1623,26 @@ func (s *Service) executeRun(runID string) {
 
 	communicationCount := s.communicationCountForTaskLocked(project.ID, storedTask.ID)
 	promptTokens, completionTokens, totalTokens, estimatedCostUSD := estimateRunCost(storedTask, plan, communicationCount, false)
+	if runtimeResponse.PromptTokens > 0 || runtimeResponse.CompletionTokens > 0 || runtimeResponse.TotalTokens > 0 {
+		promptTokens = runtimeResponse.PromptTokens
+		completionTokens = runtimeResponse.CompletionTokens
+		totalTokens = runtimeResponse.TotalTokens
+		if totalTokens <= 0 {
+			totalTokens = promptTokens + completionTokens
+		}
+		estimatedCostUSD = estimateCostFromTokens(promptTokens, completionTokens)
+	}
 	storedRun.Status = domain.RunStatusSucceeded
+	if runtimeModel := strings.TrimSpace(runtimeResponse.Model); runtimeModel != "" {
+		storedRun.Model = runtimeModel
+	}
 	storedRun.PromptTokens = promptTokens
 	storedRun.CompletionTokens = completionTokens
 	storedRun.TotalTokens = totalTokens
 	storedRun.EstimatedCostUSD = estimatedCostUSD
+	if runtimeSummary := compactRuntimeSummary(runtimeResponse.Output); runtimeSummary != "" {
+		summary += "; runtime output: " + runtimeSummary
+	}
 	if appliedOverride != nil {
 		summary += "; applied human override by " + appliedOverride.Operator + ": " + appliedOverride.Instruction
 	}
@@ -1592,6 +1662,72 @@ func (s *Service) executeRun(runID string) {
 	}
 
 	s.logger.Info("run execution completed", "runId", storedRun.ID, "taskId", storedTask.ID, "artifactId", artifact.ID)
+}
+
+func (s *Service) executeRuntimeRun(run *domain.AgentRun, task *domain.Task, plan *domain.Plan, project *domain.Project, sandbox *domain.Sandbox) (agentruntime.Response, error) {
+	if s.runtimeRegistry == nil {
+		return agentruntime.Response{}, errors.New("runtime registry is not initialized")
+	}
+
+	runner, err := s.runtimeRegistry.Get("")
+	if err != nil {
+		return agentruntime.Response{}, fmt.Errorf("resolve runtime provider: %w", err)
+	}
+
+	ctx := context.Background()
+	request := agentruntime.Request{
+		ProjectID: project.ID,
+		TaskID:    task.ID,
+		RunID:     run.ID,
+		AgentType: run.AgentType,
+		Timeout:   s.cfg.RuntimeTimeout,
+		Prompt: fmt.Sprintf(
+			"Execute task %s (%s) for project %s plan v%d",
+			task.Name,
+			task.Type,
+			project.Name,
+			plan.Version,
+		),
+		Context: strings.Join([]string{
+			"project=" + project.ID,
+			"task=" + task.ID,
+			"plan=" + plan.ID,
+			"sandbox=" + run.SandboxID,
+			"path=" + sandboxRootPath(sandbox),
+		}, "; "),
+	}
+
+	return runner.Run(ctx, request)
+}
+
+func sandboxRootPath(sandbox *domain.Sandbox) string {
+	if sandbox == nil {
+		return ""
+	}
+	return strings.TrimSpace(sandbox.RootPath)
+}
+
+func estimateCostFromTokens(promptTokens, completionTokens int) float64 {
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
+	if completionTokens < 0 {
+		completionTokens = 0
+	}
+	return float64(promptTokens)*0.0000015 + float64(completionTokens)*0.000002
+}
+
+func compactRuntimeSummary(output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return ""
+	}
+	output = strings.Join(strings.Fields(output), " ")
+	const maxLen = 220
+	if len(output) > maxLen {
+		return output[:maxLen] + "..."
+	}
+	return output
 }
 
 func (s *Service) snapshotForExecution(runID string) (*domain.AgentRun, *domain.Task, *domain.Plan, *domain.Project, *domain.Sandbox, error) {
@@ -2250,7 +2386,7 @@ func (s *Service) startTaskRunLocked(projectID string, task *domain.Task, now ti
 		ProjectID: projectID,
 		TaskID:    task.ID,
 		AgentType: agentType,
-		Model:     "rule-based-" + agentType,
+		Model:     "runtime-" + s.runtimeProviderName(),
 		SandboxID: sandbox.ID,
 		Status:    domain.RunStatusRunning,
 		StartedAt: now,

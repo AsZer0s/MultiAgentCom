@@ -87,6 +87,83 @@ func TestSprintOneFlow(t *testing.T) {
 	t.Fatal("run did not complete before deadline")
 }
 
+func TestRunUsesHTTPRuntimeProviderWhenConfigured(t *testing.T) {
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST runtime call, got %s", r.Method)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode runtime payload: %v", err)
+		}
+		if payload["projectId"] == "" || payload["taskId"] == "" || payload["runId"] == "" {
+			t.Fatalf("runtime payload missing IDs: %#v", payload)
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model":            "runtime-http-v1",
+			"output":           "runtime accepted task and prepared execution plan",
+			"promptTokens":     31,
+			"completionTokens": 19,
+			"totalTokens":      50,
+		})
+	}))
+	defer runtimeServer.Close()
+
+	cfg := config.Config{
+		Address:         ":0",
+		ServiceName:     "test-runtime-http",
+		ArtifactRoot:    t.TempDir(),
+		DefaultAgent:    "go-backend-agent",
+		RuntimeProvider: "http",
+		RuntimeEndpoint: runtimeServer.URL,
+		RuntimeTimeout:  2 * time.Second,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Runtime HTTP Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:       "实现 Todo API",
+		Content:     "实现 Todo API 并返回可交付产物",
+		Constraints: []string{"后端使用 Go"},
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s (%s)", status.Run.Status, status.Run.Error)
+	}
+	if status.Run.Model != "runtime-http-v1" {
+		t.Fatalf("expected runtime model runtime-http-v1, got %s", status.Run.Model)
+	}
+	if status.Run.PromptTokens != 31 || status.Run.CompletionTokens != 19 || status.Run.TotalTokens != 50 {
+		t.Fatalf(
+			"expected runtime tokens 31/19/50, got %d/%d/%d",
+			status.Run.PromptTokens,
+			status.Run.CompletionTokens,
+			status.Run.TotalTokens,
+		)
+	}
+	if !strings.Contains(status.Run.ResultSummary, "runtime output") {
+		t.Fatalf("expected runtime summary in result summary, got %s", status.Run.ResultSummary)
+	}
+}
+
 func TestContractHubVersioning(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",
