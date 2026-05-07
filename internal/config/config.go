@@ -7,25 +7,30 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type Config struct {
-	Address         string
-	ServiceName     string
-	ArtifactRoot    string
-	SandboxRoot     string
-	DefaultAgent    string
-	APIToken        string
-	AuthTokens      string
-	AuthTokensFile  string
-	AlertWebhookURL string
-	StoreProvider   string
-	DataRoot        string
-	RuntimeProvider string
-	RuntimeEndpoint string
-	RuntimeTimeout  time.Duration
+	Address                    string
+	ServiceName                string
+	ArtifactRoot               string
+	SandboxRoot                string
+	DefaultAgent               string
+	APIToken                   string
+	AuthTokens                 string
+	AuthTokensFile             string
+	AlertWebhookURL            string
+	StoreProvider              string
+	DataRoot                   string
+	RuntimeProvider            string
+	RuntimeEndpoint            string
+	RuntimeTimeout             time.Duration
+	TokenPromptPricePerMillion float64
+	TokenOutputPricePerMillion float64
+	TokenBudgetWarnUSD         float64
+	TokenBudgetBlockUSD        float64
 }
 
 type ValidationIssue struct {
@@ -50,20 +55,24 @@ func (e *ValidationError) Error() string {
 
 func Load() Config {
 	return WithDefaults(Config{
-		Address:         getenv("MULTI_AGENT_ADDR", ":8080"),
-		ServiceName:     getenv("MULTI_AGENT_SERVICE_NAME", "multiagentcom-api"),
-		ArtifactRoot:    getenv("MULTI_AGENT_ARTIFACT_ROOT", "runtime/artifacts"),
-		SandboxRoot:     getenv("MULTI_AGENT_SANDBOX_ROOT", "runtime/sandboxes"),
-		DefaultAgent:    getenv("MULTI_AGENT_DEFAULT_AGENT", "manager-agent-sprint1"),
-		APIToken:        getenv("MULTI_AGENT_API_TOKEN", ""),
-		AuthTokens:      getenv("MULTI_AGENT_AUTH_TOKENS", ""),
-		AuthTokensFile:  getenv("MULTI_AGENT_AUTH_TOKENS_FILE", ""),
-		AlertWebhookURL: getenv("MULTI_AGENT_ALERT_WEBHOOK_URL", ""),
-		StoreProvider:   getenv("MULTI_AGENT_STORE_PROVIDER", "memory"),
-		DataRoot:        getenv("MULTI_AGENT_DATA_ROOT", filepath.Join(os.TempDir(), "multiagentcom", "data")),
-		RuntimeProvider: getenv("MULTI_AGENT_RUNTIME_PROVIDER", "local"),
-		RuntimeEndpoint: getenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", ""),
-		RuntimeTimeout:  getenvDuration("MULTI_AGENT_RUNTIME_HTTP_TIMEOUT", 30*time.Second),
+		Address:                    getenv("MULTI_AGENT_ADDR", ":8080"),
+		ServiceName:                getenv("MULTI_AGENT_SERVICE_NAME", "multiagentcom-api"),
+		ArtifactRoot:               getenv("MULTI_AGENT_ARTIFACT_ROOT", "runtime/artifacts"),
+		SandboxRoot:                getenv("MULTI_AGENT_SANDBOX_ROOT", "runtime/sandboxes"),
+		DefaultAgent:               getenv("MULTI_AGENT_DEFAULT_AGENT", "manager-agent-sprint1"),
+		APIToken:                   getenv("MULTI_AGENT_API_TOKEN", ""),
+		AuthTokens:                 getenv("MULTI_AGENT_AUTH_TOKENS", ""),
+		AuthTokensFile:             getenv("MULTI_AGENT_AUTH_TOKENS_FILE", ""),
+		AlertWebhookURL:            getenv("MULTI_AGENT_ALERT_WEBHOOK_URL", ""),
+		StoreProvider:              getenv("MULTI_AGENT_STORE_PROVIDER", "memory"),
+		DataRoot:                   getenv("MULTI_AGENT_DATA_ROOT", filepath.Join(os.TempDir(), "multiagentcom", "data")),
+		RuntimeProvider:            getenv("MULTI_AGENT_RUNTIME_PROVIDER", "local"),
+		RuntimeEndpoint:            getenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", ""),
+		RuntimeTimeout:             getenvDuration("MULTI_AGENT_RUNTIME_HTTP_TIMEOUT", 30*time.Second),
+		TokenPromptPricePerMillion: getenvFloat("MULTI_AGENT_TOKEN_PROMPT_PRICE_PER_MILLION", 1.5),
+		TokenOutputPricePerMillion: getenvFloat("MULTI_AGENT_TOKEN_OUTPUT_PRICE_PER_MILLION", 2.5),
+		TokenBudgetWarnUSD:         getenvFloat("MULTI_AGENT_TOKEN_BUDGET_WARN_USD", 0),
+		TokenBudgetBlockUSD:        getenvFloat("MULTI_AGENT_TOKEN_BUDGET_BLOCK_USD", 0),
 	})
 }
 
@@ -92,8 +101,14 @@ func WithDefaults(cfg Config) Config {
 	if strings.TrimSpace(cfg.RuntimeProvider) == "" {
 		cfg.RuntimeProvider = "local"
 	}
-	if cfg.RuntimeTimeout <= 0 {
+	if cfg.RuntimeTimeout == 0 {
 		cfg.RuntimeTimeout = 30 * time.Second
+	}
+	if cfg.TokenPromptPricePerMillion == 0 {
+		cfg.TokenPromptPricePerMillion = 1.5
+	}
+	if cfg.TokenOutputPricePerMillion == 0 {
+		cfg.TokenOutputPricePerMillion = 2.5
 	}
 	return cfg
 }
@@ -130,6 +145,21 @@ func Validate(cfg Config) error {
 	}
 	if cfg.RuntimeTimeout <= 0 {
 		issues = append(issues, ValidationIssue{Field: "RuntimeTimeout", Message: "must be positive"})
+	}
+	if cfg.TokenPromptPricePerMillion <= 0 {
+		issues = append(issues, ValidationIssue{Field: "TokenPromptPricePerMillion", Message: "must be positive"})
+	}
+	if cfg.TokenOutputPricePerMillion <= 0 {
+		issues = append(issues, ValidationIssue{Field: "TokenOutputPricePerMillion", Message: "must be positive"})
+	}
+	if cfg.TokenBudgetWarnUSD < 0 {
+		issues = append(issues, ValidationIssue{Field: "TokenBudgetWarnUSD", Message: "must be non-negative"})
+	}
+	if cfg.TokenBudgetBlockUSD < 0 {
+		issues = append(issues, ValidationIssue{Field: "TokenBudgetBlockUSD", Message: "must be non-negative"})
+	}
+	if cfg.TokenBudgetWarnUSD > 0 && cfg.TokenBudgetBlockUSD > 0 && cfg.TokenBudgetWarnUSD > cfg.TokenBudgetBlockUSD {
+		issues = append(issues, ValidationIssue{Field: "TokenBudgetWarnUSD", Message: "must be less than or equal to TokenBudgetBlockUSD"})
 	}
 
 	if strings.TrimSpace(cfg.AlertWebhookURL) != "" {
@@ -211,4 +241,16 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return duration
+}
+
+func getenvFloat(key string, fallback float64) float64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
 }

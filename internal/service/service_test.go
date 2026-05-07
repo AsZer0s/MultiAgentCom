@@ -221,13 +221,15 @@ func TestRunUsesHTTPRuntimeProviderWhenConfigured(t *testing.T) {
 	defer runtimeServer.Close()
 
 	cfg := config.Config{
-		Address:         ":0",
-		ServiceName:     "test-runtime-http",
-		ArtifactRoot:    t.TempDir(),
-		DefaultAgent:    "go-backend-agent",
-		RuntimeProvider: "http",
-		RuntimeEndpoint: runtimeServer.URL,
-		RuntimeTimeout:  2 * time.Second,
+		Address:                    ":0",
+		ServiceName:                "test-runtime-http",
+		ArtifactRoot:               t.TempDir(),
+		DefaultAgent:               "go-backend-agent",
+		RuntimeProvider:            "http",
+		RuntimeEndpoint:            runtimeServer.URL,
+		RuntimeTimeout:             2 * time.Second,
+		TokenPromptPricePerMillion: 10,
+		TokenOutputPricePerMillion: 20,
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	svc := New(cfg, logger)
@@ -268,6 +270,10 @@ func TestRunUsesHTTPRuntimeProviderWhenConfigured(t *testing.T) {
 			status.Run.CompletionTokens,
 			status.Run.TotalTokens,
 		)
+	}
+	wantCost := (31*cfg.TokenPromptPricePerMillion + 19*cfg.TokenOutputPricePerMillion) / 1_000_000
+	if status.Run.EstimatedCostUSD != wantCost {
+		t.Fatalf("EstimatedCostUSD = %.9f, want %.9f", status.Run.EstimatedCostUSD, wantCost)
 	}
 	if !strings.Contains(status.Run.ResultSummary, "runtime output") {
 		t.Fatalf("expected runtime summary in result summary, got %s", status.Run.ResultSummary)
@@ -1386,11 +1392,13 @@ func TestListCommunicationLogsWithTaskFilter(t *testing.T) {
 
 func TestGetTokenCostTrendByTask(t *testing.T) {
 	cfg := config.Config{
-		Address:      ":0",
-		ServiceName:  "test-token-costs",
-		ArtifactRoot: t.TempDir(),
-		SandboxRoot:  t.TempDir(),
-		DefaultAgent: "manager-agent",
+		Address:             ":0",
+		ServiceName:         "test-token-costs",
+		ArtifactRoot:        t.TempDir(),
+		SandboxRoot:         t.TempDir(),
+		DefaultAgent:        "manager-agent",
+		TokenBudgetWarnUSD:  0.000001,
+		TokenBudgetBlockUSD: 1,
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	svc := New(cfg, logger)
@@ -1408,6 +1416,9 @@ func TestGetTokenCostTrendByTask(t *testing.T) {
 	if trend.TotalTokens <= 0 || trend.EstimatedCostUSD <= 0 {
 		t.Fatalf("expected positive token totals and cost, got %+v", trend)
 	}
+	if trend.BudgetStatus != "warning" || trend.BudgetWarnUSD != cfg.TokenBudgetWarnUSD || trend.BudgetBlockUSD != cfg.TokenBudgetBlockUSD {
+		t.Fatalf("unexpected budget status: %+v", trend)
+	}
 
 	filtered, err := svc.GetTokenCostTrend(ctx, project.ID, dispatched[0].ID)
 	if err != nil {
@@ -1421,6 +1432,43 @@ func TestGetTokenCostTrendByTask(t *testing.T) {
 	}
 	if filtered.Points[0].TotalTokens <= 0 || filtered.Points[0].EstimatedCostUSD <= 0 {
 		t.Fatalf("expected positive filtered token totals and cost, got %+v", filtered.Points[0])
+	}
+}
+
+func TestStartRunBlocksWhenTokenBudgetWouldBeExceeded(t *testing.T) {
+	cfg := config.Config{
+		Address:                    ":0",
+		ServiceName:                "test-token-budget-block",
+		ArtifactRoot:               t.TempDir(),
+		SandboxRoot:                t.TempDir(),
+		DefaultAgent:               "manager-agent",
+		TokenPromptPricePerMillion: 1_000_000,
+		TokenOutputPricePerMillion: 1_000_000,
+		TokenBudgetBlockUSD:        1,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Budget Block Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo API", Content: "实现 Todo API"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	_, err = svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err == nil {
+		t.Fatal("expected token budget conflict")
+	}
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != "CONFLICT" {
+		t.Fatalf("expected conflict app error, got %v", err)
 	}
 }
 

@@ -72,6 +72,10 @@ func TestLoadRuntimeOverrides(t *testing.T) {
 	t.Setenv("MULTI_AGENT_RUNTIME_PROVIDER", "http")
 	t.Setenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", "https://runtime.example.com")
 	t.Setenv("MULTI_AGENT_RUNTIME_HTTP_TIMEOUT", "45s")
+	t.Setenv("MULTI_AGENT_TOKEN_PROMPT_PRICE_PER_MILLION", "3.5")
+	t.Setenv("MULTI_AGENT_TOKEN_OUTPUT_PRICE_PER_MILLION", "7.25")
+	t.Setenv("MULTI_AGENT_TOKEN_BUDGET_WARN_USD", "10")
+	t.Setenv("MULTI_AGENT_TOKEN_BUDGET_BLOCK_USD", "12")
 
 	cfg := Load()
 
@@ -83,6 +87,12 @@ func TestLoadRuntimeOverrides(t *testing.T) {
 	}
 	if cfg.RuntimeTimeout != 45*time.Second {
 		t.Fatalf("RuntimeTimeout = %s, want %s", cfg.RuntimeTimeout, 45*time.Second)
+	}
+	if cfg.TokenPromptPricePerMillion != 3.5 || cfg.TokenOutputPricePerMillion != 7.25 {
+		t.Fatalf("unexpected token prices: %+v", cfg)
+	}
+	if cfg.TokenBudgetWarnUSD != 10 || cfg.TokenBudgetBlockUSD != 12 {
+		t.Fatalf("unexpected token budgets: %+v", cfg)
 	}
 }
 
@@ -104,11 +114,14 @@ func TestValidateAcceptsDefaultConfig(t *testing.T) {
 
 func TestValidateRejectsInvalidProductionConfig(t *testing.T) {
 	err := Validate(Config{
-		StoreProvider:   "postgres",
-		RuntimeProvider: "http",
-		RuntimeEndpoint: "://bad",
-		AlertWebhookURL: "://bad",
-		AuthTokens:      `[{"actor":"ops"}]`,
+		StoreProvider:              "postgres",
+		RuntimeProvider:            "http",
+		RuntimeEndpoint:            "://bad",
+		AlertWebhookURL:            "://bad",
+		AuthTokens:                 `[{"actor":"ops"}]`,
+		TokenBudgetWarnUSD:         2,
+		TokenBudgetBlockUSD:        1,
+		TokenPromptPricePerMillion: -1,
 	})
 	issues := ValidationIssues(err)
 	if len(issues) < 4 {

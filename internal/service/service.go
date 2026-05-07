@@ -233,6 +233,9 @@ type TokenCostTrend struct {
 	TotalTokens           int              `json:"totalTokens"`
 	EstimatedCostUSD      float64          `json:"estimatedCostUsd"`
 	MaxTokens             int              `json:"maxTokens"`
+	BudgetWarnUSD         float64          `json:"budgetWarnUsd,omitempty"`
+	BudgetBlockUSD        float64          `json:"budgetBlockUsd,omitempty"`
+	BudgetStatus          string           `json:"budgetStatus"`
 	Points                []TokenCostPoint `json:"points"`
 }
 
@@ -397,8 +400,14 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 	if strings.TrimSpace(cfg.DataRoot) == "" {
 		cfg.DataRoot = filepath.Join(os.TempDir(), "multiagentcom", "data")
 	}
-	if cfg.RuntimeTimeout <= 0 {
+	if cfg.RuntimeTimeout == 0 {
 		cfg.RuntimeTimeout = 30 * time.Second
+	}
+	if cfg.TokenPromptPricePerMillion == 0 {
+		cfg.TokenPromptPricePerMillion = 1.5
+	}
+	if cfg.TokenOutputPricePerMillion == 0 {
+		cfg.TokenOutputPricePerMillion = 2.5
 	}
 
 	runtimeRegistry := agentruntime.NewRegistry()
@@ -861,9 +870,12 @@ func (s *Service) GetTokenCostTrend(_ context.Context, projectID, taskID string)
 	}
 
 	result := &TokenCostTrend{
-		ProjectID: strings.TrimSpace(projectID),
-		TaskID:    strings.TrimSpace(taskID),
-		Points:    make([]TokenCostPoint, 0),
+		ProjectID:      strings.TrimSpace(projectID),
+		TaskID:         strings.TrimSpace(taskID),
+		BudgetWarnUSD:  s.cfg.TokenBudgetWarnUSD,
+		BudgetBlockUSD: s.cfg.TokenBudgetBlockUSD,
+		BudgetStatus:   "ok",
+		Points:         make([]TokenCostPoint, 0),
 	}
 	for _, runID := range s.runOrder[projectID] {
 		run, ok := s.runs[runID]
@@ -907,6 +919,7 @@ func (s *Service) GetTokenCostTrend(_ context.Context, projectID, taskID string)
 			result.MaxTokens = point.TotalTokens
 		}
 	}
+	result.BudgetStatus = budgetStatus(result.EstimatedCostUSD, result.BudgetWarnUSD, result.BudgetBlockUSD)
 
 	return result, nil
 }
@@ -1737,6 +1750,10 @@ func (s *Service) StartRun(_ context.Context, projectID string, input StartRunIn
 		return nil, err
 	}
 
+	if err := s.ensureTokenBudgetAllowsRunLocked(projectID, task); err != nil {
+		return nil, err
+	}
+
 	envelope, err := s.startTaskRunLocked(projectID, task, now, "single agent execution started")
 	if err != nil {
 		s.persistLocked()
@@ -1762,6 +1779,12 @@ func (s *Service) StartParallelRun(_ context.Context, projectID string, input Pa
 	selected, blocked, err := s.resolveParallelTasksLocked(projectID, input.TaskIDs)
 	if err != nil {
 		return nil, err
+	}
+
+	for _, task := range selected {
+		if err := s.ensureTokenBudgetAllowsRunLocked(projectID, task); err != nil {
+			return nil, err
+		}
 	}
 
 	started := make([]RunEnvelope, 0, len(selected))
@@ -1956,7 +1979,7 @@ func (s *Service) executeRun(runID string) {
 	s.artifactOrder[artifact.ProjectID] = append(s.artifactOrder[artifact.ProjectID], artifact.ID)
 
 	communicationCount := s.communicationCountForTaskLocked(project.ID, storedTask.ID)
-	promptTokens, completionTokens, totalTokens, estimatedCostUSD := estimateRunCost(storedTask, plan, communicationCount, false)
+	promptTokens, completionTokens, totalTokens := estimateRunTokens(storedTask, plan, communicationCount, false)
 	if runtimeResponse.PromptTokens > 0 || runtimeResponse.CompletionTokens > 0 || runtimeResponse.TotalTokens > 0 {
 		promptTokens = runtimeResponse.PromptTokens
 		completionTokens = runtimeResponse.CompletionTokens
@@ -1964,8 +1987,8 @@ func (s *Service) executeRun(runID string) {
 		if totalTokens <= 0 {
 			totalTokens = promptTokens + completionTokens
 		}
-		estimatedCostUSD = estimateCostFromTokens(promptTokens, completionTokens)
 	}
+	estimatedCostUSD := s.estimateCostFromTokens(promptTokens, completionTokens)
 	storedRun.Status = domain.RunStatusSucceeded
 	if runtimeModel := strings.TrimSpace(runtimeResponse.Model); runtimeModel != "" {
 		storedRun.Model = runtimeModel
@@ -2042,14 +2065,40 @@ func sandboxRootPath(sandbox *domain.Sandbox) string {
 	return strings.TrimSpace(sandbox.RootPath)
 }
 
-func estimateCostFromTokens(promptTokens, completionTokens int) float64 {
+func (s *Service) estimateCostFromTokens(promptTokens, completionTokens int) float64 {
 	if promptTokens < 0 {
 		promptTokens = 0
 	}
 	if completionTokens < 0 {
 		completionTokens = 0
 	}
-	return float64(promptTokens)*0.0000015 + float64(completionTokens)*0.000002
+	return estimateCostFromPricing(promptTokens, completionTokens, s.cfg.TokenPromptPricePerMillion, s.cfg.TokenOutputPricePerMillion)
+}
+
+func estimateCostFromPricing(promptTokens, completionTokens int, promptPricePerMillion, outputPricePerMillion float64) float64 {
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
+	if completionTokens < 0 {
+		completionTokens = 0
+	}
+	if promptPricePerMillion <= 0 {
+		promptPricePerMillion = 1.5
+	}
+	if outputPricePerMillion <= 0 {
+		outputPricePerMillion = 2.5
+	}
+	return (float64(promptTokens)*promptPricePerMillion + float64(completionTokens)*outputPricePerMillion) / 1_000_000
+}
+
+func budgetStatus(cost, warnBudget, blockBudget float64) string {
+	if blockBudget > 0 && cost >= blockBudget {
+		return "blocked"
+	}
+	if warnBudget > 0 && cost >= warnBudget {
+		return "warning"
+	}
+	return "ok"
 }
 
 func compactRuntimeSummary(output string) string {
@@ -2134,11 +2183,11 @@ func (s *Service) failRun(runID string, failure error) {
 		plan = s.planIndex[task.PlanID]
 	}
 	communicationCount := s.communicationCountForTaskLocked(run.ProjectID, run.TaskID)
-	promptTokens, completionTokens, totalTokens, estimatedCostUSD := estimateRunCost(task, plan, communicationCount, true)
+	promptTokens, completionTokens, totalTokens := estimateRunTokens(task, plan, communicationCount, true)
 	run.PromptTokens = promptTokens
 	run.CompletionTokens = completionTokens
 	run.TotalTokens = totalTokens
-	run.EstimatedCostUSD = estimatedCostUSD
+	run.EstimatedCostUSD = s.estimateCostFromTokens(promptTokens, completionTokens)
 	s.persistLocked()
 }
 
@@ -2571,7 +2620,7 @@ func (s *Service) communicationCountForTaskLocked(projectID, taskID string) int 
 	return count
 }
 
-func estimateRunCost(task *domain.Task, plan *domain.Plan, communicationCount int, failed bool) (int, int, int, float64) {
+func estimateRunTokens(task *domain.Task, plan *domain.Plan, communicationCount int, failed bool) (int, int, int) {
 	promptTokens := 220 + communicationCount*36
 	completionTokens := 180 + communicationCount*24
 
@@ -2601,9 +2650,7 @@ func estimateRunCost(task *domain.Task, plan *domain.Plan, communicationCount in
 		completionTokens /= 2
 	}
 
-	totalTokens := promptTokens + completionTokens
-	estimatedCostUSD := float64(promptTokens)*0.0000015 + float64(completionTokens)*0.0000025
-	return promptTokens, completionTokens, totalTokens, estimatedCostUSD
+	return promptTokens, completionTokens, promptTokens + completionTokens
 }
 
 func (s *Service) resolveTaskContractLocked(projectID string, task *domain.Task) (*domain.Contract, error) {
@@ -2636,6 +2683,31 @@ func (s *Service) findDispatchedTasksLocked(projectID, planID, contractID string
 		}
 	}
 	return result
+}
+
+func (s *Service) ensureTokenBudgetAllowsRunLocked(projectID string, task *domain.Task) error {
+	blockBudget := s.cfg.TokenBudgetBlockUSD
+	if blockBudget <= 0 {
+		return nil
+	}
+
+	currentCost := 0.0
+	for _, runID := range s.runOrder[projectID] {
+		run := s.runs[runID]
+		if run == nil {
+			continue
+		}
+		currentCost += run.EstimatedCostUSD
+	}
+
+	plan := s.planIndex[task.PlanID]
+	communicationCount := s.communicationCountForTaskLocked(projectID, task.ID)
+	promptTokens, completionTokens, _ := estimateRunTokens(task, plan, communicationCount, false)
+	projectedCost := currentCost + s.estimateCostFromTokens(promptTokens, completionTokens)
+	if projectedCost >= blockBudget {
+		return newConflictError(fmt.Sprintf("token budget block threshold exceeded: projected %.6f USD >= %.6f USD", projectedCost, blockBudget))
+	}
+	return nil
 }
 
 func (s *Service) resolveParallelTasksLocked(projectID string, taskIDs []string) ([]*domain.Task, []*domain.Task, error) {
