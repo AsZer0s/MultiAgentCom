@@ -7,6 +7,20 @@ import (
 	"time"
 )
 
+func TestLoadAuthTokenConfig(t *testing.T) {
+	t.Setenv("MULTI_AGENT_AUTH_TOKENS", `[{"tokenHash":"abc","actor":"ops","roles":["operator"]}]`)
+	t.Setenv("MULTI_AGENT_AUTH_TOKENS_FILE", "/tmp/tokens.json")
+
+	cfg := Load()
+
+	if cfg.AuthTokens == "" {
+		t.Fatal("expected AuthTokens env value")
+	}
+	if cfg.AuthTokensFile != "/tmp/tokens.json" {
+		t.Fatalf("AuthTokensFile = %q, want /tmp/tokens.json", cfg.AuthTokensFile)
+	}
+}
+
 func TestLoadStoreDefaults(t *testing.T) {
 	t.Setenv("MULTI_AGENT_STORE_PROVIDER", "")
 	t.Setenv("MULTI_AGENT_DATA_ROOT", "")

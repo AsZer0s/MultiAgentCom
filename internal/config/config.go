@@ -14,6 +14,8 @@ type Config struct {
 	SandboxRoot     string
 	DefaultAgent    string
 	APIToken        string
+	AuthTokens      string
+	AuthTokensFile  string
 	AlertWebhookURL string
 	StoreProvider   string
 	DataRoot        string
@@ -30,6 +32,8 @@ func Load() Config {
 		SandboxRoot:     getenv("MULTI_AGENT_SANDBOX_ROOT", "runtime/sandboxes"),
 		DefaultAgent:    getenv("MULTI_AGENT_DEFAULT_AGENT", "manager-agent-sprint1"),
 		APIToken:        getenv("MULTI_AGENT_API_TOKEN", ""),
+		AuthTokens:      getenv("MULTI_AGENT_AUTH_TOKENS", ""),
+		AuthTokensFile:  getenv("MULTI_AGENT_AUTH_TOKENS_FILE", ""),
 		AlertWebhookURL: getenv("MULTI_AGENT_ALERT_WEBHOOK_URL", ""),
 		StoreProvider:   getenv("MULTI_AGENT_STORE_PROVIDER", "memory"),
 		DataRoot:        getenv("MULTI_AGENT_DATA_ROOT", filepath.Join(os.TempDir(), "multiagentcom", "data")),

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"multiagentcom/internal/auth"
 	"multiagentcom/internal/config"
 	"multiagentcom/internal/domain"
 	"multiagentcom/internal/service"
@@ -372,6 +373,9 @@ func (s *Server) handleInjectSandboxFailure(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleApplyHumanOverride(w http.ResponseWriter, r *http.Request) {
+	if !authorizeRequest(w, r, r.PathValue("id"), "operator") {
+		return
+	}
 	var input service.ApplyHumanOverrideInput
 	if err := decodeJSON(r, &input); err != nil {
 		writeServiceError(w, err)
@@ -388,6 +392,9 @@ func (s *Server) handleApplyHumanOverride(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleApplyCodeLock(w http.ResponseWriter, r *http.Request) {
+	if !authorizeRequest(w, r, r.PathValue("id"), "operator") {
+		return
+	}
 	var input service.ApplyCodeLockInput
 	if err := decodeJSON(r, &input); err != nil {
 		writeServiceError(w, err)
@@ -404,6 +411,9 @@ func (s *Server) handleApplyCodeLock(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMergeSharedSandbox(w http.ResponseWriter, r *http.Request) {
+	if !authorizeRequest(w, r, r.PathValue("id"), "operator") {
+		return
+	}
 	var input service.MergeSharedSandboxInput
 	if err := decodeJSON(r, &input); err != nil {
 		writeServiceError(w, err)
@@ -437,6 +447,9 @@ func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRollbackSnapshot(w http.ResponseWriter, r *http.Request) {
+	if !authorizeRequest(w, r, r.PathValue("id"), "operator") {
+		return
+	}
 	var input service.RollbackSnapshotInput
 	if err := decodeJSON(r, &input); err != nil {
 		writeServiceError(w, err)
@@ -559,6 +572,9 @@ func (s *Server) handleGetRunStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleExportDelivery(w http.ResponseWriter, r *http.Request) {
+	if !authorizeRequest(w, r, r.PathValue("id"), "delivery") {
+		return
+	}
 	var input service.ExportDeliveryInput
 	if err := decodeJSONAllowEmpty(r, &input); err != nil {
 		writeServiceError(w, err)
@@ -578,6 +594,9 @@ func (s *Server) handleExportDelivery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) {
+	if !authorizeRequest(w, r, r.PathValue("id"), "delivery") {
+		return
+	}
 	artifact, err := s.svc.GetArtifact(r.Context(), r.PathValue("id"), r.PathValue("artifactId"))
 	if err != nil {
 		writeServiceError(w, err)
@@ -686,38 +705,73 @@ func loggingMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 }
 
 func authMiddleware(cfg config.Config) func(http.Handler) http.Handler {
-	requiredToken := strings.TrimSpace(cfg.APIToken)
+	authenticator, err := auth.New(cfg.APIToken, cfg.AuthTokens, cfg.AuthTokensFile)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if requiredToken == "" || r.URL.Path == "/health" {
+			if r.URL.Path == "/health" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"code":    "AUTH_CONFIG_INVALID",
+					"message": "auth token configuration is invalid",
+				})
+				return
+			}
+			if !authenticator.Required() {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			token := bearerToken(r.Header.Get("Authorization"))
 			if token == "" {
 				token = strings.TrimSpace(r.Header.Get("X-API-Key"))
 			}
 			if token == "" {
 				token = strings.TrimSpace(r.URL.Query().Get("token"))
 			}
-			if token != requiredToken {
+			principal, ok := authenticator.Authenticate(token, time.Now().UTC())
+			if !ok {
 				writeJSON(w, http.StatusUnauthorized, map[string]any{
 					"code":    "UNAUTHORIZED",
 					"message": "missing or invalid api token",
 				})
 				return
 			}
-
-			actor := strings.TrimSpace(r.Header.Get("X-Actor"))
-			if actor == "" {
-				actor = "api-token"
+			if headerActor := strings.TrimSpace(r.Header.Get("X-Actor")); headerActor != "" && len(principal.Roles) == 1 && principal.Roles[0] == "admin" && principal.Actor == "api-token" {
+				principal.Actor = headerActor
 			}
-			ctx := context.WithValue(r.Context(), authActorKey, actor)
-			ctx = service.WithActor(ctx, actor)
+
+			ctx := context.WithValue(r.Context(), authActorKey, principal.Actor)
+			ctx = auth.WithPrincipal(ctx, principal)
+			ctx = service.WithActor(ctx, principal.Actor)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+func bearerToken(header string) string {
+	header = strings.TrimSpace(header)
+	if !strings.HasPrefix(strings.ToLower(header), "bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(header[len("Bearer "):])
+}
+
+func authorizeRequest(w http.ResponseWriter, r *http.Request, projectID string, roles ...string) bool {
+	principal, ok := auth.PrincipalFromContext(r.Context())
+	if !ok {
+		return true
+	}
+	if principal.HasAnyRole(roles...) && principal.AllowsProject(projectID) {
+		return true
+	}
+	writeJSON(w, http.StatusForbidden, map[string]any{
+		"code":    "FORBIDDEN",
+		"message": "token is not authorized for this action",
+	})
+	return false
 }
 
 func recoveryMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {

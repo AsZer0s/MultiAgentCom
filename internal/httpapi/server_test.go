@@ -5,6 +5,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -1278,6 +1280,95 @@ func TestHTTPAuditLogs(t *testing.T) {
 	}
 }
 
+func TestHTTPScopedAuthAllowsAndDeniesPrivilegedActions(t *testing.T) {
+	operatorToken := "operator-token"
+	viewerToken := "viewer-token"
+	otherProjectToken := "other-project-token"
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-scoped-auth",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+		AuthTokens: scopedAuthTokensJSON(
+			scopedAuthRecord(operatorToken, "ops-user", []string{"operator", "delivery"}, ""),
+			scopedAuthRecord(viewerToken, "viewer-user", []string{"viewer"}, ""),
+			scopedAuthRecord(otherProjectToken, "other-project-user", []string{"operator"}, "proj_other"),
+		),
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	operatorHeaders := map[string]string{"Authorization": "Bearer " + operatorToken}
+	viewerHeaders := map[string]string{"Authorization": "Bearer " + viewerToken}
+	otherProjectHeaders := map[string]string{"Authorization": "Bearer " + otherProjectToken}
+
+	projectBody := requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{
+		"name": "Scoped Auth Demo",
+	}, operatorHeaders)
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{
+		"title":   "实现 Todo API",
+		"content": "实现 Todo API 并返回交付包。",
+	}, operatorHeaders)
+	planBody := requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{}, operatorHeaders)
+	var planResult service.PlanResult
+	decodeResponse(t, planBody, &planResult)
+	runBody := requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/run", map[string]any{"taskId": planResult.Task.ID}, operatorHeaders)
+	var runEnvelope service.RunEnvelope
+	decodeResponse(t, runBody, &runEnvelope)
+	waitForHTTPRunStatus(t, server, project.ID, runEnvelope.Run.ID, operatorHeaders, domain.RunStatusSucceeded)
+
+	requestJSONExpectStatusWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/delivery/export", map[string]any{
+		"runId": runEnvelope.Run.ID,
+	}, http.StatusOK, operatorHeaders)
+	requestJSONExpectStatusWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/delivery/export", map[string]any{
+		"runId": runEnvelope.Run.ID,
+	}, http.StatusForbidden, viewerHeaders)
+	requestJSONExpectStatusWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/overrides", map[string]any{
+		"taskId":      planResult.Task.ID,
+		"operator":    "ops-user",
+		"instruction": "pause",
+	}, http.StatusForbidden, otherProjectHeaders)
+}
+
+func TestHTTPScopedAuthTokenFile(t *testing.T) {
+	token := "file-token"
+	tokensPath := filepath.Join(t.TempDir(), "tokens.json")
+	if err := os.WriteFile(tokensPath, []byte(scopedAuthTokensJSON(scopedAuthRecord(token, "file-ops", []string{"operator"}, ""))), 0o644); err != nil {
+		t.Fatalf("write auth tokens file: %v", err)
+	}
+	cfg := config.Config{
+		Address:        ":0",
+		ServiceName:    "test-http-scoped-auth-file",
+		ArtifactRoot:   t.TempDir(),
+		SandboxRoot:    t.TempDir(),
+		DefaultAgent:   "http-manager-agent",
+		AuthTokensFile: tokensPath,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	headers := map[string]string{"X-API-Key": token}
+	body := requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{"name": "File Token Demo"}, headers)
+	var project domain.Project
+	decodeResponse(t, body, &project)
+	logsBody := getJSONWithHeaders(t, server.Client(), server.URL+"/projects/"+project.ID+"/audit-logs", headers)
+	var logs struct {
+		Items []domain.AuditLog `json:"items"`
+	}
+	decodeResponse(t, logsBody, &logs)
+	if len(logs.Items) == 0 || logs.Items[0].Actor != "file-ops" {
+		t.Fatalf("expected file token actor in audit logs, got %+v", logs.Items)
+	}
+}
+
 func TestHTTPAuthMiddleware(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",
@@ -1613,6 +1704,27 @@ func decodeResponse(t *testing.T, body []byte, target any) {
 	}
 }
 
+func waitForHTTPRunStatus(t *testing.T, server *httptest.Server, projectID, runID string, headers map[string]string, expected domain.RunStatus) service.RunStatusView {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var status service.RunStatusView
+	for time.Now().Before(deadline) {
+		statusBody := getJSONWithHeaders(t, server.Client(), server.URL+"/projects/"+projectID+"/runs/"+runID+"/status", headers)
+		decodeResponse(t, statusBody, &status)
+		if status.Run.Status == expected {
+			return status
+		}
+		if status.Run.Status == domain.RunStatusFailed && expected != domain.RunStatusFailed {
+			t.Fatalf("run failed before reaching %s: %s", expected, status.Run.Error)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("run %s did not reach %s before deadline", runID, expected)
+	return service.RunStatusView{}
+}
+
 func waitForHTTPRun(t *testing.T, server *httptest.Server, projectID, runID string) {
 	t.Helper()
 
@@ -1669,6 +1781,24 @@ func waitForHTTPTaskStatus(t *testing.T, server *httptest.Server, projectID, run
 	}
 
 	t.Fatalf("run %s did not reach task status %s before deadline", runID, expected)
+}
+
+func scopedAuthRecord(token, actor string, roles []string, projectID string) map[string]any {
+	sum := sha256.Sum256([]byte(token))
+	return map[string]any{
+		"tokenHash": hex.EncodeToString(sum[:]),
+		"actor":     actor,
+		"roles":     roles,
+		"projectId": projectID,
+	}
+}
+
+func scopedAuthTokensJSON(records ...map[string]any) string {
+	payload, err := json.Marshal(records)
+	if err != nil {
+		panic(err)
+	}
+	return string(payload)
 }
 
 func containsAgentStatus(items []service.StatusMatrixAgent, agent, status string) bool {
