@@ -108,6 +108,41 @@ func TestHTTPFlow(t *testing.T) {
 	)
 }
 
+func TestHTTPRejectsOversizedJSONBody(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-body-limit",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "http-test-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := strings.NewReader(`{"name":"` + strings.Repeat("x", int(maxJSONBodyBytes)+1) + `"}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/projects", body)
+	if err != nil {
+		t.Fatalf("new oversized request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("send oversized request: %v", err)
+	}
+	defer resp.Body.Close()
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read oversized response: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d: %s", resp.StatusCode, string(payload))
+	}
+	assertContainsBody(t, payload, `"code":"REQUEST_TOO_LARGE"`)
+}
+
 func TestHTTPContractFlow(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",

@@ -19,6 +19,19 @@ import (
 	"multiagentcom/internal/domain"
 )
 
+func TestNewDefaultsArtifactRootWhenEmpty(t *testing.T) {
+	svc := New(config.Config{SandboxRoot: t.TempDir()}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if svc.cfg.ArtifactRoot != filepath.Join(os.TempDir(), "multiagentcom", "artifacts") {
+		t.Fatalf("expected temp artifact root, got %s", svc.cfg.ArtifactRoot)
+	}
+
+	customRoot := t.TempDir()
+	custom := New(config.Config{ArtifactRoot: customRoot, SandboxRoot: t.TempDir()}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if custom.cfg.ArtifactRoot != customRoot {
+		t.Fatalf("expected custom artifact root %s, got %s", customRoot, custom.cfg.ArtifactRoot)
+	}
+}
+
 func TestSprintOneFlow(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",
@@ -162,6 +175,42 @@ func TestRunUsesHTTPRuntimeProviderWhenConfigured(t *testing.T) {
 	}
 	if !strings.Contains(status.Run.ResultSummary, "runtime output") {
 		t.Fatalf("expected runtime summary in result summary, got %s", status.Run.ResultSummary)
+	}
+}
+
+func TestStartRunFailsWhenPrivateSandboxWorkspaceCannotBeCreated(t *testing.T) {
+	sandboxRootFile := filepath.Join(t.TempDir(), "sandbox-root-file")
+	if err := os.WriteFile(sandboxRootFile, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write sandbox root file: %v", err)
+	}
+
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-private-sandbox-create-error",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  sandboxRootFile,
+		DefaultAgent: "test-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Sandbox Failure Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo API", Content: "实现 Todo API"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	_, err = svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != "SANDBOX_CREATE_FAILED" {
+		t.Fatalf("expected SANDBOX_CREATE_FAILED, got %v", err)
 	}
 }
 
@@ -844,6 +893,37 @@ func TestMergeSharedSandboxSuccess(t *testing.T) {
 	}
 	if !snapshots[0].Stable || snapshots[0].Branch != "main" {
 		t.Fatalf("expected stable main snapshot, got %+v", snapshots[0])
+	}
+}
+
+func TestMergeSharedSandboxFailsWhenWorkspaceCannotBeCreated(t *testing.T) {
+	sandboxRootFile := filepath.Join(t.TempDir(), "sandbox-root-file")
+	if err := os.WriteFile(sandboxRootFile, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write sandbox root file: %v", err)
+	}
+
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-shared-sandbox-create-error",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	svc.cfg.SandboxRoot = sandboxRootFile
+
+	_, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	})
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != "SANDBOX_CREATE_FAILED" {
+		t.Fatalf("expected SANDBOX_CREATE_FAILED, got %v", err)
 	}
 }
 

@@ -342,6 +342,9 @@ type projectSnapshotState struct {
 }
 
 func New(cfg config.Config, logger *slog.Logger) *Service {
+	if strings.TrimSpace(cfg.ArtifactRoot) == "" {
+		cfg.ArtifactRoot = filepath.Join(os.TempDir(), "multiagentcom", "artifacts")
+	}
 	if strings.TrimSpace(cfg.SandboxRoot) == "" {
 		cfg.SandboxRoot = filepath.Join(os.TempDir(), "multiagentcom", "sandboxes")
 	}
@@ -1183,7 +1186,10 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 		}
 	}
 
-	sharedSandbox := s.createSharedSandboxLocked(projectID, tasks, now)
+	sharedSandbox, err := s.createSharedSandboxLocked(projectID, tasks, now)
+	if err != nil {
+		return nil, err
+	}
 	project.UpdatedAt = now
 
 	result := &SharedSandboxMergeResult{
@@ -2387,7 +2393,11 @@ func (s *Service) startTaskRunLocked(projectID string, task *domain.Task, now ti
 		agentType = s.cfg.DefaultAgent
 	}
 
-	sandbox := s.createPrivateSandboxLocked(projectID, task, agentType, now)
+	sandbox, err := s.createPrivateSandboxLocked(projectID, task, agentType, now)
+	if err != nil {
+		_ = task.TransitionTo(domain.TaskStatusFailed, err.Error(), now)
+		return nil, err
+	}
 
 	run := &domain.AgentRun{
 		ID:        nextID("run"),
@@ -2412,7 +2422,7 @@ func (s *Service) startTaskRunLocked(projectID string, task *domain.Task, now ti
 	}, nil
 }
 
-func (s *Service) createPrivateSandboxLocked(projectID string, task *domain.Task, agentType string, now time.Time) *domain.Sandbox {
+func (s *Service) createPrivateSandboxLocked(projectID string, task *domain.Task, agentType string, now time.Time) (*domain.Sandbox, error) {
 	sandbox := &domain.Sandbox{
 		ID:        nextID("sandbox"),
 		ProjectID: projectID,
@@ -2424,14 +2434,16 @@ func (s *Service) createPrivateSandboxLocked(projectID string, task *domain.Task
 		UpdatedAt: now,
 	}
 	sandbox.RootPath = filepath.Join(s.cfg.SandboxRoot, projectID, sandbox.ID)
-	_ = os.MkdirAll(filepath.Join(sandbox.RootPath, "workspace"), 0o755)
+	if err := os.MkdirAll(filepath.Join(sandbox.RootPath, "workspace"), 0o755); err != nil {
+		return nil, newInternalError("SANDBOX_CREATE_FAILED", "sandbox workspace could not be created")
+	}
 
 	s.sandboxIndex[sandbox.ID] = sandbox
 	s.sandboxes[projectID] = append(s.sandboxes[projectID], sandbox)
-	return sandbox
+	return sandbox, nil
 }
 
-func (s *Service) createSharedSandboxLocked(projectID string, tasks []*domain.Task, now time.Time) *domain.Sandbox {
+func (s *Service) createSharedSandboxLocked(projectID string, tasks []*domain.Task, now time.Time) (*domain.Sandbox, error) {
 	sandbox := &domain.Sandbox{
 		ID:        nextID("sandbox"),
 		ProjectID: projectID,
@@ -2445,11 +2457,13 @@ func (s *Service) createSharedSandboxLocked(projectID string, tasks []*domain.Ta
 		sandbox.TaskID = tasks[len(tasks)-1].ID
 	}
 	sandbox.RootPath = filepath.Join(s.cfg.SandboxRoot, "shared", projectID, sandbox.ID)
-	_ = os.MkdirAll(filepath.Join(sandbox.RootPath, "workspace"), 0o755)
+	if err := os.MkdirAll(filepath.Join(sandbox.RootPath, "workspace"), 0o755); err != nil {
+		return nil, newInternalError("SANDBOX_CREATE_FAILED", "sandbox workspace could not be created")
+	}
 
 	s.sandboxIndex[sandbox.ID] = sandbox
 	s.sandboxes[projectID] = append(s.sandboxes[projectID], sandbox)
-	return sandbox
+	return sandbox, nil
 }
 
 func (s *Service) sandboxFailureForTask(taskID string) string {

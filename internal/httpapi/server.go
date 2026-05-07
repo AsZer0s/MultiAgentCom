@@ -15,6 +15,8 @@ import (
 	"multiagentcom/internal/service"
 )
 
+const maxJSONBodyBytes int64 = 1 << 20
+
 type Server struct {
 	cfg    config.Config
 	logger *slog.Logger
@@ -592,9 +594,13 @@ func decodeJSON(r *http.Request, target any) error {
 		return &service.AppError{Code: "INVALID_JSON", StatusCode: http.StatusBadRequest, Message: "request body is required"}
 	}
 
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxJSONBodyBytes))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			return &service.AppError{Code: "REQUEST_TOO_LARGE", StatusCode: http.StatusRequestEntityTooLarge, Message: "json body exceeds 1 MiB limit"}
+		}
 		return &service.AppError{Code: "INVALID_JSON", StatusCode: http.StatusBadRequest, Message: "invalid json body"}
 	}
 	return nil
