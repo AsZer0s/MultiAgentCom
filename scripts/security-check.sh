@@ -6,6 +6,12 @@ cd "$ROOT_DIR"
 
 echo "== hardcoded secret scan =="
 
+SCAN_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/multiagentcom-secret-scan.XXXXXX")"
+cleanup() {
+  rm -f "$SCAN_OUTPUT"
+}
+trap cleanup EXIT
+
 PATTERNS=(
   'BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY'
   'AKIA[0-9A-Z]{16}'
@@ -24,13 +30,11 @@ SCAN_TARGETS=(
 )
 
 for pattern in "${PATTERNS[@]}"; do
-  if rg -n --hidden --glob '!runtime/**' --glob '!docs/**' -e "$pattern" "${SCAN_TARGETS[@]}" >/tmp/multiagentcom-secret-scan.txt 2>/dev/null; then
+  if rg -n --hidden --glob '!runtime/**' --glob '!docs/**' -e "$pattern" "${SCAN_TARGETS[@]}" >"$SCAN_OUTPUT" 2>/dev/null; then
     echo "Potential secret detected for pattern: $pattern" >&2
-    cat /tmp/multiagentcom-secret-scan.txt >&2
-    rm -f /tmp/multiagentcom-secret-scan.txt
+    cat "$SCAN_OUTPUT" >&2
     exit 1
   fi
 done
 
-rm -f /tmp/multiagentcom-secret-scan.txt
 echo "Security check passed."
