@@ -343,6 +343,19 @@ type projectSnapshotState struct {
 	ArtifactOrder []string                              `json:"artifactOrder,omitempty"`
 }
 
+type snapshotManifest struct {
+	SchemaVersion    int       `json:"schemaVersion"`
+	ID               string    `json:"id"`
+	ProjectID        string    `json:"projectId"`
+	Branch           string    `json:"branch"`
+	SourceSnapshotID string    `json:"sourceSnapshotId,omitempty"`
+	Reason           string    `json:"reason"`
+	Stable           bool      `json:"stable"`
+	StateRef         string    `json:"stateRef"`
+	Checksum         string    `json:"checksum"`
+	CreatedAt        time.Time `json:"createdAt"`
+}
+
 type persistedServiceState struct {
 	Version        int                                   `json:"version"`
 	Projects       map[string]*domain.Project            `json:"projects,omitempty"`
@@ -635,6 +648,44 @@ func (s *Service) rebuildIndexesLocked() {
 			}
 		}
 	}
+}
+
+func (s *Service) usesFileStore() bool {
+	return strings.EqualFold(strings.TrimSpace(s.cfg.StoreProvider), "file")
+}
+
+func (s *Service) snapshotRoot(snapshot *domain.Snapshot) string {
+	return filepath.Join(s.cfg.DataRoot, "snapshots", snapshot.ProjectID, snapshot.ID)
+}
+
+func (s *Service) writeSnapshotRecord(snapshot *domain.Snapshot, state *projectSnapshotState) (string, string, error) {
+	statePath := filepath.Join(s.snapshotRoot(snapshot), "state.json")
+	statePayload, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return "", "", fmt.Errorf("marshal snapshot state: %w", err)
+	}
+	statePayload = append(statePayload, '\n')
+	if err := writeFile(statePath, statePayload); err != nil {
+		return "", "", err
+	}
+	checksum := sha256.Sum256(statePayload)
+	stateRef := "file://" + statePath
+	manifest := snapshotManifest{
+		SchemaVersion:    1,
+		ID:               snapshot.ID,
+		ProjectID:        snapshot.ProjectID,
+		Branch:           snapshot.Branch,
+		SourceSnapshotID: snapshot.SourceSnapshotID,
+		Reason:           snapshot.Reason,
+		Stable:           snapshot.Stable,
+		StateRef:         stateRef,
+		Checksum:         hex.EncodeToString(checksum[:]),
+		CreatedAt:        snapshot.CreatedAt,
+	}
+	if err := writeJSONFile(filepath.Join(s.snapshotRoot(snapshot), "manifest.json"), manifest); err != nil {
+		return "", "", err
+	}
+	return stateRef, manifest.Checksum, nil
 }
 
 func (s *Service) runtimeProviderName() string {
@@ -1802,6 +1853,31 @@ func (s *Service) ExportDelivery(ctx context.Context, projectID string, input Ex
 	return nil, newConflictError("no exportable artifact found")
 }
 
+func (s *Service) artifactPathWithinConfiguredRoots(path string) bool {
+	artifactRoot := strings.TrimSpace(s.cfg.ArtifactRoot)
+	sandboxRoot := strings.TrimSpace(s.cfg.SandboxRoot)
+	return pathWithinRoot(path, artifactRoot) || pathWithinRoot(path, sandboxRoot)
+}
+
+func pathWithinRoot(path, root string) bool {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(root) == "" {
+		return false
+	}
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(absoluteRoot, absolutePath)
+	if err != nil {
+		return false
+	}
+	return relative == "." || (!strings.HasPrefix(relative, "..") && !filepath.IsAbs(relative))
+}
+
 func (s *Service) GetArtifact(ctx context.Context, projectID, artifactID string) (*domain.Artifact, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1809,6 +1885,9 @@ func (s *Service) GetArtifact(ctx context.Context, projectID, artifactID string)
 	artifact, ok := s.artifacts[artifactID]
 	if !ok || artifact.ProjectID != projectID {
 		return nil, newNotFoundError("artifact not found")
+	}
+	if !s.artifactPathWithinConfiguredRoots(artifact.URI) {
+		return nil, newInternalError("ARTIFACT_PATH_INVALID", "artifact path is outside configured roots")
 	}
 	if _, err := os.Stat(artifact.URI); err != nil {
 		return nil, newInternalError("ARTIFACT_MISSING", "artifact file is missing")
@@ -2880,11 +2959,20 @@ func (s *Service) recordSnapshotLocked(projectID, branch, reason string, stable 
 		Stable:           stable,
 		CreatedAt:        now,
 	}
+	state := s.captureProjectSnapshotStateLocked(projectID)
 	snapshot.StateRef = "memory://" + snapshot.ID
+	if s.usesFileStore() {
+		stateRef, checksum, err := s.writeSnapshotRecord(snapshot, state)
+		if err != nil {
+			return nil, err
+		}
+		snapshot.StateRef = stateRef
+		snapshot.Checksum = checksum
+	}
 
 	s.snapshotIndex[snapshot.ID] = snapshot
 	s.snapshots[projectID] = append(s.snapshots[projectID], snapshot)
-	s.snapshotState[snapshot.ID] = s.captureProjectSnapshotStateLocked(projectID)
+	s.snapshotState[snapshot.ID] = state
 	s.projectBranch[projectID] = branch
 	if stable {
 		s.stableBranch[projectID] = snapshot.ID

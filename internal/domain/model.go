@@ -122,6 +122,7 @@ type Snapshot struct {
 	SourceSnapshotID string    `json:"sourceSnapshotId,omitempty"`
 	Reason           string    `json:"reason"`
 	StateRef         string    `json:"stateRef"`
+	Checksum         string    `json:"checksum,omitempty"`
 	Stable           bool      `json:"stable"`
 	CreatedAt        time.Time `json:"createdAt"`
 }

@@ -109,6 +109,13 @@ func TestFileStoreRestoresServiceState(t *testing.T) {
 	if len(snapshots) != 1 || !snapshots[0].Stable {
 		t.Fatalf("expected 1 stable restored snapshot, got %+v", snapshots)
 	}
+	if !strings.HasPrefix(snapshots[0].StateRef, "file://") || snapshots[0].Checksum == "" {
+		t.Fatalf("expected file-backed snapshot ref and checksum, got %+v", snapshots[0])
+	}
+	manifestPath := filepath.Join(cfg.DataRoot, "snapshots", project.ID, snapshots[0].ID, "manifest.json")
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("expected snapshot manifest at %s: %v", manifestPath, err)
+	}
 	if _, err := restored.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{SnapshotID: snapshots[0].ID}); err != nil {
 		t.Fatalf("rollback using restored snapshot state: %v", err)
 	}
@@ -1484,6 +1491,45 @@ func TestListAuditLogsTracksCriticalActions(t *testing.T) {
 	}
 	if !foundProjectCreate || !foundExport || !foundDownload {
 		t.Fatalf("expected audit entries for create, export and download, got %+v", items)
+	}
+}
+
+func TestGetArtifactRejectsPathOutsideConfiguredRoots(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-artifact-path-boundary",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Artifact Boundary Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	outsidePath := filepath.Join(t.TempDir(), "delivery.zip")
+	if err := os.WriteFile(outsidePath, []byte("zip"), 0o644); err != nil {
+		t.Fatalf("write outside artifact: %v", err)
+	}
+	artifact := &domain.Artifact{
+		ID:        "artifact_outside",
+		ProjectID: project.ID,
+		Kind:      "delivery_bundle",
+		URI:       outsidePath,
+		CreatedAt: time.Now().UTC(),
+	}
+	svc.mu.Lock()
+	svc.artifacts[artifact.ID] = artifact
+	svc.artifactOrder[project.ID] = append(svc.artifactOrder[project.ID], artifact.ID)
+	svc.mu.Unlock()
+
+	_, err = svc.GetArtifact(ctx, project.ID, artifact.ID)
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != "ARTIFACT_PATH_INVALID" {
+		t.Fatalf("expected ARTIFACT_PATH_INVALID, got %v", err)
 	}
 }
 
