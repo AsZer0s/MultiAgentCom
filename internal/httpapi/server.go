@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -306,15 +307,30 @@ func (s *Server) handleGenerateTaskContext(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleListCommunications(w http.ResponseWriter, r *http.Request) {
+	page, err := parseStreamPage(r)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
 	items, err := s.svc.ListCommunicationLogs(r.Context(), r.PathValue("id"), r.URL.Query().Get("taskId"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"items": items,
-		"count": len(items),
+	filtered := make([]domain.CommunicationLog, 0, len(items))
+	for _, item := range items {
+		if page.includes(item.Timestamp) {
+			filtered = append(filtered, item)
+		}
+	}
+	paged := applyPage(filtered, page)
+	writeJSON(w, http.StatusOK, streamPageResponse[domain.CommunicationLog]{
+		Items:  paged,
+		Count:  len(paged),
+		Total:  len(filtered),
+		Limit:  page.limit,
+		Offset: page.offset,
 	})
 }
 
@@ -329,28 +345,58 @@ func (s *Server) handleGetTokenCosts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListAuditLogs(w http.ResponseWriter, r *http.Request) {
+	page, err := parseStreamPage(r)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
 	items, err := s.svc.ListAuditLogs(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"items": items,
-		"count": len(items),
+	filtered := make([]domain.AuditLog, 0, len(items))
+	for _, item := range items {
+		if page.includes(item.Timestamp) {
+			filtered = append(filtered, item)
+		}
+	}
+	paged := applyPage(filtered, page)
+	writeJSON(w, http.StatusOK, streamPageResponse[domain.AuditLog]{
+		Items:  paged,
+		Count:  len(paged),
+		Total:  len(filtered),
+		Limit:  page.limit,
+		Offset: page.offset,
 	})
 }
 
 func (s *Server) handleListAlerts(w http.ResponseWriter, r *http.Request) {
+	page, err := parseStreamPage(r)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
 	items, err := s.svc.ListAlerts(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"items": items,
-		"count": len(items),
+	filtered := make([]domain.Alert, 0, len(items))
+	for _, item := range items {
+		if page.includes(item.Timestamp) {
+			filtered = append(filtered, item)
+		}
+	}
+	paged := applyPage(filtered, page)
+	writeJSON(w, http.StatusOK, streamPageResponse[domain.Alert]{
+		Items:  paged,
+		Count:  len(paged),
+		Total:  len(filtered),
+		Limit:  page.limit,
+		Offset: page.offset,
 	})
 }
 
@@ -630,6 +676,89 @@ func decodeJSONAllowEmpty(r *http.Request, target any) error {
 		return nil
 	}
 	return decodeJSON(r, target)
+}
+
+type streamPage struct {
+	limit  int
+	offset int
+	since  time.Time
+	until  time.Time
+}
+
+type streamPageResponse[T any] struct {
+	Items  []T `json:"items"`
+	Count  int `json:"count"`
+	Total  int `json:"total"`
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
+}
+
+func parseStreamPage(r *http.Request) (streamPage, error) {
+	query := r.URL.Query()
+	limit, err := parseNonNegativeInt(query.Get("limit"), 100)
+	if err != nil || limit <= 0 {
+		return streamPage{}, &service.AppError{Code: "INVALID_QUERY", StatusCode: http.StatusBadRequest, Message: "limit must be a positive integer"}
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	offset, err := parseNonNegativeInt(query.Get("offset"), 0)
+	if err != nil {
+		return streamPage{}, &service.AppError{Code: "INVALID_QUERY", StatusCode: http.StatusBadRequest, Message: "offset must be a non-negative integer"}
+	}
+
+	page := streamPage{limit: limit, offset: offset}
+	if since := strings.TrimSpace(query.Get("since")); since != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, since)
+		if err != nil {
+			return streamPage{}, &service.AppError{Code: "INVALID_QUERY", StatusCode: http.StatusBadRequest, Message: "since must be RFC3339"}
+		}
+		page.since = parsed
+	}
+	if until := strings.TrimSpace(query.Get("until")); until != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, until)
+		if err != nil {
+			return streamPage{}, &service.AppError{Code: "INVALID_QUERY", StatusCode: http.StatusBadRequest, Message: "until must be RFC3339"}
+		}
+		page.until = parsed
+	}
+	return page, nil
+}
+
+func parseNonNegativeInt(value string, fallback int) (int, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, err
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("negative integer")
+	}
+	return parsed, nil
+}
+
+func (p streamPage) includes(timestamp time.Time) bool {
+	if !p.since.IsZero() && timestamp.Before(p.since) {
+		return false
+	}
+	if !p.until.IsZero() && timestamp.After(p.until) {
+		return false
+	}
+	return true
+}
+
+func applyPage[T any](items []T, page streamPage) []T {
+	if page.offset >= len(items) {
+		return []T{}
+	}
+	end := page.offset + page.limit
+	if end > len(items) {
+		end = len(items)
+	}
+	return items[page.offset:end]
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

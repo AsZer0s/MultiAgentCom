@@ -1165,6 +1165,25 @@ func TestHTTPListCommunicationLogs(t *testing.T) {
 			t.Fatalf("expected filtered task id %s, got %s", dispatched[0].ID, item.TaskID)
 		}
 	}
+
+	pagedBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/communications?limit=2&offset=1")
+	var paged struct {
+		Items  []domain.CommunicationLog `json:"items"`
+		Count  int                       `json:"count"`
+		Total  int                       `json:"total"`
+		Limit  int                       `json:"limit"`
+		Offset int                       `json:"offset"`
+	}
+	decodeResponse(t, pagedBody, &paged)
+	if paged.Count != 2 || len(paged.Items) != 2 || paged.Total != communications.Count || paged.Limit != 2 || paged.Offset != 1 {
+		t.Fatalf("unexpected paged communications response: %+v", paged)
+	}
+	if paged.Items[0].ID != communications.Items[1].ID {
+		t.Fatalf("expected offset item %s, got %s", communications.Items[1].ID, paged.Items[0].ID)
+	}
+
+	invalidBody := getJSONExpectStatus(t, server.Client(), server.URL+"/projects/"+project.ID+"/communications?limit=0", http.StatusBadRequest)
+	assertContainsBody(t, invalidBody, `"code":"INVALID_QUERY"`)
 }
 
 func TestHTTPGetTokenCosts(t *testing.T) {
@@ -1277,6 +1296,20 @@ func TestHTTPAuditLogs(t *testing.T) {
 	}
 	if !foundExport || !foundDownload {
 		t.Fatalf("expected DELIVERY_EXPORT and DELIVERY_DOWNLOAD audit entries, got %+v", logs.Items)
+	}
+
+	since := logs.Items[len(logs.Items)-1].Timestamp.Format(time.RFC3339Nano)
+	pagedBody := getJSONWithHeaders(t, server.Client(), server.URL+"/projects/"+project.ID+"/audit-logs?limit=1&since="+since, nil)
+	var paged struct {
+		Items  []domain.AuditLog `json:"items"`
+		Count  int               `json:"count"`
+		Total  int               `json:"total"`
+		Limit  int               `json:"limit"`
+		Offset int               `json:"offset"`
+	}
+	decodeResponse(t, pagedBody, &paged)
+	if paged.Count != 1 || len(paged.Items) != 1 || paged.Limit != 1 || paged.Total < 1 {
+		t.Fatalf("unexpected paged audit logs response: %+v", paged)
 	}
 }
 
@@ -1459,8 +1492,11 @@ func TestHTTPAlerts(t *testing.T) {
 
 	body := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/alerts")
 	var alerts struct {
-		Items []domain.Alert `json:"items"`
-		Count int            `json:"count"`
+		Items  []domain.Alert `json:"items"`
+		Count  int            `json:"count"`
+		Total  int            `json:"total"`
+		Limit  int            `json:"limit"`
+		Offset int            `json:"offset"`
 	}
 	decodeResponse(t, body, &alerts)
 	if alerts.Count == 0 || len(alerts.Items) == 0 {
@@ -1468,6 +1504,23 @@ func TestHTTPAlerts(t *testing.T) {
 	}
 	if alerts.Items[0].Type != "RUN_FAILURE" {
 		t.Fatalf("expected RUN_FAILURE alert, got %+v", alerts.Items[0])
+	}
+	if alerts.Total != alerts.Count || alerts.Limit != 100 || alerts.Offset != 0 {
+		t.Fatalf("unexpected alert pagination metadata: %+v", alerts)
+	}
+
+	since := alerts.Items[0].Timestamp.Format(time.RFC3339Nano)
+	pagedBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/alerts?limit=1&since="+since)
+	var paged struct {
+		Items  []domain.Alert `json:"items"`
+		Count  int            `json:"count"`
+		Total  int            `json:"total"`
+		Limit  int            `json:"limit"`
+		Offset int            `json:"offset"`
+	}
+	decodeResponse(t, pagedBody, &paged)
+	if paged.Count != 1 || len(paged.Items) != 1 || paged.Total != 1 || paged.Limit != 1 || paged.Offset != 0 {
+		t.Fatalf("unexpected paged alerts response: %+v", paged)
 	}
 }
 
@@ -1645,7 +1698,17 @@ func getJSON(t *testing.T, client *http.Client, url string) []byte {
 	return getJSONWithHeaders(t, client, url, nil)
 }
 
+func getJSONExpectStatus(t *testing.T, client *http.Client, url string, expectedStatus int) []byte {
+	t.Helper()
+	return getJSONWithHeadersExpectStatus(t, client, url, expectedStatus, nil)
+}
+
 func getJSONWithHeaders(t *testing.T, client *http.Client, url string, headers map[string]string) []byte {
+	t.Helper()
+	return getJSONWithHeadersExpectStatus(t, client, url, http.StatusOK, headers)
+}
+
+func getJSONWithHeadersExpectStatus(t *testing.T, client *http.Client, url string, expectedStatus int, headers map[string]string) []byte {
 	t.Helper()
 
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -1667,8 +1730,8 @@ func getJSONWithHeaders(t *testing.T, client *http.Client, url string, headers m
 		t.Fatalf("read response: %v", err)
 	}
 
-	if resp.StatusCode >= 300 {
-		t.Fatalf("unexpected status %d: %s", resp.StatusCode, string(data))
+	if resp.StatusCode != expectedStatus {
+		t.Fatalf("expected status %d, got %d: %s", expectedStatus, resp.StatusCode, string(data))
 	}
 
 	return data
