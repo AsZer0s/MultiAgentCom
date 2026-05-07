@@ -1,12 +1,13 @@
 # MultiAgentCom
 
-基于 `docs/` 中的产品与架构文档，当前仓库已启动 **Sprint 1 / M1 最小闭环** 的首轮开发。
+基于 `docs/` 中的产品与架构文档，当前仓库已完成 **Sprint 4 / M4 MVP 验收**。
 
 ## 已实现范围
 
 - `GET /health`：健康检查
 - `GET /status/matrix`：查看全局或按项目过滤的状态矩阵数据
 - `GET /status/panel`：打开最小状态矩阵面板
+- `GET /status/stream`：通过 SSE 实时推送状态事件（状态面板使用，支持轮询兜底）
 - `POST /projects`：创建项目
 - `POST /projects/{id}/requirements`：提交需求
 - `GET /projects/{id}/requirements`：查看需求
@@ -44,13 +45,13 @@
 ## 设计说明
 
 - 后端使用 Go 标准库先跑通最小闭环，领域层与 HTTP 层已解耦，后续可按 `docs/Tech-Stack-Decision.md` 平滑替换为 Gin。
-- 当前使用**内存存储**，用于验证 Sprint 1 核心链路。
+- 当前使用**内存存储**，用于验证 MVP 核心链路。
 - 单 Agent 执行器当前为**规则驱动的最小交付实现**：会基于 PRD 生成标准交付包（README、Go 后端、Node 预览前端、Dockerfile、Compose、元数据）。
 - Contract Hub 当前为**最小可演示实现**：支持基于最新 PRD 规则生成 CRUD 风格 API/Schema 契约，并按版本保存在内存中。
 - 契约校验当前支持**合并前最小闸门**：可检查候选 endpoints/schemas 与契约的缺失、类型不一致、额外字段；若存在冲突，会拒绝校验并自动创建修复任务。
 - 并行调度当前支持**双 Agent + 简单 DAG**：可生成后端/前端实现任务，并在依赖满足后触发集成任务；失败任务可单独创建 retry 任务，不影响其他任务继续推进。
 - Context Engine 当前支持**按任务角色切片注入**：后端任务会拿到 API/Schema 重点，前端任务会拿到 UX/验收重点；每次生成都会记录 `version` 和 `sources`，可回查最新注入结果。
-- 状态矩阵面板当前支持**最小可视化监控**：可查看项目级任务矩阵、Agent 状态汇总，并在 `/status/panel` 中按项目过滤与自动刷新。
+- 状态矩阵面板当前支持**最小可视化监控**：可查看项目级任务矩阵、Agent 状态汇总，并在 `/status/panel` 中按项目过滤；状态更新采用 SSE 实时推送并提供轮询兜底。
 - 通信日志当前支持**最小链路可视化**：会记录任务派发、上下文注入、运行启动、人工接管、代码锁等内部消息，并可在 `/projects/{id}/communications` 或 `/status/panel` 中按 `taskId` 过滤和高亮查看。
 - 告警基线当前支持**最小失败通知**：run 失败和共享沙盒关键失败会沉淀为 `/projects/{id}/alerts` 中的告警流，并在 `/status/panel` 里直接展示。
 - Token 成本监控当前支持**最小趋势观测**：系统会基于每次 run 的执行阶段生成模拟 Prompt/Completion Token 与估算成本，可通过 `/projects/{id}/token-costs` 或 `/status/panel` 查看按任务的趋势条目。
@@ -62,7 +63,7 @@
 - Preview Service 当前支持**最小可验收预览**：共享沙盒合并完成后可启动带 revision 检查的 Todo 预览页，便于验收演示。
 - 安全基线当前支持**最小单租户鉴权与审计**：设置 `MULTI_AGENT_API_TOKEN` 后，API 需携带 `Authorization: Bearer <token>`；关键操作会写入 `/projects/{id}/audit-logs` 审计流。
 - 告警通知当前支持**最小 webhook 主动推送**：设置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，run 失败和回滚事件会异步推送结构化 alert 到外部接收端。
-- 状态面板当前支持**最小运维总览**：同一页面可查看任务矩阵、失败告警、审计轨迹、通信日志和 Token 成本趋势。
+- 状态面板当前支持**最小运维总览**：同一页面可查看任务矩阵、失败告警、审计轨迹、通信日志和 Token 成本趋势，更新机制为 SSE + 轮询兜底。
 
 ## 本地运行
 

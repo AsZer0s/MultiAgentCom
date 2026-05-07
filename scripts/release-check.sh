@@ -32,6 +32,7 @@ bash -n "$ROOT_DIR/scripts/alert-smoke.sh"
 bash -n "$ROOT_DIR/scripts/auth-smoke.sh"
 bash -n "$ROOT_DIR/scripts/release-check.sh"
 bash -n "$ROOT_DIR/scripts/security-check.sh"
+bash -n "$ROOT_DIR/scripts/status-stream-smoke.sh"
 
 echo
 echo "== security checks =="
@@ -79,6 +80,10 @@ for _ in $(seq 1 60); do
   sleep 0.2
 done
 curl -sS "$BASE_URL/health" >/dev/null
+
+echo
+echo "== status stream smoke verification =="
+BASE_URL="$BASE_URL" bash "$ROOT_DIR/scripts/status-stream-smoke.sh"
 
 echo
 echo "== end-to-end demo verification =="

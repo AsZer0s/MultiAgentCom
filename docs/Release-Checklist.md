@@ -64,6 +64,7 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - `GET /status/panel` 页面包含 `Failure Alerts`
 - `GET /status/panel` 页面包含 `Audit Trail`
 - `GET /status/panel` 页面包含 `Token Cost Trend`
+- `GET /status/stream` 可持续接收 `status` SSE 事件（断开 SSE 后可由轮询兜底刷新）
 - `GET /projects/{id}/alerts` 返回关键失败告警流
 - 配置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，失败告警可推送到外部 webhook sink
 - `GET /projects/{id}/communications?taskId=...` 返回 `checksum`
@@ -90,3 +91,16 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - P1 中 AC-12 / AC-13 可演示
 - 安全扫描通过，关键操作可通过审计日志追踪
 - `RUNS=3 bash scripts/demo.sh` 可连续通过
+
+## Status Stream Smoke
+
+```bash
+bash scripts/status-stream-smoke.sh
+```
+
+预期结果：
+
+- `GET /status/stream` 返回 `200`
+- 响应头 `Content-Type` 包含 `event-stream`
+- SSE 输出包含 `event: status`
+- SSE 输出包含 `data:`

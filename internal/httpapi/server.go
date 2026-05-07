@@ -33,6 +33,7 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("GET /health", server.handleHealth)
 	mux.HandleFunc("GET /status/matrix", server.handleGetStatusMatrix)
 	mux.HandleFunc("GET /status/panel", server.handleStatusPanel)
+	mux.HandleFunc("GET /status/stream", server.handleStatusStream)
 	mux.HandleFunc("POST /projects", server.handleCreateProject)
 	mux.HandleFunc("GET /projects/{id}", server.handleGetProject)
 	mux.HandleFunc("POST /projects/{id}/requirements", server.handleAddRequirement)
@@ -92,6 +93,53 @@ func (s *Server) handleGetStatusMatrix(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStatusPanel(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(renderStatusPanelHTML(s.cfg.ServiceName)))
+}
+
+func (s *Server) handleStatusStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"code":    "STREAM_UNSUPPORTED",
+			"message": "streaming is not supported",
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	writeStatusEvent := func() bool {
+		payload, err := json.Marshal(map[string]any{
+			"serverTime": time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		if err != nil {
+			return false
+		}
+		if _, err := fmt.Fprintf(w, "event: status\ndata: %s\n\n", payload); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	if !writeStatusEvent() {
+		return
+	}
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if !writeStatusEvent() {
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
@@ -700,6 +748,13 @@ func (w *statusRecorder) WriteHeader(status int) {
 	w.ResponseWriter.WriteHeader(status)
 }
 
+func (w *statusRecorder) Flush() {
+	flusher, ok := w.ResponseWriter.(http.Flusher)
+	if ok {
+		flusher.Flush()
+	}
+}
+
 func requestIDFromContext(ctx context.Context) string {
 	value, _ := ctx.Value(requestIDKey).(string)
 	return value
@@ -1172,7 +1227,7 @@ func renderStatusPanelHTML(serviceName string) string {
     <div class="hero">
       <div class="eyebrow">Operational View</div>
       <h1>Status Matrix</h1>
-      <div class="sub">查看每个项目下任务和 Agent 的当前状态。这个最小版面板会自动刷新，适合演示 Sprint 2 的协同编排进度。</div>
+      <div class="sub">查看每个项目下任务和 Agent 的当前状态。这个最小版面板支持 SSE 实时推送并保留轮询兜底，适合演示 MVP 阶段协同编排进度。</div>
     </div>
     <div class="toolbar">
       <select id="projectFilter"></select>
@@ -1402,6 +1457,17 @@ func renderStatusPanelHTML(serviceName string) string {
     filter.addEventListener('change', load);
     taskLogFilter.addEventListener('change', load);
     refreshBtn.addEventListener('click', load);
+
+    if (typeof window.EventSource === 'function') {
+      const stream = new EventSource(withAuth('/status/stream'));
+      stream.addEventListener('status', function() {
+        load();
+      });
+      stream.onerror = function() {
+        // Keep polling fallback active when SSE connection is interrupted.
+      };
+    }
+
     load();
     setInterval(load, 4000);
   </script>

@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -409,6 +411,96 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "Token Cost Trend") {
 		t.Fatalf("expected status panel html to contain token cost panel, got %s", string(body))
+	}
+	if !strings.Contains(string(body), "new EventSource(withAuth('/status/stream'))") {
+		t.Fatalf("expected status panel html to include status stream EventSource, got %s", string(body))
+	}
+	if !strings.Contains(string(body), "setInterval(load, 4000)") {
+		t.Fatalf("expected status panel html to keep polling fallback, got %s", string(body))
+	}
+}
+
+func TestHTTPStatusStream(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-status-stream",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/status/stream", nil)
+	if err != nil {
+		t.Fatalf("new status stream request: %v", err)
+	}
+
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("get status stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status stream 200, got %d", resp.StatusCode)
+	}
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("expected text/event-stream content type, got %s", resp.Header.Get("Content-Type"))
+	}
+
+	chunk := readStatusStreamChunk(t, resp.Body)
+	if !strings.Contains(chunk, "event: status") || !strings.Contains(chunk, "data:") {
+		t.Fatalf("expected stream payload to contain status event and data field, got %s", chunk)
+	}
+}
+
+func TestHTTPStatusStreamTokenQueryAuth(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-status-stream-auth",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "http-manager-agent",
+		APIToken:     "demo-token",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	unauthorizedResp, err := server.Client().Get(server.URL + "/status/stream")
+	if err != nil {
+		t.Fatalf("get unauthorized status stream: %v", err)
+	}
+	defer unauthorizedResp.Body.Close()
+	if unauthorizedResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized status stream 401, got %d", unauthorizedResp.StatusCode)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/status/stream?token=demo-token", nil)
+	if err != nil {
+		t.Fatalf("new authorized status stream request: %v", err)
+	}
+
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("get authorized status stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected authorized status stream 200, got %d", resp.StatusCode)
+	}
+
+	chunk := readStatusStreamChunk(t, resp.Body)
+	if !strings.Contains(chunk, "event: status") || !strings.Contains(chunk, "data:") {
+		t.Fatalf("expected authorized stream payload to contain status event and data field, got %s", chunk)
 	}
 }
 
@@ -1413,6 +1505,22 @@ func getJSONWithHeaders(t *testing.T, client *http.Client, url string, headers m
 	}
 
 	return data
+}
+
+func readStatusStreamChunk(t *testing.T, body io.Reader) string {
+	t.Helper()
+
+	reader := bufio.NewReader(body)
+	var lines strings.Builder
+	for i := 0; i < 2; i++ {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read status stream line %d: %v", i+1, err)
+		}
+		lines.WriteString(line)
+	}
+
+	return lines.String()
 }
 
 func assertContainsBody(t *testing.T, body []byte, fragment string) {
