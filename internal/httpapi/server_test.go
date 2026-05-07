@@ -1174,9 +1174,21 @@ func TestHTTPAuditLogs(t *testing.T) {
 	decodeResponse(t, runBody, &runEnvelope)
 	waitForHTTPRun(t, server, project.ID, runEnvelope.Run.ID)
 
-	requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/delivery/export", map[string]any{
+	exportBody := requestJSONWithHeaders(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/delivery/export", map[string]any{
 		"runId": runEnvelope.Run.ID,
 	}, nil)
+	var exportResponse struct {
+		DownloadPath string `json:"downloadPath"`
+	}
+	decodeResponse(t, exportBody, &exportResponse)
+	resp, err := server.Client().Get(server.URL + exportResponse.DownloadPath)
+	if err != nil {
+		t.Fatalf("download delivery artifact: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected download status 200, got %d", resp.StatusCode)
+	}
 
 	body := getJSONWithHeaders(t, server.Client(), server.URL+"/projects/"+project.ID+"/audit-logs", nil)
 	var logs struct {
@@ -1191,14 +1203,17 @@ func TestHTTPAuditLogs(t *testing.T) {
 		t.Fatalf("expected at least 4 audit log entries, got %d", len(logs.Items))
 	}
 	foundExport := false
+	foundDownload := false
 	for _, item := range logs.Items {
-		if item.Action == "DELIVERY_EXPORT" {
+		switch item.Action {
+		case "DELIVERY_EXPORT":
 			foundExport = true
-			break
+		case "DELIVERY_DOWNLOAD":
+			foundDownload = true
 		}
 	}
-	if !foundExport {
-		t.Fatalf("expected DELIVERY_EXPORT audit entry, got %+v", logs.Items)
+	if !foundExport || !foundDownload {
+		t.Fatalf("expected DELIVERY_EXPORT and DELIVERY_DOWNLOAD audit entries, got %+v", logs.Items)
 	}
 }
 

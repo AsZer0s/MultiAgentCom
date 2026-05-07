@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -580,11 +579,6 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 	artifact, err := s.svc.GetArtifact(r.Context(), r.PathValue("id"), r.PathValue("artifactId"))
 	if err != nil {
 		writeServiceError(w, err)
-		return
-	}
-
-	if _, err := os.Stat(artifact.URI); err != nil {
-		writeServiceError(w, &service.AppError{Code: "ARTIFACT_MISSING", StatusCode: http.StatusInternalServerError, Message: "artifact file is missing"})
 		return
 	}
 

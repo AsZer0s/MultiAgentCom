@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1280,8 +1281,12 @@ func TestListAuditLogsTracksCriticalActions(t *testing.T) {
 	}
 	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
 
-	if _, err := svc.ExportDelivery(ctx, project.ID, ExportDeliveryInput{RunID: runEnvelope.Run.ID}); err != nil {
+	artifact, err := svc.ExportDelivery(ctx, project.ID, ExportDeliveryInput{RunID: runEnvelope.Run.ID})
+	if err != nil {
 		t.Fatalf("export delivery: %v", err)
+	}
+	if _, err := svc.GetArtifact(ctx, project.ID, artifact.ID); err != nil {
+		t.Fatalf("download artifact: %v", err)
 	}
 
 	items, err := svc.ListAuditLogs(ctx, project.ID)
@@ -1294,6 +1299,7 @@ func TestListAuditLogsTracksCriticalActions(t *testing.T) {
 
 	foundProjectCreate := false
 	foundExport := false
+	foundDownload := false
 	for _, item := range items {
 		if item.Actor != "qa-reviewer" {
 			t.Fatalf("expected audit actor qa-reviewer, got %s", item.Actor)
@@ -1303,10 +1309,69 @@ func TestListAuditLogsTracksCriticalActions(t *testing.T) {
 			foundProjectCreate = true
 		case "DELIVERY_EXPORT":
 			foundExport = true
+		case "DELIVERY_DOWNLOAD":
+			foundDownload = true
 		}
 	}
-	if !foundProjectCreate || !foundExport {
-		t.Fatalf("expected audit entries for create and export, got %+v", items)
+	if !foundProjectCreate || !foundExport || !foundDownload {
+		t.Fatalf("expected audit entries for create, export and download, got %+v", items)
+	}
+}
+
+func TestGetArtifactMissingFileDoesNotRecordDownload(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-missing-artifact-download",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := WithActor(context.Background(), "qa-reviewer")
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Missing Artifact Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo 列表的增删改查",
+		Content: "实现 Todo 列表的增删改查，并导出标准交付包。",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+
+	artifact, err := svc.ExportDelivery(ctx, project.ID, ExportDeliveryInput{RunID: runEnvelope.Run.ID})
+	if err != nil {
+		t.Fatalf("export delivery: %v", err)
+	}
+	if err := os.Remove(artifact.URI); err != nil {
+		t.Fatalf("remove artifact: %v", err)
+	}
+
+	_, err = svc.GetArtifact(ctx, project.ID, artifact.ID)
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != "ARTIFACT_MISSING" {
+		t.Fatalf("expected ARTIFACT_MISSING error, got %v", err)
+	}
+
+	items, err := svc.ListAuditLogs(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list audit logs: %v", err)
+	}
+	for _, item := range items {
+		if item.Action == "DELIVERY_DOWNLOAD" {
+			t.Fatalf("did not expect download audit for missing file, got %+v", items)
+		}
 	}
 }
 

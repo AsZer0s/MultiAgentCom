@@ -48,6 +48,10 @@ func newConflictError(message string) *AppError {
 	return &AppError{Code: "CONFLICT", StatusCode: 409, Message: message}
 }
 
+func newInternalError(code, message string) *AppError {
+	return &AppError{Code: code, StatusCode: http.StatusInternalServerError, Message: message}
+}
+
 type Service struct {
 	cfg             config.Config
 	logger          *slog.Logger
@@ -1552,15 +1556,19 @@ func (s *Service) ExportDelivery(ctx context.Context, projectID string, input Ex
 	return nil, newConflictError("no exportable artifact found")
 }
 
-func (s *Service) GetArtifact(_ context.Context, projectID, artifactID string) (*domain.Artifact, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Service) GetArtifact(ctx context.Context, projectID, artifactID string) (*domain.Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	artifact, ok := s.artifacts[artifactID]
 	if !ok || artifact.ProjectID != projectID {
 		return nil, newNotFoundError("artifact not found")
 	}
+	if _, err := os.Stat(artifact.URI); err != nil {
+		return nil, newInternalError("ARTIFACT_MISSING", "artifact file is missing")
+	}
 
+	s.recordAuditLocked(ctx, projectID, "DELIVERY_DOWNLOAD", "artifact", artifact.ID, "delivery artifact downloaded", time.Now().UTC())
 	return cloneArtifact(artifact), nil
 }
 
