@@ -32,6 +32,95 @@ func TestNewDefaultsArtifactRootWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestFileStoreRestoresServiceState(t *testing.T) {
+	cfg := config.Config{
+		Address:       ":0",
+		ServiceName:   "test-file-store-restore",
+		ArtifactRoot:  t.TempDir(),
+		SandboxRoot:   t.TempDir(),
+		StoreProvider: "file",
+		DataRoot:      t.TempDir(),
+		DefaultAgent:  "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	ctx := context.Background()
+	svc := New(cfg, logger)
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	merge, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	})
+	if err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	if !merge.Passed {
+		t.Fatalf("expected successful merge, got %+v", merge)
+	}
+	preview, err := svc.StartPreview(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("start preview: %v", err)
+	}
+	artifact, err := svc.ExportDelivery(ctx, project.ID, ExportDeliveryInput{})
+	if err != nil {
+		t.Fatalf("export delivery: %v", err)
+	}
+	if _, err := svc.GetArtifact(ctx, project.ID, artifact.ID); err != nil {
+		t.Fatalf("download artifact: %v", err)
+	}
+
+	restored := New(cfg, logger)
+	projects, err := restored.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("list restored projects: %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != project.ID {
+		t.Fatalf("expected restored project %s, got %+v", project.ID, projects)
+	}
+	requirements, err := restored.ListRequirements(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list restored requirements: %v", err)
+	}
+	if len(requirements) != 1 {
+		t.Fatalf("expected 1 restored requirement, got %d", len(requirements))
+	}
+	tasks, err := restored.ListTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list restored tasks: %v", err)
+	}
+	if len(tasks) != 4 {
+		t.Fatalf("expected 4 restored tasks, got %d", len(tasks))
+	}
+	if _, err := restored.GetContract(ctx, project.ID, contract.ID); err != nil {
+		t.Fatalf("get restored contract: %v", err)
+	}
+	if _, err := restored.GetPreview(ctx, project.ID, preview.Preview.ID); err != nil {
+		t.Fatalf("get restored preview: %v", err)
+	}
+	if _, err := restored.GetArtifact(ctx, project.ID, artifact.ID); err != nil {
+		t.Fatalf("get restored artifact: %v", err)
+	}
+	snapshots, err := restored.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list restored snapshots: %v", err)
+	}
+	if len(snapshots) != 1 || !snapshots[0].Stable {
+		t.Fatalf("expected 1 stable restored snapshot, got %+v", snapshots)
+	}
+	if _, err := restored.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{SnapshotID: snapshots[0].ID}); err != nil {
+		t.Fatalf("rollback using restored snapshot state: %v", err)
+	}
+	auditLogs, err := restored.ListAuditLogs(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list restored audit logs: %v", err)
+	}
+	if len(auditLogs) == 0 {
+		t.Fatal("expected restored audit logs")
+	}
+}
+
 func TestSprintOneFlow(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",

@@ -1,9 +1,40 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestLoadStoreDefaults(t *testing.T) {
+	t.Setenv("MULTI_AGENT_STORE_PROVIDER", "")
+	t.Setenv("MULTI_AGENT_DATA_ROOT", "")
+
+	cfg := Load()
+
+	if cfg.StoreProvider != "memory" {
+		t.Fatalf("StoreProvider = %q, want %q", cfg.StoreProvider, "memory")
+	}
+	if cfg.DataRoot != filepath.Join(os.TempDir(), "multiagentcom", "data") {
+		t.Fatalf("DataRoot = %q, want temp data root", cfg.DataRoot)
+	}
+}
+
+func TestLoadStoreOverrides(t *testing.T) {
+	dataRoot := t.TempDir()
+	t.Setenv("MULTI_AGENT_STORE_PROVIDER", "file")
+	t.Setenv("MULTI_AGENT_DATA_ROOT", dataRoot)
+
+	cfg := Load()
+
+	if cfg.StoreProvider != "file" {
+		t.Fatalf("StoreProvider = %q, want %q", cfg.StoreProvider, "file")
+	}
+	if cfg.DataRoot != dataRoot {
+		t.Fatalf("DataRoot = %q, want %q", cfg.DataRoot, dataRoot)
+	}
+}
 
 func TestLoadRuntimeDefaults(t *testing.T) {
 	t.Setenv("MULTI_AGENT_RUNTIME_PROVIDER", "")

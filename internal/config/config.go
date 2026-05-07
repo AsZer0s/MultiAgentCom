@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -14,6 +15,8 @@ type Config struct {
 	DefaultAgent    string
 	APIToken        string
 	AlertWebhookURL string
+	StoreProvider   string
+	DataRoot        string
 	RuntimeProvider string
 	RuntimeEndpoint string
 	RuntimeTimeout  time.Duration
@@ -28,6 +31,8 @@ func Load() Config {
 		DefaultAgent:    getenv("MULTI_AGENT_DEFAULT_AGENT", "manager-agent-sprint1"),
 		APIToken:        getenv("MULTI_AGENT_API_TOKEN", ""),
 		AlertWebhookURL: getenv("MULTI_AGENT_ALERT_WEBHOOK_URL", ""),
+		StoreProvider:   getenv("MULTI_AGENT_STORE_PROVIDER", "memory"),
+		DataRoot:        getenv("MULTI_AGENT_DATA_ROOT", filepath.Join(os.TempDir(), "multiagentcom", "data")),
 		RuntimeProvider: getenv("MULTI_AGENT_RUNTIME_PROVIDER", "local"),
 		RuntimeEndpoint: getenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", ""),
 		RuntimeTimeout:  getenvDuration("MULTI_AGENT_RUNTIME_HTTP_TIMEOUT", 30*time.Second),
