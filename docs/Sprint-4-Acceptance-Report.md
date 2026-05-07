@@ -5,7 +5,7 @@
 ## Scope
 
 - 验收版本：`main` 分支，包含 BL-301 / BL-302 / BL-303 / BL-304 / BL-305 的当前工作区状态
-- 验收环境：Go 标准库 HTTP 服务，内存存储，`go test ./...`
+- 验收环境：Go 标准库 HTTP 服务，默认内存存储；文件存储、scoped auth、readiness 与 token budget 已有回归覆盖，`go test ./...`
 - 示例场景：Todo 全栈（状态面板、通信日志、Token 成本趋势、预览、标准交付包）
 
 ## Coverage
@@ -30,7 +30,7 @@
 
 - Result: `PASS`
 - Notes:
-  - `GET /projects/{id}/communications` 支持按 `taskId` 过滤。
+  - `GET /projects/{id}/communications` 支持按 `taskId` 过滤，并支持 `limit`、`offset`、`since`、`until` 分页/时间过滤。
   - 日志包含 `version`、`from`、`to`、`type`、`taskId`、`checksum`、`timestamp`。
   - 状态面板可按 `taskId` 高亮对应任务和通信条目。
 
@@ -71,7 +71,7 @@
 
 ## Residual Risk
 
-- Token 与成本目前为规则驱动的估算值，用于趋势演示，不代表真实模型计费。
-- 状态面板仍为内嵌 HTML 的 MVP 版本，尚未接入更细粒度的图形拓扑与实时推送。
+- Token 与成本已支持 runtime provider 返回 usage 优先、估算 fallback、可配置单价和 warn/block budget；真实账单仍需由外部模型供应商账务系统对账。
+- 状态面板仍为内嵌 HTML 的 MVP 版本，尚未接入更细粒度的图形拓扑。
 - 交付包虽然已可本地启动，但仍属于示例工程结构，未覆盖真实业务依赖与外部基础设施。
-- 当前鉴权仍为单租户静态 token，尚未覆盖多租户权限、角色分级和更细粒度的下载授权。
+- 当前鉴权已支持本地多 token、roles、project scope、disabled 和 expiry；仍未接入企业级 OIDC/OAuth、租户目录或集中权限系统。
