@@ -95,3 +95,41 @@ func TestLoadRuntimeTimeoutInvalidFallback(t *testing.T) {
 		t.Fatalf("RuntimeTimeout = %s, want %s when env is invalid", cfg.RuntimeTimeout, 30*time.Second)
 	}
 }
+
+func TestValidateAcceptsDefaultConfig(t *testing.T) {
+	if err := Validate(Config{}); err != nil {
+		t.Fatalf("Validate default config: %v", err)
+	}
+}
+
+func TestValidateRejectsInvalidProductionConfig(t *testing.T) {
+	err := Validate(Config{
+		StoreProvider:   "postgres",
+		RuntimeProvider: "http",
+		RuntimeEndpoint: "://bad",
+		AlertWebhookURL: "://bad",
+		AuthTokens:      `[{"actor":"ops"}]`,
+	})
+	issues := ValidationIssues(err)
+	if len(issues) < 4 {
+		t.Fatalf("expected validation issues, got %v", issues)
+	}
+
+	fields := map[string]bool{}
+	for _, issue := range issues {
+		fields[issue.Field] = true
+	}
+	for _, field := range []string{"StoreProvider", "RuntimeEndpoint", "AlertWebhookURL", "AuthTokens[0].TokenHash"} {
+		if !fields[field] {
+			t.Fatalf("expected issue for %s, got %v", field, issues)
+		}
+	}
+}
+
+func TestValidateRejectsMissingAuthTokenFile(t *testing.T) {
+	err := Validate(Config{AuthTokensFile: filepath.Join(t.TempDir(), "missing.json")})
+	issues := ValidationIssues(err)
+	if len(issues) != 1 || issues[0].Field != "AuthTokensFile" {
+		t.Fatalf("expected AuthTokensFile issue, got %v", issues)
+	}
+}

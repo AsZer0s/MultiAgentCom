@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,7 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", server.handleHealth)
+	mux.HandleFunc("GET /ready", server.handleReady)
 	mux.HandleFunc("GET /status/matrix", server.handleGetStatusMatrix)
 	mux.HandleFunc("GET /status/panel", server.handleStatusPanel)
 	mux.HandleFunc("GET /status/stream", server.handleStatusStream)
@@ -81,6 +83,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"service":   s.cfg.ServiceName,
 		"timestamp": time.Now().UTC(),
 	})
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	result := s.readiness()
+	status := http.StatusOK
+	if result.Status != "ready" {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, result)
 }
 
 func (s *Server) handleGetStatusMatrix(w http.ResponseWriter, r *http.Request) {
@@ -761,6 +772,91 @@ func applyPage[T any](items []T, page streamPage) []T {
 	return items[page.offset:end]
 }
 
+type readinessResult struct {
+	Status    string           `json:"status"`
+	Service   string           `json:"service"`
+	Timestamp time.Time        `json:"timestamp"`
+	Checks    []readinessCheck `json:"checks"`
+}
+
+type readinessCheck struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+func (s *Server) readiness() readinessResult {
+	cfg := config.WithDefaults(s.cfg)
+	checks := []readinessCheck{}
+	addCheck := func(name string, err error) {
+		check := readinessCheck{Name: name, Status: "ok"}
+		if err != nil {
+			check.Status = "failed"
+			check.Message = err.Error()
+		}
+		checks = append(checks, check)
+	}
+
+	addCheck("config", config.Validate(cfg))
+	_, authErr := auth.New(cfg.APIToken, cfg.AuthTokens, cfg.AuthTokensFile)
+	addCheck("auth", authErr)
+	if strings.EqualFold(strings.TrimSpace(cfg.StoreProvider), "file") {
+		addCheck("dataRoot", ensureWritableDir(cfg.DataRoot))
+	} else {
+		addCheck("store", nil)
+	}
+	addCheck("artifactRoot", ensureWritableDir(cfg.ArtifactRoot))
+	addCheck("sandboxRoot", ensureWritableDir(cfg.SandboxRoot))
+	if strings.EqualFold(strings.TrimSpace(cfg.RuntimeProvider), "http") {
+		addCheck("runtime", nil)
+	} else if strings.EqualFold(strings.TrimSpace(cfg.RuntimeProvider), "local") {
+		addCheck("runtime", nil)
+	} else {
+		addCheck("runtime", fmt.Errorf("runtime provider %q is not registered", cfg.RuntimeProvider))
+	}
+	if strings.TrimSpace(cfg.AlertWebhookURL) != "" {
+		addCheck("alertWebhook", nil)
+	}
+
+	status := "ready"
+	for _, check := range checks {
+		if check.Status != "ok" {
+			status = "not_ready"
+			break
+		}
+	}
+	return readinessResult{Status: status, Service: cfg.ServiceName, Timestamp: time.Now().UTC(), Checks: checks}
+}
+
+func ensureWritableDir(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("path is required")
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory")
+	}
+	file, err := os.CreateTemp(path, ".ready-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := file.Name()
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -837,7 +933,7 @@ func authMiddleware(cfg config.Config) func(http.Handler) http.Handler {
 	authenticator, err := auth.New(cfg.APIToken, cfg.AuthTokens, cfg.AuthTokensFile)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/health" {
+			if r.URL.Path == "/health" || r.URL.Path == "/ready" {
 				next.ServeHTTP(w, r)
 				return
 			}

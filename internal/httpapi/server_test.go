@@ -136,6 +136,60 @@ func TestHTTPSecurityHeaders(t *testing.T) {
 	}
 }
 
+func TestHTTPReadyReportsReady(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-ready",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DataRoot:     t.TempDir(),
+		APIToken:     "secret-token",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSON(t, server.Client(), server.URL+"/ready")
+	var ready struct {
+		Status string `json:"status"`
+		Checks []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		} `json:"checks"`
+	}
+	decodeResponse(t, body, &ready)
+	if ready.Status != "ready" {
+		t.Fatalf("expected ready status, got %+v", ready)
+	}
+	if len(ready.Checks) == 0 {
+		t.Fatal("expected readiness checks")
+	}
+	for _, check := range ready.Checks {
+		if check.Status != "ok" {
+			t.Fatalf("expected readiness check ok, got %+v", ready.Checks)
+		}
+	}
+}
+
+func TestHTTPReadyReportsConfigFailure(t *testing.T) {
+	cfg := config.Config{
+		Address:         ":0",
+		ServiceName:     "test-http-ready-failure",
+		ArtifactRoot:    t.TempDir(),
+		SandboxRoot:     t.TempDir(),
+		RuntimeProvider: "http",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSONExpectStatus(t, server.Client(), server.URL+"/ready", http.StatusServiceUnavailable)
+	assertContainsBody(t, body, `"status":"not_ready"`)
+	assertContainsBody(t, body, `"name":"config"`)
+}
+
 func TestHTTPRejectsOversizedJSONBody(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",
