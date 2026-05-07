@@ -641,7 +641,15 @@ const requestIDKey contextKey = "request_id"
 const authActorKey contextKey = "auth_actor"
 
 func withMiddleware(cfg config.Config, logger *slog.Logger, next http.Handler) http.Handler {
-	return requestIDMiddleware(authMiddleware(cfg)(recoveryMiddleware(logger)(loggingMiddleware(logger)(next))))
+	return requestIDMiddleware(securityHeadersMiddleware(authMiddleware(cfg)(recoveryMiddleware(logger)(loggingMiddleware(logger)(next)))))
+}
+
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func requestIDMiddleware(next http.Handler) http.Handler {

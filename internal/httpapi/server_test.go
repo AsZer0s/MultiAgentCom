@@ -108,6 +108,32 @@ func TestHTTPFlow(t *testing.T) {
 	)
 }
 
+func TestHTTPSecurityHeaders(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-http-security-headers",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "http-test-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	resp, err := server.Client().Get(server.URL + "/health")
+	if err != nil {
+		t.Fatalf("get health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("expected nosniff header, got %s", resp.Header.Get("X-Content-Type-Options"))
+	}
+	if resp.Header.Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("expected no-referrer header, got %s", resp.Header.Get("Referrer-Policy"))
+	}
+}
+
 func TestHTTPRejectsOversizedJSONBody(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",
