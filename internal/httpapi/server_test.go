@@ -546,6 +546,9 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 	if !strings.Contains(bodyText, "textContent") || !strings.Contains(bodyText, "replaceChildren") {
 		t.Fatalf("expected status panel html to use DOM-safe rendering helpers, got %s", bodyText)
 	}
+	if !strings.Contains(bodyText, "renderPanelFetch") {
+		t.Fatalf("expected status panel html to isolate project panel fetch failures, got %s", bodyText)
+	}
 }
 
 func TestHTTPStatusStream(t *testing.T) {

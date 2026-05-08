@@ -1737,6 +1737,17 @@ func renderStatusPanelHTML(serviceName string) string {
       snapshotPanel.replaceChildren(panelHead('Timeline', 'Snapshots', ['Project ' + projectId, 'Count ' + (payload.count || 0)]), list.childElementCount ? list : empty('No snapshots recorded'));
     }
 
+    async function renderPanelFetch(panel, title, request, render) {
+      try {
+        const payload = await request();
+        render(payload);
+        return payload;
+      } catch (err) {
+        renderError(panel, title, err);
+        return null;
+      }
+    }
+
     async function loadProjectPanels(projectId) {
       if (!projectId) {
         renderAlerts('', { items: [], count: 0 });
@@ -1750,20 +1761,15 @@ func renderStatusPanelHTML(serviceName string) string {
       const taskId = taskLogFilter.value.trim();
       const limit = encodeURIComponent(logLimit.value || '25');
       const scopedTask = taskId ? '&taskId=' + encodeURIComponent(taskId) : '';
-      const [alerts, audit, comms, costs, sandboxes, snapshots] = await Promise.all([
-        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/alerts?limit=' + limit),
-        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/audit-logs?limit=' + limit),
-        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/communications?limit=' + limit + scopedTask),
-        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/token-costs' + (taskId ? '?taskId=' + encodeURIComponent(taskId) : '')),
-        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/sandboxes'),
-        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/snapshots')
+      const costPath = '/projects/' + encodeURIComponent(projectId) + '/token-costs' + (taskId ? '?taskId=' + encodeURIComponent(taskId) : '');
+      const [, , , costs] = await Promise.all([
+        renderPanelFetch(alertPanel, 'Failure Alerts', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/alerts?limit=' + limit), (payload) => renderAlerts(projectId, payload)),
+        renderPanelFetch(auditPanel, 'Audit Trail', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/audit-logs?limit=' + limit), (payload) => renderAuditLogs(projectId, payload)),
+        renderPanelFetch(commPanel, 'Agent Message Log', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/communications?limit=' + limit + scopedTask), (payload) => renderCommunications(projectId, payload)),
+        renderPanelFetch(costPanel, 'Token Cost Trend', () => fetchJSON(costPath), (payload) => renderCosts(projectId, payload)),
+        renderPanelFetch(sandboxPanel, 'Sandboxes', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/sandboxes'), (payload) => renderSandboxes(projectId, payload)),
+        renderPanelFetch(snapshotPanel, 'Snapshots', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/snapshots'), (payload) => renderSnapshots(projectId, payload))
       ]);
-      renderAlerts(projectId, alerts);
-      renderAuditLogs(projectId, audit);
-      renderCommunications(projectId, comms);
-      renderCosts(projectId, costs);
-      renderSandboxes(projectId, sandboxes);
-      renderSnapshots(projectId, snapshots);
       return costs;
     }
 
