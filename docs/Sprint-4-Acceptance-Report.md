@@ -71,7 +71,7 @@
 
 ## Residual Risk
 
-- Token 与成本已支持 runtime provider 返回 usage 优先、估算 fallback、可配置单价和 warn/block budget；HTTP runtime provider 已有 `runtime.http.v1` 协议、结构化错误和 response size/timeout/malformed 归一化，真实账单仍需由外部模型供应商账务系统对账。
+- Token 与成本已支持 runtime provider 返回 usage 优先、估算 fallback、可配置单价和 warn/block budget；HTTP runtime provider 已有 `runtime.http.v1` 协议、Bearer outbound auth、有界 retry、结构化错误和 response size/timeout/malformed 归一化，真实账单仍需由外部模型供应商账务系统对账。
 - 状态面板已接入内嵌 SVG 任务拓扑，但仍是零构建的 vanilla MVP，不是完整图编辑器或复杂图分析工作台。
 - 交付包虽然已可本地启动，但仍属于示例工程结构，未覆盖真实业务依赖与外部基础设施。
 - 当前鉴权已支持本地多 token、roles、project scope、disabled 和 expiry；仍未接入企业级 OIDC/OAuth、租户目录或集中权限系统。

@@ -79,6 +79,8 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - `GET /projects/{id}/audit-logs?limit=1&since=...` 返回分页后的关键操作审计流
 - `GET /projects/{id}/token-costs?taskId=...` 返回 `totalTokens` 与 `budgetStatus`
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回 `runtime.http.v1` success 时可执行成功并采用嵌套 `usage`
+- `MULTI_AGENT_RUNTIME_HTTP_BEARER_TOKEN` 配置后，runtime provider 请求携带 `Authorization: Bearer ...`
+- `MULTI_AGENT_RUNTIME_HTTP_MAX_ATTEMPTS` 配置后，runtime provider 对 retryable 失败执行有界重试；`release-check.sh` 会验证一次 `503` 后成功恢复
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回结构化非 2xx error 时，run 失败原因包含稳定 code/status/retryable/requestId，且项目告警记录该失败
 - 配置 `MULTI_AGENT_API_TOKEN` 后，未带 token 的 API 请求返回 `401`
 - 配置 `MULTI_AGENT_API_TOKEN` 后，带 token 的 API 请求可正常创建项目并写入审计

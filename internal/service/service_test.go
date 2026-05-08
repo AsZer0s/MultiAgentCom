@@ -280,6 +280,145 @@ func TestRunUsesHTTPRuntimeProviderWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestRunUsesHTTPRuntimeProviderBearerToken(t *testing.T) {
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer runtime-secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"protocolVersion": "runtime.http.v1",
+				"error": map[string]any{
+					"code":    "UNAUTHORIZED",
+					"message": "missing bearer token",
+				},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocolVersion": "runtime.http.v1",
+			"model":           "runtime-http-v1",
+			"output":          "authorized runtime execution",
+			"usage": map[string]any{
+				"promptTokens":     5,
+				"completionTokens": 6,
+				"totalTokens":      11,
+			},
+		})
+	}))
+	defer runtimeServer.Close()
+
+	cfg := config.Config{
+		Address:                ":0",
+		ServiceName:            "test-runtime-bearer",
+		ArtifactRoot:           t.TempDir(),
+		DefaultAgent:           "go-backend-agent",
+		RuntimeProvider:        "http",
+		RuntimeEndpoint:        runtimeServer.URL,
+		RuntimeTimeout:         2 * time.Second,
+		RuntimeHTTPBearerToken: "runtime-secret",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Runtime Bearer Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo API", Content: "实现 Todo API"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s (%s)", status.Run.Status, status.Run.Error)
+	}
+	if status.Run.TotalTokens != 11 {
+		t.Fatalf("expected provider tokens, got %+v", status.Run)
+	}
+}
+
+func TestRunRetriesTransientHTTPRuntimeProviderFailure(t *testing.T) {
+	var attempts int
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"protocolVersion": "runtime.http.v1",
+				"error": map[string]any{
+					"code":      "UPSTREAM_UNAVAILABLE",
+					"message":   "temporary outage",
+					"retryable": true,
+				},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocolVersion": "runtime.http.v1",
+			"model":           "runtime-http-v1",
+			"output":          "retry recovered",
+			"usage": map[string]any{
+				"promptTokens":     8,
+				"completionTokens": 9,
+				"totalTokens":      17,
+			},
+		})
+	}))
+	defer runtimeServer.Close()
+
+	cfg := config.Config{
+		Address:                   ":0",
+		ServiceName:               "test-runtime-retry",
+		ArtifactRoot:              t.TempDir(),
+		DefaultAgent:              "go-backend-agent",
+		RuntimeProvider:           "http",
+		RuntimeEndpoint:           runtimeServer.URL,
+		RuntimeTimeout:            2 * time.Second,
+		RuntimeHTTPMaxAttempts:    2,
+		RuntimeHTTPRetryBaseDelay: time.Millisecond,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Runtime Retry Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo API", Content: "实现 Todo API"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s (%s)", status.Run.Status, status.Run.Error)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if status.Run.TotalTokens != 17 || status.Run.EstimatedCostUSD <= 0 {
+		t.Fatalf("expected retried provider usage and cost, got %+v", status.Run)
+	}
+}
+
 func TestRunUsesTotalOnlyRuntimeUsageForCost(t *testing.T) {
 	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{

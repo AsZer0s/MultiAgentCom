@@ -422,7 +422,12 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 	var runtimeInitErr error
 
 	if endpoint := strings.TrimSpace(cfg.RuntimeEndpoint); endpoint != "" {
-		if runner, err := agentruntime.NewHTTPRunner(endpoint, &http.Client{Timeout: cfg.RuntimeTimeout}); err != nil {
+		options := agentruntime.HTTPRunnerOptions{
+			BearerToken:    cfg.RuntimeHTTPBearerToken,
+			MaxAttempts:    cfg.RuntimeHTTPMaxAttempts,
+			RetryBaseDelay: cfg.RuntimeHTTPRetryBaseDelay,
+		}
+		if runner, err := agentruntime.NewHTTPRunnerWithOptions(endpoint, &http.Client{Timeout: cfg.RuntimeTimeout}, options); err != nil {
 			runtimeInitErr = fmt.Errorf("initialize http runtime runner: %w", err)
 			if logger != nil {
 				logger.Warn("failed to initialize http runtime runner", "endpoint", endpoint, "error", err)

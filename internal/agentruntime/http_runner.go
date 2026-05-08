@@ -15,11 +15,24 @@ import (
 const maxRuntimeResponseBytes = 1 << 20
 
 type HTTPRunner struct {
-	endpoint string
-	client   *http.Client
+	endpoint       string
+	client         *http.Client
+	bearerToken    string
+	maxAttempts    int
+	retryBaseDelay time.Duration
+}
+
+type HTTPRunnerOptions struct {
+	BearerToken    string
+	MaxAttempts    int
+	RetryBaseDelay time.Duration
 }
 
 func NewHTTPRunner(endpoint string, client *http.Client) (*HTTPRunner, error) {
+	return NewHTTPRunnerWithOptions(endpoint, client, HTTPRunnerOptions{})
+}
+
+func NewHTTPRunnerWithOptions(endpoint string, client *http.Client, options HTTPRunnerOptions) (*HTTPRunner, error) {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
 		return nil, fmt.Errorf("%w: endpoint", ErrProviderRequired)
@@ -27,10 +40,25 @@ func NewHTTPRunner(endpoint string, client *http.Client) (*HTTPRunner, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
+	if options.MaxAttempts == 0 {
+		options.MaxAttempts = 1
+	}
+	if options.MaxAttempts < 0 {
+		return nil, fmt.Errorf("runtime http max attempts must be positive")
+	}
+	if options.RetryBaseDelay == 0 {
+		options.RetryBaseDelay = 100 * time.Millisecond
+	}
+	if options.RetryBaseDelay < 0 {
+		return nil, fmt.Errorf("runtime http retry base delay must be positive")
+	}
 
 	return &HTTPRunner{
-		endpoint: endpoint,
-		client:   client,
+		endpoint:       endpoint,
+		client:         client,
+		bearerToken:    strings.TrimSpace(options.BearerToken),
+		maxAttempts:    options.MaxAttempts,
+		retryBaseDelay: options.RetryBaseDelay,
 	}, nil
 }
 
@@ -42,6 +70,33 @@ func (r *HTTPRunner) Run(ctx context.Context, req Request) (Response, error) {
 		defer cancel()
 	}
 
+	body, err := marshalRuntimeRequest(req)
+	if err != nil {
+		return Response{}, err
+	}
+
+	attempts := r.maxAttempts
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		decoded, err := r.runOnce(execCtx, body)
+		if err == nil {
+			return decoded, nil
+		}
+		lastErr = err
+		if attempt == attempts || !IsRetryableProviderError(err) {
+			return Response{}, err
+		}
+		if err := waitForRuntimeRetry(execCtx, r.retryBaseDelay, attempt); err != nil {
+			return Response{}, err
+		}
+	}
+	return Response{}, lastErr
+}
+
+func marshalRuntimeRequest(req Request) ([]byte, error) {
 	payload := struct {
 		ProtocolVersion string `json:"protocolVersion"`
 		ProjectID       string `json:"projectId"`
@@ -66,20 +121,26 @@ func (r *HTTPRunner) Run(ctx context.Context, req Request) (Response, error) {
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return Response{}, fmt.Errorf("marshal runtime request: %w", err)
+		return nil, fmt.Errorf("marshal runtime request: %w", err)
 	}
+	return body, nil
+}
 
-	httpReq, err := http.NewRequestWithContext(execCtx, http.MethodPost, r.endpoint, bytes.NewReader(body))
+func (r *HTTPRunner) runOnce(ctx context.Context, body []byte) (Response, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return Response{}, fmt.Errorf("create runtime request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
 	httpReq.Header.Set("X-MultiAgentCom-Runtime-Protocol", ProtocolVersion)
+	if r.bearerToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+r.bearerToken)
+	}
 
 	resp, err := r.client.Do(httpReq)
 	if err != nil {
-		return Response{}, transportProviderError(execCtx, err)
+		return Response{}, transportProviderError(ctx, err)
 	}
 	defer resp.Body.Close()
 
@@ -96,6 +157,21 @@ func (r *HTTPRunner) Run(ctx context.Context, req Request) (Response, error) {
 		return Response{}, err
 	}
 	return normalizeUsage(decoded), nil
+}
+
+func waitForRuntimeRetry(ctx context.Context, baseDelay time.Duration, attempt int) error {
+	if baseDelay <= 0 {
+		baseDelay = 100 * time.Millisecond
+	}
+	delay := baseDelay * time.Duration(attempt)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return transportProviderError(ctx, ctx.Err())
+	case <-timer.C:
+		return nil
+	}
 }
 
 func readRuntimeResponse(body io.Reader) ([]byte, error) {

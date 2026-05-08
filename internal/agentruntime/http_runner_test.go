@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -69,6 +70,160 @@ func TestHTTPRunnerRunProtocolSuccess(t *testing.T) {
 	}
 	if resp.PromptTokens != 9 || resp.CompletionTokens != 7 || resp.TotalTokens != 16 {
 		t.Fatalf("unexpected usage: %+v", resp)
+	}
+}
+
+func TestHTTPRunnerRunSendsBearerToken(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer runtime-secret" {
+			t.Fatalf("Authorization = %q, want bearer token", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocolVersion": ProtocolVersion,
+			"model":           "runtime-http-v1",
+			"output":          "authorized",
+		})
+	}))
+	defer server.Close()
+
+	runner, err := NewHTTPRunnerWithOptions(server.URL, server.Client(), HTTPRunnerOptions{BearerToken: " runtime-secret "})
+	if err != nil {
+		t.Fatalf("new http runner: %v", err)
+	}
+
+	if _, err := runner.Run(context.Background(), Request{}); err != nil {
+		t.Fatalf("run http runner: %v", err)
+	}
+}
+
+func TestHTTPRunnerRunRetriesRetryableProviderError(t *testing.T) {
+	t.Parallel()
+
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := atomic.AddInt32(&attempts, 1)
+		if attempt == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"protocolVersion": ProtocolVersion,
+				"error": map[string]any{
+					"code":      "UPSTREAM_UNAVAILABLE",
+					"message":   "temporary outage",
+					"retryable": true,
+				},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocolVersion": ProtocolVersion,
+			"model":           "runtime-http-v1",
+			"output":          "retried",
+			"usage": map[string]any{
+				"promptTokens":     3,
+				"completionTokens": 4,
+				"totalTokens":      7,
+			},
+		})
+	}))
+	defer server.Close()
+
+	runner, err := NewHTTPRunnerWithOptions(server.URL, server.Client(), HTTPRunnerOptions{MaxAttempts: 2, RetryBaseDelay: time.Millisecond})
+	if err != nil {
+		t.Fatalf("new http runner: %v", err)
+	}
+
+	resp, err := runner.Run(context.Background(), Request{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("run http runner: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if resp.Output != "retried" || resp.TotalTokens != 7 {
+		t.Fatalf("unexpected retried response: %+v", resp)
+	}
+}
+
+func TestHTTPRunnerRunDoesNotRetryNonRetryableProviderError(t *testing.T) {
+	t.Parallel()
+
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocolVersion": ProtocolVersion,
+			"error": map[string]any{
+				"code":    "BAD_REQUEST",
+				"message": "bad request",
+			},
+		})
+	}))
+	defer server.Close()
+
+	runner, err := NewHTTPRunnerWithOptions(server.URL, server.Client(), HTTPRunnerOptions{MaxAttempts: 3, RetryBaseDelay: time.Millisecond})
+	if err != nil {
+		t.Fatalf("new http runner: %v", err)
+	}
+
+	_, err = runner.Run(context.Background(), Request{})
+	if err == nil {
+		t.Fatal("expected provider error")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestHTTPRunnerRunStopsRetryWhenContextExpires(t *testing.T) {
+	t.Parallel()
+
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocolVersion": ProtocolVersion,
+			"error": map[string]any{
+				"code":      "UPSTREAM_UNAVAILABLE",
+				"message":   "temporary outage",
+				"retryable": true,
+			},
+		})
+	}))
+	defer server.Close()
+
+	runner, err := NewHTTPRunnerWithOptions(server.URL, server.Client(), HTTPRunnerOptions{MaxAttempts: 3, RetryBaseDelay: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("new http runner: %v", err)
+	}
+
+	_, err = runner.Run(context.Background(), Request{Timeout: 100 * time.Millisecond})
+	if err == nil {
+		t.Fatal("expected provider error")
+	}
+	var providerErr *ProviderError
+	if !errors.As(err, &providerErr) {
+		t.Fatalf("expected ProviderError, got %T: %v", err, err)
+	}
+	if providerErr.Code != ProviderErrorTimeout {
+		t.Fatalf("expected timeout provider error, got %+v", providerErr)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestNewHTTPRunnerWithOptionsRejectsInvalidRetryOptions(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewHTTPRunnerWithOptions("http://runtime.example", nil, HTTPRunnerOptions{MaxAttempts: -1}); err == nil {
+		t.Fatal("expected max attempts error")
+	}
+	if _, err := NewHTTPRunnerWithOptions("http://runtime.example", nil, HTTPRunnerOptions{RetryBaseDelay: -time.Millisecond}); err == nil {
+		t.Fatal("expected retry base delay error")
 	}
 }
 

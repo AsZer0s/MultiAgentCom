@@ -27,6 +27,9 @@ type Config struct {
 	RuntimeProvider            string
 	RuntimeEndpoint            string
 	RuntimeTimeout             time.Duration
+	RuntimeHTTPBearerToken     string
+	RuntimeHTTPMaxAttempts     int
+	RuntimeHTTPRetryBaseDelay  time.Duration
 	TokenPromptPricePerMillion float64
 	TokenOutputPricePerMillion float64
 	TokenBudgetWarnUSD         float64
@@ -69,6 +72,9 @@ func Load() Config {
 		RuntimeProvider:            getenv("MULTI_AGENT_RUNTIME_PROVIDER", "local"),
 		RuntimeEndpoint:            getenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", ""),
 		RuntimeTimeout:             getenvDuration("MULTI_AGENT_RUNTIME_HTTP_TIMEOUT", 30*time.Second),
+		RuntimeHTTPBearerToken:     getenv("MULTI_AGENT_RUNTIME_HTTP_BEARER_TOKEN", ""),
+		RuntimeHTTPMaxAttempts:     getenvInt("MULTI_AGENT_RUNTIME_HTTP_MAX_ATTEMPTS", 1),
+		RuntimeHTTPRetryBaseDelay:  getenvDuration("MULTI_AGENT_RUNTIME_HTTP_RETRY_BASE_DELAY", 100*time.Millisecond),
 		TokenPromptPricePerMillion: getenvFloat("MULTI_AGENT_TOKEN_PROMPT_PRICE_PER_MILLION", 1.5),
 		TokenOutputPricePerMillion: getenvFloat("MULTI_AGENT_TOKEN_OUTPUT_PRICE_PER_MILLION", 2.5),
 		TokenBudgetWarnUSD:         getenvFloat("MULTI_AGENT_TOKEN_BUDGET_WARN_USD", 0),
@@ -103,6 +109,12 @@ func WithDefaults(cfg Config) Config {
 	}
 	if cfg.RuntimeTimeout == 0 {
 		cfg.RuntimeTimeout = 30 * time.Second
+	}
+	if cfg.RuntimeHTTPMaxAttempts == 0 {
+		cfg.RuntimeHTTPMaxAttempts = 1
+	}
+	if cfg.RuntimeHTTPRetryBaseDelay == 0 {
+		cfg.RuntimeHTTPRetryBaseDelay = 100 * time.Millisecond
 	}
 	if cfg.TokenPromptPricePerMillion == 0 {
 		cfg.TokenPromptPricePerMillion = 1.5
@@ -145,6 +157,12 @@ func Validate(cfg Config) error {
 	}
 	if cfg.RuntimeTimeout <= 0 {
 		issues = append(issues, ValidationIssue{Field: "RuntimeTimeout", Message: "must be positive"})
+	}
+	if cfg.RuntimeHTTPMaxAttempts <= 0 {
+		issues = append(issues, ValidationIssue{Field: "RuntimeHTTPMaxAttempts", Message: "must be positive"})
+	}
+	if cfg.RuntimeHTTPRetryBaseDelay <= 0 {
+		issues = append(issues, ValidationIssue{Field: "RuntimeHTTPRetryBaseDelay", Message: "must be positive"})
 	}
 	if cfg.TokenPromptPricePerMillion <= 0 {
 		issues = append(issues, ValidationIssue{Field: "TokenPromptPricePerMillion", Message: "must be positive"})
@@ -250,6 +268,18 @@ func getenvFloat(key string, fallback float64) float64 {
 	}
 	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func getenvInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
 		return fallback
 	}
 	return parsed
