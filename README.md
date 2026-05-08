@@ -6,7 +6,7 @@
 
 - `GET /health`：健康检查
 - `GET /status/matrix`：查看全局或按项目过滤的状态矩阵数据
-- `GET /status/panel`：打开最小状态矩阵面板
+- `GET /status/panel`：打开 WebUI 运维 dashboard，集中查看 readiness、状态矩阵、告警、审计、通信日志、Token 成本、沙盒和快照
 - `GET /status/stream`：通过 SSE 实时推送状态事件（状态面板使用，支持轮询兜底）
 - `POST /projects`：创建项目
 - `POST /projects/{id}/requirements`：提交需求
@@ -51,7 +51,7 @@
 - 契约校验当前支持**合并前最小闸门**：可检查候选 endpoints/schemas 与契约的缺失、类型不一致、额外字段；若存在冲突，会拒绝校验并自动创建修复任务。
 - 并行调度当前支持**双 Agent + 简单 DAG**：可生成后端/前端实现任务，并在依赖满足后触发集成任务；失败任务可单独创建 retry 任务，不影响其他任务继续推进。
 - Context Engine 当前支持**按任务角色切片注入**：后端任务会拿到 API/Schema 重点，前端任务会拿到 UX/验收重点；每次生成都会记录 `version` 和 `sources`，可回查最新注入结果。
-- 状态矩阵面板当前支持**最小可视化监控**：可查看项目级任务矩阵、Agent 状态汇总，并在 `/status/panel` 中按项目过滤；状态更新采用 SSE 实时推送并提供轮询兜底。
+- WebUI 运维 dashboard 当前支持**集中可视化监控**：可在 `/status/panel` 查看 readiness、项目级任务矩阵、Agent 状态汇总、KPI、失败告警、审计轨迹、通信日志、Token 成本趋势、私有沙盒和时间线快照；状态更新采用 SSE 实时推送并提供轮询兜底。
 - 通信日志当前支持**链路可视化与分页读取**：会记录任务派发、上下文注入、运行启动、人工接管、代码锁等内部消息，并可在 `/projects/{id}/communications` 或 `/status/panel` 中按 `taskId` 过滤和高亮查看；HTTP 列表支持 `limit`、`offset`、`since`、`until`。
 - 告警基线当前支持**失败通知与分页读取**：run 失败和共享沙盒关键失败会沉淀为 `/projects/{id}/alerts` 中的告警流，并在 `/status/panel` 里直接展示；告警与审计列表均支持分页和时间过滤。
 - Token 成本监控当前支持**真实 usage 优先与预算状态**：runtime provider 返回 token usage 时优先采用真实值，否则使用估算 fallback；单价和 warn/block 预算阈值可通过环境变量配置，可通过 `/projects/{id}/token-costs` 或 `/status/panel` 查看按任务的趋势条目。
@@ -63,7 +63,7 @@
 - Preview Service 当前支持**最小可验收预览**：共享沙盒合并完成后可启动带 revision 检查的 Todo 预览页，便于验收演示。
 - 安全基线当前支持**多 token scoped auth 与审计**：除 `MULTI_AGENT_API_TOKEN` 兼容模式外，可通过 `MULTI_AGENT_AUTH_TOKENS` 或 `MULTI_AGENT_AUTH_TOKENS_FILE` 配置带 actor、roles、project scope、disabled、expiry 的 token 记录；关键操作会写入 `/projects/{id}/audit-logs` 审计流。
 - 告警通知当前支持**最小 webhook 主动推送**：设置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，run 失败和回滚事件会异步推送结构化 alert 到外部接收端。
-- 状态面板当前支持**最小运维总览**：同一页面可查看任务矩阵、失败告警、审计轨迹、通信日志和 Token 成本趋势，更新机制为 SSE + 轮询兜底。
+- 状态面板当前支持**WebUI 运维总览**：同一页面可查看 readiness、任务矩阵、失败告警、审计轨迹、通信日志、Token 成本趋势、沙盒和快照，更新机制为 SSE + 轮询兜底，并使用 DOM API 渲染接口数据以降低 XSS 风险。
 - 运维 readiness 当前支持 `GET /ready`：会检查配置有效性、auth token 配置、存储/数据目录、artifact/sandbox 根目录可写性以及 runtime provider 配置；配置无效时服务启动会 fail fast。
 
 ## 本地运行

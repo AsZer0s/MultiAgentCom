@@ -60,10 +60,15 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 
 ## Manual Verification Points
 
+- `GET /status/panel` 页面包含 `Operations Dashboard`
+- `GET /status/panel` 页面包含 `Readiness`
+- `GET /status/panel` 页面包含 `Status Matrix`
 - `GET /status/panel` 页面包含 `Agent Message Log`
 - `GET /status/panel` 页面包含 `Failure Alerts`
 - `GET /status/panel` 页面包含 `Audit Trail`
 - `GET /status/panel` 页面包含 `Token Cost Trend`
+- `GET /status/panel` 页面包含 `Sandboxes`
+- `GET /status/panel` 页面包含 `Snapshots`
 - `GET /status/stream` 可持续接收 `status` SSE 事件（断开 SSE 后可由轮询兜底刷新）
 - `GET /ready` 返回 readiness 检查结果；配置无效时应返回 `503`
 - `GET /projects/{id}/alerts?limit=1&since=...` 返回分页后的关键失败告警流

@@ -1268,11 +1268,11 @@ func renderStatusPanelHTML(serviceName string) string {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>%s Status Matrix</title>
+  <title>%s Operations Dashboard</title>
   <style>
     :root {
       --bg: #f4efe7;
-      --card: rgba(255, 252, 247, 0.92);
+      --card: rgba(255, 252, 247, 0.94);
       --line: #d6cab8;
       --ink: #1f1b16;
       --muted: #6a5d4d;
@@ -1294,43 +1294,14 @@ func renderStatusPanelHTML(serviceName string) string {
         radial-gradient(circle at bottom right, rgba(180, 35, 24, 0.08), transparent 24%%),
         linear-gradient(180deg, #fbf7f1 0%%, var(--bg) 100%%);
     }
-    .shell {
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 32px 20px 48px;
-    }
-    .hero {
-      display: grid;
-      gap: 12px;
-      margin-bottom: 24px;
-    }
-    .eyebrow {
-      font-size: 12px;
-      letter-spacing: 0.18em;
-      text-transform: uppercase;
-      color: var(--muted);
-    }
-    h1 {
-      margin: 0;
-      font-size: clamp(32px, 5vw, 52px);
-      line-height: 0.94;
-    }
-    .sub {
-      max-width: 680px;
-      color: var(--muted);
-      font-size: 16px;
-      line-height: 1.5;
-    }
-    .toolbar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      align-items: center;
-      margin: 20px 0 28px;
-    }
-    .toolbar select,
-    .toolbar input,
-    .toolbar button {
+    .shell { max-width: 1280px; margin: 0 auto; padding: 32px 20px 48px; }
+    .hero { display: grid; gap: 12px; margin-bottom: 22px; }
+    .eyebrow { font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); }
+    h1 { margin: 0; font-size: clamp(32px, 5vw, 56px); line-height: 0.94; }
+    h2, h3 { margin: 0; }
+    .sub { max-width: 760px; color: var(--muted); font-size: 16px; line-height: 1.5; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 18px 0; }
+    .toolbar select, .toolbar input, .toolbar button {
       border: 1px solid var(--line);
       border-radius: 999px;
       background: var(--card);
@@ -1338,15 +1309,9 @@ func renderStatusPanelHTML(serviceName string) string {
       padding: 10px 16px;
       font: inherit;
     }
-    .toolbar button {
-      background: var(--ink);
-      color: #fff;
-      cursor: pointer;
-    }
-    .grid {
-      display: grid;
-      gap: 18px;
-    }
+    .toolbar button { background: var(--ink); color: #fff; cursor: pointer; }
+    .dashboard-grid { display: grid; gap: 18px; }
+    .two-col { display: grid; gap: 18px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .panel {
       background: var(--card);
       backdrop-filter: blur(14px);
@@ -1354,20 +1319,12 @@ func renderStatusPanelHTML(serviceName string) string {
       border-radius: 24px;
       box-shadow: 0 18px 60px rgba(31, 27, 22, 0.08);
       padding: 20px;
+      min-width: 0;
     }
-    .project-head {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 14px;
-    }
-    .meta {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .pill {
+    .project-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .meta, .kpi-grid, .check-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+    .kpi-grid { margin: 12px 0 2px; }
+    .pill, .kpi, .check {
       border-radius: 999px;
       padding: 6px 10px;
       background: #fff;
@@ -1375,173 +1332,107 @@ func renderStatusPanelHTML(serviceName string) string {
       font-size: 12px;
       color: var(--muted);
     }
-    .status {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      font-weight: 600;
-    }
-    .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-    }
-    .RUNNING .dot { background: var(--accent); }
-    .READY .dot { background: var(--warn); }
-    .BLOCKED .dot { background: var(--bad); }
-    .HUMAN_OVERRIDE .dot { background: var(--hold); }
-    .COMPLETED .dot { background: var(--ok); }
-    .IDLE .dot { background: var(--idle); }
-    table {
-      width: 100%%;
-      border-collapse: collapse;
-      margin-top: 12px;
-    }
-    th, td {
-      text-align: left;
-      padding: 12px 10px;
-      border-top: 1px solid rgba(214, 202, 184, 0.7);
-      vertical-align: top;
-      font-size: 14px;
-    }
-    th {
-      color: var(--muted);
-      font-weight: 600;
-    }
-    .task-meta {
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 12px;
-      word-break: break-all;
-    }
-    .task-row.highlight td {
-      background: var(--accent-soft);
-    }
-    .trend-list {
-      display: grid;
-      gap: 12px;
-      margin-top: 12px;
-    }
-    .alert-list {
-      display: grid;
-      gap: 12px;
-      margin-top: 12px;
-    }
-    .audit-list {
-      display: grid;
-      gap: 12px;
-      margin-top: 12px;
-    }
-    .audit-item {
+    .kpi { display: grid; gap: 2px; min-width: 118px; border-radius: 18px; padding: 12px 14px; }
+    .kpi strong { color: var(--ink); font-size: 22px; }
+    .check.ok { border-color: rgba(15, 139, 76, 0.35); color: var(--ok); }
+    .check.failed { border-color: rgba(180, 35, 24, 0.35); color: var(--bad); }
+    .status { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; }
+    .dot { width: 10px; height: 10px; border-radius: 999px; background: var(--idle); }
+    .status.RUNNING .dot, .status.ACTIVE .dot, .status.SUCCEEDED .dot { background: var(--accent); }
+    .status.READY .dot, .status.PENDING .dot, .status.RELEASED .dot { background: var(--warn); }
+    .status.BLOCKED .dot, .status.FAILED .dot, .status.ERROR .dot, .status.CRITICAL .dot { background: var(--bad); }
+    .status.HUMAN_OVERRIDE .dot { background: var(--hold); }
+    .status.COMPLETED .dot, .status.DONE .dot, .status.OK .dot { background: var(--ok); }
+    table { width: 100%%; border-collapse: collapse; margin-top: 12px; }
+    th, td { text-align: left; padding: 12px 10px; border-top: 1px solid rgba(214, 202, 184, 0.7); vertical-align: top; font-size: 14px; }
+    th { color: var(--muted); font-weight: 600; }
+    .task-meta { margin-top: 4px; color: var(--muted); font-size: 12px; word-break: break-all; }
+    .task-row.highlight td, .item.highlight { background: var(--accent-soft); }
+    .item-list { display: grid; gap: 12px; margin-top: 12px; }
+    .item {
       border: 1px solid rgba(214, 202, 184, 0.7);
       border-radius: 18px;
       padding: 12px 14px;
       background: rgba(255,255,255,0.6);
     }
-    .alert-item {
-      border: 1px solid rgba(214, 202, 184, 0.7);
-      border-radius: 18px;
-      padding: 12px 14px;
-      background: rgba(255,255,255,0.6);
-    }
-    .alert-item.CRITICAL {
-      border-color: rgba(180, 35, 24, 0.45);
-      box-shadow: inset 0 0 0 1px rgba(180, 35, 24, 0.12);
-    }
-    .alert-item.ERROR {
-      border-color: rgba(183, 121, 31, 0.45);
-      box-shadow: inset 0 0 0 1px rgba(183, 121, 31, 0.12);
-    }
-    .trend-row {
-      border: 1px solid rgba(214, 202, 184, 0.7);
-      border-radius: 18px;
-      padding: 12px 14px;
-      background: rgba(255,255,255,0.6);
-    }
-    .trend-row.highlight {
-      border-color: rgba(22, 93, 255, 0.4);
-      box-shadow: inset 0 0 0 1px rgba(22, 93, 255, 0.16);
-    }
-    .trend-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: baseline;
-      margin-bottom: 8px;
-    }
-    .trend-head strong {
-      display: block;
-    }
-    .bar-track {
-      width: 100%%;
-      height: 10px;
-      border-radius: 999px;
-      background: rgba(22, 93, 255, 0.12);
-      overflow: hidden;
-    }
-    .bar-fill {
-      height: 100%%;
-      border-radius: 999px;
-      background: linear-gradient(90deg, #165dff 0%%, #0f8b4c 100%%);
-    }
-    .statline {
-      margin-top: 8px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .empty {
-      padding: 28px;
-      border: 1px dashed var(--line);
-      border-radius: 20px;
-      color: var(--muted);
-      text-align: center;
-      background: rgba(255,255,255,0.5);
-    }
-    .foot {
-      margin-top: 18px;
-      color: var(--muted);
-      font-size: 12px;
-    }
+    .item.CRITICAL, .item.FAILED { border-color: rgba(180, 35, 24, 0.45); box-shadow: inset 0 0 0 1px rgba(180, 35, 24, 0.12); }
+    .item.ERROR, .item.WARN { border-color: rgba(183, 121, 31, 0.45); box-shadow: inset 0 0 0 1px rgba(183, 121, 31, 0.12); }
+    .trend-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 8px; }
+    .trend-head strong { display: block; }
+    .bar-track { width: 100%%; height: 10px; border-radius: 999px; background: rgba(22, 93, 255, 0.12); overflow: hidden; }
+    .bar-fill { height: 100%%; border-radius: 999px; background: linear-gradient(90deg, #165dff 0%%, #0f8b4c 100%%); }
+    .statline { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .empty { padding: 28px; border: 1px dashed var(--line); border-radius: 20px; color: var(--muted); text-align: center; background: rgba(255,255,255,0.5); }
+    .error { color: var(--bad); }
+    @media (max-width: 920px) { .two-col { grid-template-columns: 1fr; } }
     @media (max-width: 760px) {
       .panel { padding: 16px; }
-      th:nth-child(3), td:nth-child(3),
-      th:nth-child(5), td:nth-child(5) { display: none; }
+      th:nth-child(3), td:nth-child(3), th:nth-child(5), td:nth-child(5) { display: none; }
     }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <div class="hero">
+  <main class="shell">
+    <section class="hero">
       <div class="eyebrow">Operational View</div>
-      <h1>Status Matrix</h1>
-      <div class="sub">查看每个项目下任务和 Agent 的当前状态。这个最小版面板支持 SSE 实时推送并保留轮询兜底，适合演示 MVP 阶段协同编排进度。</div>
-    </div>
-    <div class="toolbar">
+      <h1>Operations Dashboard</h1>
+      <div class="sub">集中查看 readiness、Status Matrix、Failure Alerts、Audit Trail、Agent Message Log、Token Cost Trend、Sandboxes 和 Snapshots。页面复用现有 JSON/SSE API，并在 SSE 中断时保留轮询兜底。</div>
+    </section>
+
+    <section id="readinessPanel" class="panel"></section>
+
+    <div class="toolbar" aria-label="Project and task controls">
       <select id="projectFilter"></select>
       <input id="taskLogFilter" type="text" placeholder="Filter communications by taskId">
+      <select id="logLimit">
+        <option value="10">10 logs</option>
+        <option value="25" selected>25 logs</option>
+        <option value="50">50 logs</option>
+        <option value="100">100 logs</option>
+      </select>
       <button id="refreshBtn" type="button">Refresh Now</button>
       <div id="generatedAt" class="pill">loading...</div>
+      <div id="streamState" class="pill">SSE connecting</div>
     </div>
-    <div id="app" class="grid"></div>
-    <div id="alertPanel" class="panel" style="margin-top:18px;"></div>
-    <div id="auditPanel" class="panel" style="margin-top:18px;"></div>
-    <div id="commPanel" class="panel" style="margin-top:18px;"></div>
-    <div id="costPanel" class="panel" style="margin-top:18px;"></div>
-  </div>
+
+    <section id="kpiPanel" class="panel"></section>
+    <div class="dashboard-grid">
+      <section id="matrixPanel" class="panel"></section>
+      <div class="two-col">
+        <section id="alertPanel" class="panel"></section>
+        <section id="auditPanel" class="panel"></section>
+      </div>
+      <section id="commPanel" class="panel"></section>
+      <section id="costPanel" class="panel"></section>
+      <div class="two-col">
+        <section id="sandboxPanel" class="panel"></section>
+        <section id="snapshotPanel" class="panel"></section>
+      </div>
+    </div>
+  </main>
   <script>
     const authQuery = new URLSearchParams(window.location.search).get("token");
     const filter = document.getElementById("projectFilter");
     const taskLogFilter = document.getElementById("taskLogFilter");
+    const logLimit = document.getElementById("logLimit");
     const refreshBtn = document.getElementById("refreshBtn");
-    const app = document.getElementById("app");
+    const readinessPanel = document.getElementById("readinessPanel");
+    const kpiPanel = document.getElementById("kpiPanel");
+    const matrixPanel = document.getElementById("matrixPanel");
     const generatedAt = document.getElementById("generatedAt");
+    const streamState = document.getElementById("streamState");
     const alertPanel = document.getElementById("alertPanel");
     const auditPanel = document.getElementById("auditPanel");
     const commPanel = document.getElementById("commPanel");
     const costPanel = document.getElementById("costPanel");
+    const sandboxPanel = document.getElementById("sandboxPanel");
+    const snapshotPanel = document.getElementById("snapshotPanel");
 
-    function statusBadge(status) {
-      return '<span class="status ' + status + '"><span class="dot"></span>' + status + '</span>';
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined && text !== null) node.textContent = String(text);
+      return node;
     }
 
     function withAuth(path) {
@@ -1549,215 +1440,374 @@ func renderStatusPanelHTML(serviceName string) string {
       return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(authQuery);
     }
 
-    function renderMatrix(view) {
-      const selected = view.selectedProjectId || "";
-      const selectedTaskId = taskLogFilter.value.trim();
-      const options = ['<option value="">All Projects</option>']
-        .concat((view.projects || []).map(project =>
-          '<option value="' + project.id + '"' + (project.id === selected ? ' selected' : '') + '>' + project.name + '</option>'
-        ));
-      filter.innerHTML = options.join("");
-      generatedAt.textContent = view.generatedAt ? 'Generated at ' + new Date(view.generatedAt).toLocaleString() : 'No data';
-
-      if (!view.matrices || view.matrices.length === 0) {
-        app.innerHTML = '<div class="empty">还没有可展示的项目状态。先创建项目并派发任务，再回来查看。</div>';
-        return;
-      }
-
-      app.innerHTML = view.matrices.map(function(matrix) {
-        const project = matrix.project;
-        const agentRows = (matrix.agentMatrix || []).map(function(agent) {
-          return '<tr>'
-            + '<td>' + agent.agent + '</td>'
-            + '<td>' + statusBadge(agent.status) + '</td>'
-            + '<td>' + agent.totalTasks + '</td>'
-            + '<td>' + agent.runningTasks + '</td>'
-            + '<td>' + agent.doneTasks + '</td>'
-            + '<td>' + agent.failedTasks + '</td>'
-            + '</tr>';
-        }).join("");
-
-        const taskRows = (matrix.taskMatrix || []).map(function(task) {
-          const rowClass = selectedTaskId && task.id === selectedTaskId ? ' class="task-row highlight"' : ' class="task-row"';
-          return '<tr' + rowClass + '>'
-            + '<td>' + task.name + '<div class="task-meta">' + task.id + '</div></td>'
-            + '<td>' + (task.assigneeAgent || '-') + '</td>'
-            + '<td>' + task.type + '</td>'
-            + '<td>' + task.status + '</td>'
-            + '<td>' + (task.latestRunStatus || '-') + '</td>'
-            + '<td>' + ((task.dependsOn || []).join(', ') || '-') + '</td>'
-            + '</tr>';
-        }).join("");
-
-        return '<section class="panel">'
-          + '<div class="project-head">'
-          +   '<div>'
-          +     '<div class="eyebrow">Project</div>'
-          +     '<h2 style="margin:6px 0 0;">' + project.name + '</h2>'
-          +   '</div>'
-          +   '<div class="meta">'
-          +     '<span class="pill">Ready ' + matrix.readyTasks + '</span>'
-          +     '<span class="pill">Running ' + matrix.runningTasks + '</span>'
-          +     '<span class="pill">Done ' + matrix.completedTasks + '</span>'
-          +     '<span class="pill">Failed ' + matrix.failedTasks + '</span>'
-          +   '</div>'
-          + '</div>'
-          + '<table>'
-          +   '<thead><tr><th>Agent</th><th>Status</th><th>Total</th><th>Running</th><th>Done</th><th>Failed</th></tr></thead>'
-          +   '<tbody>' + (agentRows || '<tr><td colspan="6">No agents</td></tr>') + '</tbody>'
-          + '</table>'
-          + '<table>'
-          +   '<thead><tr><th>Task</th><th>Agent</th><th>Type</th><th>Status</th><th>Latest Run</th><th>Depends On</th></tr></thead>'
-          +   '<tbody>' + (taskRows || '<tr><td colspan="6">No tasks</td></tr>') + '</tbody>'
-          + '</table>'
-          + '</section>';
-      }).join("");
+    function statusClass(value) {
+      const allowed = new Set(['RUNNING', 'READY', 'BLOCKED', 'HUMAN_OVERRIDE', 'COMPLETED', 'DONE', 'IDLE', 'CREATED', 'IN_PROGRESS', 'FAILED', 'PENDING', 'SUCCEEDED', 'ACTIVE', 'RELEASED', 'OK', 'ERROR', 'CRITICAL']);
+      const normalized = String(value || 'IDLE').toUpperCase().replace(/[^A-Z_]/g, '_');
+      return allowed.has(normalized) ? normalized : 'IDLE';
     }
 
-    function renderCommunications(projectId, payload) {
-      if (!projectId) {
-        commPanel.innerHTML = '<div class="empty">选择一个项目后可查看内部通信日志。</div>';
+    function statusBadge(status) {
+      const normalized = statusClass(status);
+      const badge = el('span', 'status ' + normalized);
+      badge.appendChild(el('span', 'dot'));
+      badge.appendChild(document.createTextNode(status || 'IDLE'));
+      return badge;
+    }
+
+    function pill(text) {
+      return el('span', 'pill', text);
+    }
+
+    function empty(text) {
+      return el('div', 'empty', text);
+    }
+
+    function panelHead(eyebrow, title, pills) {
+      const head = el('div', 'project-head');
+      const titleWrap = el('div');
+      titleWrap.appendChild(el('div', 'eyebrow', eyebrow));
+      titleWrap.appendChild(el('h2', '', title));
+      const meta = el('div', 'meta');
+      (pills || []).forEach((entry) => meta.appendChild(pill(entry)));
+      head.appendChild(titleWrap);
+      head.appendChild(meta);
+      return head;
+    }
+
+    function renderError(panel, title, err) {
+      panel.replaceChildren(panelHead('Error', title, []), el('div', 'empty error', err.message || String(err)));
+    }
+
+    async function fetchJSON(path) {
+      const response = await fetch(withAuth(path), { headers: { 'Accept': 'application/json' } });
+      if (!response.ok) throw new Error(path + ' returned ' + response.status);
+      return response.json();
+    }
+
+    function formatTime(value) {
+      if (!value) return '-';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      return date.toLocaleString();
+    }
+
+    function renderReadiness(data) {
+      const checks = el('div', 'check-grid');
+      (data.checks || []).forEach((check) => {
+        const item = el('span', 'check ' + (check.status === 'ok' ? 'ok' : 'failed'), check.name + ': ' + check.status);
+        if (check.message) item.title = check.message;
+        checks.appendChild(item);
+      });
+      readinessPanel.replaceChildren(
+        panelHead('Readiness', 'Readiness', [data.service || '%s', data.status || 'unknown', 'Last refresh ' + formatTime(data.timestamp)]),
+        checks
+      );
+    }
+
+    function renderProjectOptions(view) {
+      const selected = view.selectedProjectId || filter.value || '';
+      const options = [el('option', '', 'All Projects')];
+      options[0].value = '';
+      (view.projects || []).forEach((project) => {
+        const option = el('option', '', project.name || project.id);
+        option.value = project.id || '';
+        option.selected = option.value === selected;
+        options.push(option);
+      });
+      filter.replaceChildren(...options);
+      filter.value = selected;
+    }
+
+    function renderKPIs(view, costData) {
+      const matrices = view.matrices || [];
+      const totals = matrices.reduce((acc, matrix) => {
+        acc.tasks += matrix.totalTasks || 0;
+        acc.ready += matrix.readyTasks || 0;
+        acc.running += matrix.runningTasks || 0;
+        acc.override += matrix.overrideTasks || 0;
+        acc.completed += matrix.completedTasks || 0;
+        acc.failed += matrix.failedTasks || 0;
+        return acc;
+      }, { tasks: 0, ready: 0, running: 0, override: 0, completed: 0, failed: 0 });
+      const grid = el('div', 'kpi-grid');
+      [
+        ['Projects', (view.projects || []).length],
+        ['Tasks', totals.tasks],
+        ['Ready', totals.ready],
+        ['Running', totals.running],
+        ['Completed', totals.completed],
+        ['Failed', totals.failed],
+        ['Human Override', totals.override],
+        ['Budget', costData ? (costData.budgetStatus || 'ok') : '-']
+      ].forEach(([label, value]) => {
+        const card = el('div', 'kpi');
+        card.appendChild(el('span', '', label));
+        card.appendChild(el('strong', '', value));
+        grid.appendChild(card);
+      });
+      kpiPanel.replaceChildren(panelHead('Summary', 'KPI Cards', []), grid);
+    }
+
+    function renderMatrix(view) {
+      renderProjectOptions(view);
+      generatedAt.textContent = view.generatedAt ? 'Generated at ' + formatTime(view.generatedAt) : 'No data';
+      const matrices = view.matrices || [];
+      if (!matrices.length) {
+        matrixPanel.replaceChildren(panelHead('Status Matrix', 'Status Matrix', []), empty('还没有可展示的项目状态。先创建项目并派发任务，再回来查看。'));
         return;
       }
 
-      const rows = (payload.items || []).map(function(item) {
-        return '<tr>'
-          + '<td>' + item.version + '</td>'
-          + '<td>' + item.from + '</td>'
-          + '<td>' + item.to + '</td>'
-          + '<td>' + item.type + '</td>'
-          + '<td>' + item.taskId + '</td>'
-          + '<td>' + item.checksum + '</td>'
-          + '</tr>';
-      }).join("");
+      const content = el('div', 'dashboard-grid');
+      const selectedTaskId = taskLogFilter.value.trim();
+      matrices.forEach((matrix) => {
+        const project = matrix.project || {};
+        const section = el('section', 'item');
+        section.appendChild(panelHead('Project', project.name || project.id || '-', [
+          'Ready ' + (matrix.readyTasks || 0),
+          'Running ' + (matrix.runningTasks || 0),
+          'Done ' + (matrix.completedTasks || 0),
+          'Failed ' + (matrix.failedTasks || 0)
+        ]));
 
-      commPanel.innerHTML = '<div class="project-head">'
-        + '<div><div class="eyebrow">Communications</div><h2 style="margin:6px 0 0;">Agent Message Log</h2></div>'
-        + '<div class="meta"><span class="pill">Project ' + projectId + '</span><span class="pill">Count ' + (payload.count || 0) + '</span>' + (taskLogFilter.value.trim() ? ('<span class="pill">Task ' + taskLogFilter.value.trim() + '</span>') : '') + '</div>'
-        + '</div>'
-        + '<table>'
-        + '<thead><tr><th>Version</th><th>From</th><th>To</th><th>Type</th><th>Task</th><th>Checksum</th></tr></thead>'
-        + '<tbody>' + (rows || '<tr><td colspan="6">No communication log entries</td></tr>') + '</tbody>'
-        + '</table>';
+        const agentTable = table(['Agent', 'Status', 'Total', 'Running', 'Done', 'Failed']);
+        const agentBody = agentTable.querySelector('tbody');
+        (matrix.agentMatrix || []).forEach((agent) => {
+          const row = el('tr');
+          appendCells(row, [agent.agent || '-', statusBadge(agent.status), agent.totalTasks || 0, agent.runningTasks || 0, agent.doneTasks || 0, agent.failedTasks || 0]);
+          agentBody.appendChild(row);
+        });
+        if (!(matrix.agentMatrix || []).length) appendEmptyRow(agentBody, 6, 'No agents');
+        section.appendChild(agentTable);
+
+        const taskTable = table(['Task', 'Agent', 'Type', 'Status', 'Latest Run', 'Depends On']);
+        const taskBody = taskTable.querySelector('tbody');
+        (matrix.taskMatrix || []).forEach((task) => {
+          const row = el('tr', selectedTaskId && task.id === selectedTaskId ? 'task-row highlight' : 'task-row');
+          const taskCell = el('td');
+          taskCell.appendChild(el('strong', '', task.name || '-'));
+          taskCell.appendChild(el('div', 'task-meta', task.id || '-'));
+          appendCells(row, [taskCell, task.assigneeAgent || '-', task.type || '-', task.status || '-', task.latestRunStatus || '-', (task.dependsOn || []).join(', ') || '-']);
+          taskBody.appendChild(row);
+        });
+        if (!(matrix.taskMatrix || []).length) appendEmptyRow(taskBody, 6, 'No tasks');
+        section.appendChild(taskTable);
+        content.appendChild(section);
+      });
+      matrixPanel.replaceChildren(panelHead('Status Matrix', 'Agent and Task Matrix', []), content);
+    }
+
+    function table(headers) {
+      const node = el('table');
+      const thead = el('thead');
+      const headRow = el('tr');
+      headers.forEach((header) => headRow.appendChild(el('th', '', header)));
+      thead.appendChild(headRow);
+      node.appendChild(thead);
+      node.appendChild(el('tbody'));
+      return node;
+    }
+
+    function appendCells(row, cells) {
+      cells.forEach((value) => {
+        if (value instanceof Node) {
+          row.appendChild(value.tagName === 'TD' ? value : wrapCell(value));
+          return;
+        }
+        row.appendChild(el('td', '', value));
+      });
+    }
+
+    function wrapCell(node) {
+      const cell = el('td');
+      cell.appendChild(node);
+      return cell;
+    }
+
+    function appendEmptyRow(body, span, text) {
+      const row = el('tr');
+      const cell = el('td', '', text);
+      cell.colSpan = span;
+      row.appendChild(cell);
+      body.appendChild(row);
     }
 
     function renderAlerts(projectId, payload) {
       if (!projectId) {
-        alertPanel.innerHTML = '<div class="empty">选择一个项目后可查看失败告警。</div>';
+        alertPanel.replaceChildren(panelHead('Alerts', 'Failure Alerts', []), empty('选择一个项目后可查看失败告警。'));
         return;
       }
-
-      const rows = (payload.items || []).map(function(item) {
-        return '<div class="alert-item ' + item.severity + '">'
-          + '<div class="trend-head"><div><strong>' + item.type + '</strong><div class="task-meta">' + item.resourceId + '</div></div><strong>' + item.severity + '</strong></div>'
-          + '<div class="statline">' + item.message + '</div>'
-          + '</div>';
-      }).join("");
-
-      alertPanel.innerHTML = '<div class="project-head">'
-        + '<div><div class="eyebrow">Alerts</div><h2 style="margin:6px 0 0;">Failure Alerts</h2></div>'
-        + '<div class="meta"><span class="pill">Project ' + projectId + '</span><span class="pill">Count ' + (payload.count || 0) + '</span></div>'
-        + '</div>'
-        + ((payload.items || []).length ? ('<div class="alert-list">' + rows + '</div>') : '<div class="empty">No active alerts</div>');
+      const list = el('div', 'item-list');
+      (payload.items || []).forEach((item) => {
+        const entry = el('div', 'item ' + statusClass(item.severity));
+        entry.appendChild(panelHead(item.severity || 'Alert', item.type || '-', [item.resourceId || '-', formatTime(item.timestamp)]));
+        entry.appendChild(el('div', 'statline', item.message || '-'));
+        list.appendChild(entry);
+      });
+      alertPanel.replaceChildren(panelHead('Alerts', 'Failure Alerts', ['Project ' + projectId, 'Count ' + (payload.count || 0)]), list.childElementCount ? list : empty('No active alerts'));
     }
 
     function renderAuditLogs(projectId, payload) {
       if (!projectId) {
-        auditPanel.innerHTML = '<div class="empty">选择一个项目后可查看关键操作审计。</div>';
+        auditPanel.replaceChildren(panelHead('Audit', 'Audit Trail', []), empty('选择一个项目后可查看关键操作审计。'));
         return;
       }
+      const list = el('div', 'item-list');
+      (payload.items || []).forEach((item) => {
+        const entry = el('div', 'item');
+        entry.appendChild(panelHead(item.actor || 'actor', item.action || '-', [item.resourceType || '-', item.resourceId || '-', formatTime(item.timestamp)]));
+        entry.appendChild(el('div', 'statline', item.summary || '-'));
+        list.appendChild(entry);
+      });
+      auditPanel.replaceChildren(panelHead('Audit', 'Audit Trail', ['Project ' + projectId, 'Count ' + (payload.count || 0)]), list.childElementCount ? list : empty('No audit events recorded'));
+    }
 
-      const rows = (payload.items || []).map(function(item) {
-        return '<div class="audit-item">'
-          + '<div class="trend-head"><div><strong>' + item.action + '</strong><div class="task-meta">' + item.resourceType + ' · ' + item.resourceId + '</div></div><strong>' + item.actor + '</strong></div>'
-          + '<div class="statline">' + item.summary + '</div>'
-          + '</div>';
-      }).join("");
-
-      auditPanel.innerHTML = '<div class="project-head">'
-        + '<div><div class="eyebrow">Audit</div><h2 style="margin:6px 0 0;">Audit Trail</h2></div>'
-        + '<div class="meta"><span class="pill">Project ' + projectId + '</span><span class="pill">Count ' + (payload.count || 0) + '</span></div>'
-        + '</div>'
-        + ((payload.items || []).length ? ('<div class="audit-list">' + rows + '</div>') : '<div class="empty">No audit events recorded</div>');
+    function renderCommunications(projectId, payload) {
+      if (!projectId) {
+        commPanel.replaceChildren(panelHead('Communications', 'Agent Message Log', []), empty('选择一个项目后可查看内部通信日志。'));
+        return;
+      }
+      const tableNode = table(['Version', 'From', 'To', 'Type', 'Task', 'Checksum', 'Timestamp']);
+      const body = tableNode.querySelector('tbody');
+      (payload.items || []).forEach((item) => {
+        const row = el('tr', taskLogFilter.value.trim() && item.taskId === taskLogFilter.value.trim() ? 'task-row highlight' : 'task-row');
+        appendCells(row, [item.version || '-', item.from || '-', item.to || '-', item.type || '-', item.taskId || '-', item.checksum || '-', formatTime(item.timestamp)]);
+        body.appendChild(row);
+      });
+      if (!(payload.items || []).length) appendEmptyRow(body, 7, 'No communication log entries');
+      const pills = ['Project ' + projectId, 'Count ' + (payload.count || 0), 'Limit ' + logLimit.value];
+      if (taskLogFilter.value.trim()) pills.push('Task ' + taskLogFilter.value.trim());
+      commPanel.replaceChildren(panelHead('Communications', 'Agent Message Log', pills), tableNode);
     }
 
     function renderCosts(projectId, payload) {
       if (!projectId) {
-        costPanel.innerHTML = '<div class="empty">选择一个项目后可查看 Token 与成本趋势。</div>';
+        costPanel.replaceChildren(panelHead('Token Cost', 'Token Cost Trend', []), empty('选择一个项目后可查看 Token 与成本趋势。'));
         return;
       }
-
       const maxTokens = Math.max(payload.maxTokens || 0, 1);
-      const rows = (payload.points || []).map(function(item) {
-        const width = Math.max(8, Math.round((item.totalTokens / maxTokens) * 100));
-        const highlight = taskLogFilter.value.trim() && item.taskId === taskLogFilter.value.trim() ? ' highlight' : '';
-        return '<div class="trend-row' + highlight + '">'
-          + '<div class="trend-head"><div><strong>' + item.taskName + '</strong><div class="task-meta">' + item.taskId + ' · ' + item.agentType + '</div></div><strong>' + item.totalTokens + ' tok</strong></div>'
-          + '<div class="bar-track"><div class="bar-fill" style="width:' + width + '%%;"></div></div>'
-          + '<div class="statline">Prompt ' + item.promptTokens + ' · Completion ' + item.completionTokens + ' · Cost $' + Number(item.estimatedCostUsd || 0).toFixed(4) + '</div>'
-          + '</div>';
-      }).join("");
-
-      costPanel.innerHTML = '<div class="project-head">'
-        + '<div><div class="eyebrow">Token Cost</div><h2 style="margin:6px 0 0;">Token Cost Trend</h2></div>'
-        + '<div class="meta"><span class="pill">Project ' + projectId + '</span><span class="pill">Total ' + (payload.totalTokens || 0) + ' tok</span><span class="pill">Cost $' + Number(payload.estimatedCostUsd || 0).toFixed(4) + '</span></div>'
-        + '</div>'
-        + ((payload.points || []).length ? ('<div class="trend-list">' + rows + '</div>') : '<div class="empty">No token usage recorded yet</div>');
+      const list = el('div', 'item-list');
+      (payload.points || []).forEach((item) => {
+        const width = Math.max(8, Math.min(100, Math.round(((item.totalTokens || 0) / maxTokens) * 100)));
+        const entry = el('div', taskLogFilter.value.trim() && item.taskId === taskLogFilter.value.trim() ? 'item highlight' : 'item');
+        entry.appendChild(panelHead(item.status || 'Run', item.taskName || item.taskId || '-', [item.agentType || '-', String(item.totalTokens || 0) + ' tok', '$' + Number(item.estimatedCostUsd || 0).toFixed(4)]));
+        const track = el('div', 'bar-track');
+        const fill = el('div', 'bar-fill');
+        fill.style.width = width + '%%';
+        track.appendChild(fill);
+        entry.appendChild(track);
+        entry.appendChild(el('div', 'statline', 'Prompt ' + (item.promptTokens || 0) + ' · Completion ' + (item.completionTokens || 0) + ' · Run ' + (item.runId || '-') + ' · ' + formatTime(item.timestamp)));
+        list.appendChild(entry);
+      });
+      const pills = ['Project ' + projectId, 'Total ' + (payload.totalTokens || 0) + ' tok', 'Cost $' + Number(payload.estimatedCostUsd || 0).toFixed(4), 'Budget ' + (payload.budgetStatus || 'ok')];
+      if (payload.budgetWarnUsd) pills.push('Warn $' + Number(payload.budgetWarnUsd).toFixed(2));
+      if (payload.budgetBlockUsd) pills.push('Block $' + Number(payload.budgetBlockUsd).toFixed(2));
+      costPanel.replaceChildren(panelHead('Token Cost', 'Token Cost Trend', pills), list.childElementCount ? list : empty('No token usage recorded yet'));
     }
 
-    async function load() {
-      const value = filter.value ? '?projectId=' + encodeURIComponent(filter.value) : '';
-      const response = await fetch(withAuth('/status/matrix' + value), { headers: { 'Accept': 'application/json' } });
-      const data = await response.json();
-      renderMatrix(data);
+    function renderSandboxes(projectId, payload) {
+      if (!projectId) {
+        sandboxPanel.replaceChildren(panelHead('Runtime', 'Sandboxes', []), empty('选择一个项目后可查看私有沙盒。'));
+        return;
+      }
+      const list = el('div', 'item-list');
+      (payload.items || []).forEach((item) => {
+        const sandbox = item.sandbox || {};
+        const task = item.task || {};
+        const entry = el('div', 'item ' + statusClass(sandbox.status));
+        entry.appendChild(panelHead(sandbox.scope || 'Sandbox', sandbox.id || '-', [sandbox.status || '-', sandbox.agentType || '-', task.name || sandbox.taskId || '-']));
+        entry.appendChild(el('div', 'statline', 'Run ' + (sandbox.runId || '-') + ' · Task ' + (sandbox.taskId || '-') + ' · Updated ' + formatTime(sandbox.updatedAt)));
+        if (sandbox.failureReason) entry.appendChild(el('div', 'statline error', sandbox.failureReason));
+        list.appendChild(entry);
+      });
+      sandboxPanel.replaceChildren(panelHead('Runtime', 'Sandboxes', ['Project ' + projectId, 'Count ' + (payload.count || 0)]), list.childElementCount ? list : empty('No sandboxes recorded'));
+    }
 
-      const projectId = filter.value || '';
+    function renderSnapshots(projectId, payload) {
+      if (!projectId) {
+        snapshotPanel.replaceChildren(panelHead('Timeline', 'Snapshots', []), empty('选择一个项目后可查看时间线快照。'));
+        return;
+      }
+      const list = el('div', 'item-list');
+      (payload.items || []).forEach((item) => {
+        const entry = el('div', item.stable ? 'item OK' : 'item');
+        entry.appendChild(panelHead(item.branch || 'branch', item.id || '-', [item.stable ? 'stable' : 'unstable', item.checksum ? 'checksum present' : 'no checksum', formatTime(item.createdAt)]));
+        entry.appendChild(el('div', 'statline', (item.reason || '-') + ' · Source ' + (item.sourceSnapshotId || '-')));
+        list.appendChild(entry);
+      });
+      snapshotPanel.replaceChildren(panelHead('Timeline', 'Snapshots', ['Project ' + projectId, 'Count ' + (payload.count || 0)]), list.childElementCount ? list : empty('No snapshots recorded'));
+    }
+
+    async function loadProjectPanels(projectId) {
       if (!projectId) {
         renderAlerts('', { items: [], count: 0 });
         renderAuditLogs('', { items: [], count: 0 });
         renderCommunications('', { items: [], count: 0 });
         renderCosts('', { points: [], totalTokens: 0, estimatedCostUsd: 0, maxTokens: 0 });
-        return;
+        renderSandboxes('', { items: [], count: 0 });
+        renderSnapshots('', { items: [], count: 0 });
+        return null;
       }
       const taskId = taskLogFilter.value.trim();
-      const alertURL = '/projects/' + encodeURIComponent(projectId) + '/alerts';
-      const alertResponse = await fetch(withAuth(alertURL), { headers: { 'Accept': 'application/json' } });
-      const alertData = await alertResponse.json();
-      renderAlerts(projectId, alertData);
-
-      const auditURL = '/projects/' + encodeURIComponent(projectId) + '/audit-logs';
-      const auditResponse = await fetch(withAuth(auditURL), { headers: { 'Accept': 'application/json' } });
-      const auditData = await auditResponse.json();
-      renderAuditLogs(projectId, auditData);
-
-      const commURL = '/projects/' + encodeURIComponent(projectId) + '/communications' + (taskId ? ('?taskId=' + encodeURIComponent(taskId)) : '');
-      const commResponse = await fetch(withAuth(commURL), { headers: { 'Accept': 'application/json' } });
-      const commData = await commResponse.json();
-      renderCommunications(projectId, commData);
-
-      const costURL = '/projects/' + encodeURIComponent(projectId) + '/token-costs' + (taskId ? ('?taskId=' + encodeURIComponent(taskId)) : '');
-      const costResponse = await fetch(withAuth(costURL), { headers: { 'Accept': 'application/json' } });
-      const costData = await costResponse.json();
-      renderCosts(projectId, costData);
+      const limit = encodeURIComponent(logLimit.value || '25');
+      const scopedTask = taskId ? '&taskId=' + encodeURIComponent(taskId) : '';
+      const [alerts, audit, comms, costs, sandboxes, snapshots] = await Promise.all([
+        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/alerts?limit=' + limit),
+        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/audit-logs?limit=' + limit),
+        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/communications?limit=' + limit + scopedTask),
+        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/token-costs' + (taskId ? '?taskId=' + encodeURIComponent(taskId) : '')),
+        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/sandboxes'),
+        fetchJSON('/projects/' + encodeURIComponent(projectId) + '/snapshots')
+      ]);
+      renderAlerts(projectId, alerts);
+      renderAuditLogs(projectId, audit);
+      renderCommunications(projectId, comms);
+      renderCosts(projectId, costs);
+      renderSandboxes(projectId, sandboxes);
+      renderSnapshots(projectId, snapshots);
+      return costs;
     }
 
-    filter.addEventListener('change', load);
-    taskLogFilter.addEventListener('change', load);
-    refreshBtn.addEventListener('click', load);
+    async function loadDashboard() {
+      try {
+        const readiness = await fetchJSON('/ready');
+        renderReadiness(readiness);
+      } catch (err) {
+        renderError(readinessPanel, 'Readiness', err);
+      }
+
+      try {
+        const value = filter.value ? '?projectId=' + encodeURIComponent(filter.value) : '';
+        const view = await fetchJSON('/status/matrix' + value);
+        renderMatrix(view);
+        const projectId = filter.value || '';
+        const costs = await loadProjectPanels(projectId);
+        renderKPIs(view, costs);
+      } catch (err) {
+        renderError(matrixPanel, 'Status Matrix', err);
+      }
+    }
+
+    filter.addEventListener('change', loadDashboard);
+    taskLogFilter.addEventListener('change', loadDashboard);
+    logLimit.addEventListener('change', loadDashboard);
+    refreshBtn.addEventListener('click', loadDashboard);
 
     if (typeof window.EventSource === 'function') {
       const stream = new EventSource(withAuth('/status/stream'));
+      stream.onopen = function() { streamState.textContent = 'SSE connected'; };
       stream.addEventListener('status', function() {
-        load();
+        loadDashboard();
       });
       stream.onerror = function() {
-        // Keep polling fallback active when SSE connection is interrupted.
+        streamState.textContent = 'SSE reconnecting; polling fallback active';
       };
+    } else {
+      streamState.textContent = 'SSE unavailable; polling fallback active';
     }
 
-    load();
-    setInterval(load, 4000);
+    loadDashboard();
+    setInterval(loadDashboard, 4000);
   </script>
 </body>
-</html>`, serviceName)
+</html>`, serviceName, serviceName)
 }

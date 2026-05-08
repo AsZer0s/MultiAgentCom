@@ -517,23 +517,34 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status panel 200, got %d", resp.StatusCode)
 	}
-	if !strings.Contains(string(body), "Status Matrix") {
-		t.Fatalf("expected status panel html to contain title, got %s", string(body))
+	bodyText := string(body)
+	for _, label := range []string{
+		"Operations Dashboard",
+		"Readiness",
+		"Status Matrix",
+		"Failure Alerts",
+		"Audit Trail",
+		"Agent Message Log",
+		"Token Cost Trend",
+		"Sandboxes",
+		"Snapshots",
+		"Filter communications by taskId",
+	} {
+		if !strings.Contains(bodyText, label) {
+			t.Fatalf("expected status panel html to contain %q, got %s", label, bodyText)
+		}
 	}
-	if !strings.Contains(string(body), "Agent Message Log") || !strings.Contains(string(body), "Filter communications by taskId") {
-		t.Fatalf("expected status panel html to contain communications controls, got %s", string(body))
+	if !strings.Contains(bodyText, "new EventSource(withAuth('/status/stream'))") {
+		t.Fatalf("expected status panel html to include status stream EventSource, got %s", bodyText)
 	}
-	if !strings.Contains(string(body), "Audit Trail") {
-		t.Fatalf("expected status panel html to contain audit panel, got %s", string(body))
+	if !strings.Contains(bodyText, "setInterval(loadDashboard, 4000)") {
+		t.Fatalf("expected status panel html to keep polling fallback, got %s", bodyText)
 	}
-	if !strings.Contains(string(body), "Token Cost Trend") {
-		t.Fatalf("expected status panel html to contain token cost panel, got %s", string(body))
+	if strings.Contains(bodyText, "app.innerHTML = view.matrices.map") {
+		t.Fatalf("expected status panel html to avoid old innerHTML matrix rendering")
 	}
-	if !strings.Contains(string(body), "new EventSource(withAuth('/status/stream'))") {
-		t.Fatalf("expected status panel html to include status stream EventSource, got %s", string(body))
-	}
-	if !strings.Contains(string(body), "setInterval(load, 4000)") {
-		t.Fatalf("expected status panel html to keep polling fallback, got %s", string(body))
+	if !strings.Contains(bodyText, "textContent") || !strings.Contains(bodyText, "replaceChildren") {
+		t.Fatalf("expected status panel html to use DOM-safe rendering helpers, got %s", bodyText)
 	}
 }
 
