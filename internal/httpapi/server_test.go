@@ -107,6 +107,8 @@ func TestHTTPFlow(t *testing.T) {
 		"web-app/server.js",
 		"web-app/index.html",
 		"web-app/Dockerfile",
+		"metadata/manifest.json",
+		"metadata/release-gate.json",
 	)
 }
 

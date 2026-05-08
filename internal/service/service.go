@@ -2242,7 +2242,7 @@ func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.T
 	if err := writeFile(filepath.Join(bundleDir, "README.md"), []byte(renderBundleReadme(project, task, plan))); err != nil {
 		return nil, "", err
 	}
-	if err := writeFile(filepath.Join(bundleDir, "generated-app", "go.mod"), []byte("module generated-app\n\ngo 1.26\n")); err != nil {
+	if err := writeFile(filepath.Join(bundleDir, "generated-app", "go.mod"), []byte("module generated-app\n\ngo 1.25\n")); err != nil {
 		return nil, "", err
 	}
 	if err := writeFile(filepath.Join(bundleDir, "generated-app", "main.go"), []byte(renderGeneratedSource(project, plan))); err != nil {
@@ -2279,13 +2279,44 @@ func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.T
 	if err := writeJSONFile(filepath.Join(bundleDir, "metadata", "run.json"), run); err != nil {
 		return nil, "", err
 	}
-	if err := writeJSONFile(filepath.Join(bundleDir, "metadata", "manifest.json"), map[string]any{
-		"projectId": project.ID,
-		"runId":     run.ID,
-		"taskId":    task.ID,
-		"kind":      "delivery_bundle",
-		"createdAt": time.Now().UTC(),
-	}); err != nil {
+
+	now := time.Now().UTC()
+	releaseGate, err := buildDeliveryReleaseGate(bundleDir, now)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := writeJSONFile(filepath.Join(bundleDir, "metadata", "release-gate.json"), releaseGate); err != nil {
+		return nil, "", err
+	}
+	descriptors, err := collectDeliveryFileDescriptors(bundleDir, requiredDeliveryBundleFiles)
+	if err != nil {
+		return nil, "", err
+	}
+	manifest := deliveryBundleManifest{
+		SchemaVersion: deliveryBundleSchemaVersion,
+		Kind:          "delivery_bundle",
+		ProjectID:     project.ID,
+		TaskID:        task.ID,
+		RunID:         run.ID,
+		PlanID:        plan.ID,
+		PlanVersion:   plan.Version,
+		CreatedAt:     now,
+		Generator: deliveryBundleGenerator{
+			Name:            "MultiAgentCom",
+			ContractVersion: deliveryBundleSchemaVersion,
+		},
+		Entrypoints: deliveryBundleEntrypoints{
+			Frontend:      "http://127.0.0.1:3000",
+			BackendHealth: "http://127.0.0.1:8081/health",
+			ComposeFile:   "docker-compose.yml",
+		},
+		Files: descriptors,
+		ReleaseGate: deliveryBundleReleaseGateRef{
+			Path:   "metadata/release-gate.json",
+			Status: releaseGate.Status,
+		},
+	}
+	if err := writeJSONFile(filepath.Join(bundleDir, "metadata", "manifest.json"), manifest); err != nil {
 		return nil, "", err
 	}
 
@@ -2313,6 +2344,162 @@ func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.T
 
 	summary := fmt.Sprintf("generated standard delivery bundle for plan v%d at %s", plan.Version, zipPath)
 	return artifact, summary, nil
+}
+
+const (
+	deliveryBundleSchemaVersion = "delivery.bundle.v1"
+	deliveryGateSchemaVersion   = "delivery.release_gate.v1"
+)
+
+type deliveryRequiredFile struct {
+	Path string
+	Role string
+}
+
+type deliveryFileDescriptor struct {
+	Path      string `json:"path"`
+	Role      string `json:"role"`
+	Required  bool   `json:"required"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"sizeBytes"`
+}
+
+type deliveryBundleGenerator struct {
+	Name            string `json:"name"`
+	ContractVersion string `json:"contractVersion"`
+}
+
+type deliveryBundleEntrypoints struct {
+	Frontend      string `json:"frontend"`
+	BackendHealth string `json:"backendHealth"`
+	ComposeFile   string `json:"composeFile"`
+}
+
+type deliveryBundleReleaseGateRef struct {
+	Path   string `json:"path"`
+	Status string `json:"status"`
+}
+
+type deliveryBundleManifest struct {
+	SchemaVersion string                       `json:"schemaVersion"`
+	Kind          string                       `json:"kind"`
+	ProjectID     string                       `json:"projectId"`
+	TaskID        string                       `json:"taskId"`
+	RunID         string                       `json:"runId"`
+	PlanID        string                       `json:"planId"`
+	PlanVersion   int                          `json:"planVersion"`
+	CreatedAt     time.Time                    `json:"createdAt"`
+	Generator     deliveryBundleGenerator      `json:"generator"`
+	Entrypoints   deliveryBundleEntrypoints    `json:"entrypoints"`
+	Files         []deliveryFileDescriptor     `json:"files"`
+	ReleaseGate   deliveryBundleReleaseGateRef `json:"releaseGate"`
+}
+
+type deliveryGateCheck struct {
+	ID      string `json:"id"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+type deliveryReleaseGate struct {
+	SchemaVersion string              `json:"schemaVersion"`
+	Status        string              `json:"status"`
+	GeneratedAt   time.Time           `json:"generatedAt"`
+	Checks        []deliveryGateCheck `json:"checks"`
+}
+
+var requiredDeliveryBundleFiles = []deliveryRequiredFile{
+	{Path: "README.md", Role: "documentation"},
+	{Path: "docker-compose.yml", Role: "orchestration"},
+	{Path: "generated-app/go.mod", Role: "backend_dependency_manifest"},
+	{Path: "generated-app/main.go", Role: "backend_source"},
+	{Path: "generated-app/Dockerfile", Role: "backend_container"},
+	{Path: "web-app/package.json", Role: "frontend_dependency_manifest"},
+	{Path: "web-app/server.js", Role: "frontend_server"},
+	{Path: "web-app/index.html", Role: "frontend_source"},
+	{Path: "web-app/Dockerfile", Role: "frontend_container"},
+	{Path: "metadata/prd.json", Role: "metadata"},
+	{Path: "metadata/task.json", Role: "metadata"},
+	{Path: "metadata/run.json", Role: "metadata"},
+	{Path: "metadata/release-gate.json", Role: "release_gate"},
+}
+
+func buildDeliveryReleaseGate(bundleDir string, generatedAt time.Time) (deliveryReleaseGate, error) {
+	checks := []deliveryGateCheck{
+		{ID: "required_files_present", Status: "PASS", Message: "all required bundle files are present"},
+		{ID: "metadata_json_valid", Status: "PASS", Message: "metadata/prd.json, metadata/task.json and metadata/run.json are valid JSON"},
+		{ID: "local_entrypoints_declared", Status: "PASS", Message: "frontend, backend health and compose entrypoints are declared"},
+	}
+	if err := validateRequiredDeliveryFiles(bundleDir, requiredDeliveryBundleFiles[:len(requiredDeliveryBundleFiles)-1]); err != nil {
+		return deliveryReleaseGate{}, err
+	}
+	if err := validateDeliveryMetadataJSON(bundleDir); err != nil {
+		return deliveryReleaseGate{}, err
+	}
+	if _, err := os.Stat(filepath.Join(bundleDir, "metadata", "lock-conflicts.log")); err == nil {
+		checks = append(checks, deliveryGateCheck{ID: "code_locks_applied", Status: "WARN", Message: "human code locks produced conflict notes in metadata/lock-conflicts.log"})
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return deliveryReleaseGate{}, err
+	}
+	return deliveryReleaseGate{
+		SchemaVersion: deliveryGateSchemaVersion,
+		Status:        "PASS",
+		GeneratedAt:   generatedAt,
+		Checks:        checks,
+	}, nil
+}
+
+func validateRequiredDeliveryFiles(bundleDir string, required []deliveryRequiredFile) error {
+	for _, item := range required {
+		path := filepath.Join(bundleDir, filepath.FromSlash(item.Path))
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("delivery bundle missing required file %s: %w", item.Path, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("delivery bundle required path %s is a directory", item.Path)
+		}
+		if info.Size() <= 0 {
+			return fmt.Errorf("delivery bundle required file %s is empty", item.Path)
+		}
+	}
+	return nil
+}
+
+func validateDeliveryMetadataJSON(bundleDir string) error {
+	for _, path := range []string{"metadata/prd.json", "metadata/task.json", "metadata/run.json"} {
+		payload, err := os.ReadFile(filepath.Join(bundleDir, filepath.FromSlash(path)))
+		if err != nil {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+		var decoded any
+		if err := json.Unmarshal(payload, &decoded); err != nil {
+			return fmt.Errorf("invalid delivery metadata json %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func collectDeliveryFileDescriptors(bundleDir string, required []deliveryRequiredFile) ([]deliveryFileDescriptor, error) {
+	descriptors := make([]deliveryFileDescriptor, 0, len(required))
+	for _, item := range required {
+		path := filepath.Join(bundleDir, filepath.FromSlash(item.Path))
+		checksum, size, err := fileChecksum(path)
+		if err != nil {
+			return nil, fmt.Errorf("checksum delivery file %s: %w", item.Path, err)
+		}
+		if size <= 0 {
+			return nil, fmt.Errorf("delivery bundle required file %s is empty", item.Path)
+		}
+		descriptors = append(descriptors, deliveryFileDescriptor{
+			Path:      item.Path,
+			Role:      item.Role,
+			Required:  true,
+			SHA256:    checksum,
+			SizeBytes: size,
+		})
+	}
+	return descriptors, nil
 }
 
 func (s *Service) resolveTaskLocked(projectID, taskID string) (*domain.Task, error) {
@@ -3789,6 +3976,18 @@ func renderBundleReadme(project *domain.Project, task *domain.Task, plan *domain
 3. 打开: http://127.0.0.1:3000 验证前端预览。
 4. 访问: http://127.0.0.1:8081/health 验证后端服务。
 
+## Local Entrypoints
+
+- Frontend: http://127.0.0.1:3000
+- Backend health: http://127.0.0.1:8081/health
+- Compose file: docker-compose.yml
+
+## Bundle Contract
+
+- Contract version: delivery.bundle.v1
+- metadata/manifest.json: 机器可读交付清单，包含必需文件、SHA-256、大小和本地入口。
+- metadata/release-gate.json: 本地 release gate 报告，status 为 PASS 表示交付包结构已通过生成时校验。
+
 ## Bundle Contents
 
 - generated-app/: Go 后端服务，包含 go.mod、main.go、Dockerfile
@@ -3797,7 +3996,8 @@ func renderBundleReadme(project *domain.Project, task *domain.Task, plan *domain
 - metadata/prd.json: 结构化 PRD
 - metadata/task.json: 任务快照
 - metadata/run.json: 执行快照
-- metadata/manifest.json: 交付清单
+- metadata/release-gate.json: 本地 release gate 报告
+- metadata/manifest.json: delivery.bundle.v1 交付清单
 `, project.Name, project.ID, task.ID, task.Type, task.AssigneeAgent, plan.Version, plan.Goal, renderBulletList(plan.Scope), renderBulletList(plan.AcceptanceCriteria))
 }
 
@@ -3968,12 +4168,23 @@ func renderDockerCompose() string {
     build: ./generated-app
     ports:
       - "8081:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
   frontend:
     build: ./web-app
     ports:
       - "3000:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/status"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 `
 }
 

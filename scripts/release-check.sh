@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
+RELEASE_CHECK_PORT="${RELEASE_CHECK_PORT:-$((24000 + RANDOM % 1000))}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:$RELEASE_CHECK_PORT}"
 LOG_FILE="${LOG_FILE:-${TMPDIR:-/tmp}/multiagentcom-release-check.log}"
 DEMO_RUNS="${DEMO_RUNS:-3}"
 ALERT_WEBHOOK_PORT="${ALERT_WEBHOOK_PORT:-18081}"
@@ -171,7 +172,7 @@ WEBHOOK_PID="$!"
 
 echo
 echo "== start local server =="
-(cd "$ROOT_DIR" && MULTI_AGENT_ALERT_WEBHOOK_URL="http://127.0.0.1:$ALERT_WEBHOOK_PORT" go run ./cmd/server >"$LOG_FILE" 2>&1) &
+(cd "$ROOT_DIR" && MULTI_AGENT_ADDR=":$RELEASE_CHECK_PORT" MULTI_AGENT_ALERT_WEBHOOK_URL="http://127.0.0.1:$ALERT_WEBHOOK_PORT" go run ./cmd/server >"$LOG_FILE" 2>&1) &
 SERVER_PID="$!"
 
 wait_health "$BASE_URL" "multiagentcom-api"
@@ -181,7 +182,7 @@ echo "== status stream smoke verification =="
 BASE_URL="$BASE_URL" bash "$ROOT_DIR/scripts/status-stream-smoke.sh"
 
 echo
-echo "== end-to-end demo verification =="
+echo "== end-to-end demo and delivery gate verification =="
 RUNS="$DEMO_RUNS" BASE_URL="$BASE_URL" ARTIFACT_DIR="${TMPDIR:-/tmp}/multiagentcom-release-artifacts" bash "$ROOT_DIR/scripts/demo.sh"
 
 echo

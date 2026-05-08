@@ -23,7 +23,7 @@ bash scripts/release-check.sh
 - `bash scripts/alert-smoke.sh` 验证失败告警与 webhook 推送通过
 - `bash scripts/auth-smoke.sh` 验证 token 鉴权兼容路径通过
 - 预览环境可访问
-- 导出 ZIP 交付包结构符合 AC-15
+- 导出 ZIP 交付包结构符合 AC-15，并通过 `delivery.bundle.v1` / `delivery.release_gate.v1` 契约校验
 - Sprint 4 验收文档存在
 
 ## Demo Walkthrough
@@ -96,6 +96,8 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
   - `web-app/server.js`
   - `web-app/index.html`
   - `web-app/Dockerfile`
+  - `metadata/manifest.json`（`schemaVersion: delivery.bundle.v1`，包含必需文件 checksum/size 与本地入口）
+  - `metadata/release-gate.json`（`schemaVersion: delivery.release_gate.v1`，`status: PASS`）
 
 ## Exit Criteria
 

@@ -188,6 +188,8 @@ func TestSprintOneFlow(t *testing.T) {
 				"web-app/server.js",
 				"web-app/index.html",
 				"web-app/Dockerfile",
+				"metadata/manifest.json",
+				"metadata/release-gate.json",
 			)
 			return
 		}
@@ -195,6 +197,96 @@ func TestSprintOneFlow(t *testing.T) {
 	}
 
 	t.Fatal("run did not complete before deadline")
+}
+
+func TestDeliveryBundleIncludesManifestAndReleaseGateV1(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-delivery-gate",
+		ArtifactRoot: t.TempDir(),
+		DefaultAgent: "test-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Delivery Gate Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo API", Content: "生成可校验交付包"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: plan.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s: %s", status.Run.Status, status.Run.Error)
+	}
+	artifact, err := svc.ExportDelivery(ctx, project.ID, ExportDeliveryInput{RunID: runEnvelope.Run.ID})
+	if err != nil {
+		t.Fatalf("export delivery: %v", err)
+	}
+
+	var manifest deliveryBundleManifest
+	readZipJSON(t, artifact.URI, "metadata/manifest.json", &manifest)
+	if manifest.SchemaVersion != deliveryBundleSchemaVersion || manifest.Kind != "delivery_bundle" {
+		t.Fatalf("unexpected manifest identity: %+v", manifest)
+	}
+	if manifest.ProjectID != project.ID || manifest.TaskID != plan.Task.ID || manifest.RunID != runEnvelope.Run.ID || manifest.PlanID != plan.Plan.ID {
+		t.Fatalf("manifest IDs do not match project/run: %+v", manifest)
+	}
+	if manifest.PlanVersion != plan.Plan.Version {
+		t.Fatalf("manifest plan version = %d, want %d", manifest.PlanVersion, plan.Plan.Version)
+	}
+	if manifest.Entrypoints.Frontend == "" || manifest.Entrypoints.BackendHealth == "" || manifest.Entrypoints.ComposeFile != "docker-compose.yml" {
+		t.Fatalf("manifest entrypoints incomplete: %+v", manifest.Entrypoints)
+	}
+	if manifest.ReleaseGate.Path != "metadata/release-gate.json" || manifest.ReleaseGate.Status != "PASS" {
+		t.Fatalf("manifest release gate mismatch: %+v", manifest.ReleaseGate)
+	}
+
+	filesByPath := make(map[string]deliveryFileDescriptor, len(manifest.Files))
+	for _, item := range manifest.Files {
+		filesByPath[item.Path] = item
+		if item.Path == "" || item.Role == "" || !item.Required || item.SHA256 == "" || item.SizeBytes <= 0 {
+			t.Fatalf("invalid manifest file descriptor: %+v", item)
+		}
+	}
+	for _, required := range requiredDeliveryBundleFiles {
+		if _, ok := filesByPath[required.Path]; !ok {
+			t.Fatalf("manifest missing required file descriptor %s", required.Path)
+		}
+	}
+	if _, ok := filesByPath["metadata/manifest.json"]; ok {
+		t.Fatal("manifest should not include self-referential metadata/manifest.json descriptor")
+	}
+
+	var gate deliveryReleaseGate
+	readZipJSON(t, artifact.URI, "metadata/release-gate.json", &gate)
+	if gate.SchemaVersion != deliveryGateSchemaVersion || gate.Status != "PASS" {
+		t.Fatalf("unexpected release gate: %+v", gate)
+	}
+	if len(gate.Checks) < 3 {
+		t.Fatalf("expected release gate checks, got %+v", gate.Checks)
+	}
+}
+
+func TestDeliveryBundleGateRejectsMissingRequiredFile(t *testing.T) {
+	bundleDir := t.TempDir()
+	if err := writeFile(filepath.Join(bundleDir, "README.md"), []byte("readme")); err != nil {
+		t.Fatalf("write temp readme: %v", err)
+	}
+	err := validateRequiredDeliveryFiles(bundleDir, []deliveryRequiredFile{{Path: "README.md", Role: "documentation"}, {Path: "missing.txt", Role: "missing"}})
+	if err == nil || !strings.Contains(err.Error(), "missing.txt") {
+		t.Fatalf("expected missing required file error, got %v", err)
+	}
 }
 
 func TestRunUsesHTTPRuntimeProviderWhenConfigured(t *testing.T) {
@@ -2355,6 +2447,32 @@ func waitForTaskStatus(t *testing.T, svc *Service, projectID, runID string, expe
 	}
 
 	t.Fatalf("run %s did not reach task status %s before deadline", runID, expected)
+}
+
+func readZipJSON(t *testing.T, zipPath, name string, target any) {
+	t.Helper()
+
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("open zip %s: %v", zipPath, err)
+	}
+	defer reader.Close()
+
+	for _, file := range reader.File {
+		if file.Name != name {
+			continue
+		}
+		body, err := file.Open()
+		if err != nil {
+			t.Fatalf("open zip entry %s: %v", name, err)
+		}
+		defer body.Close()
+		if err := json.NewDecoder(body).Decode(target); err != nil {
+			t.Fatalf("decode zip entry %s: %v", name, err)
+		}
+		return
+	}
+	t.Fatalf("zip %s missing %s", zipPath, name)
 }
 
 func assertZipContains(t *testing.T, zipPath string, expected ...string) {

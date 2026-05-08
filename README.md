@@ -46,7 +46,7 @@
 
 - 后端使用 Go 标准库先跑通最小闭环，领域层与 HTTP 层已解耦，后续可按 `docs/Tech-Stack-Decision.md` 平滑替换为 Gin。
 - 存储支持默认内存模式，也可通过 `MULTI_AGENT_STORE_PROVIDER=file` 与 `MULTI_AGENT_DATA_ROOT` 启用文件持久化；项目、任务、运行、审计/告警/通信流、artifact 元数据与快照状态可在服务重启后恢复。
-- 单 Agent 执行器当前为**规则驱动的本地交付实现**，同时支持通过 `MULTI_AGENT_RUNTIME_PROVIDER=http` 接入外部 runtime provider；HTTP runtime 使用 `runtime.http.v1` 协议发送 `protocolVersion` 与 `X-MultiAgentCom-Runtime-Protocol`，支持嵌套 `usage`、兼容旧版 flat token 字段，并把非 2xx、超时、网络、malformed、超大响应和协议版本不匹配归一化为结构化 provider error；系统会基于 PRD 生成标准交付包（README、Go 后端、Node 预览前端、Dockerfile、Compose、元数据）。
+- 单 Agent 执行器当前为**规则驱动的本地交付实现**，同时支持通过 `MULTI_AGENT_RUNTIME_PROVIDER=http` 接入外部 runtime provider；HTTP runtime 使用 `runtime.http.v1` 协议发送 `protocolVersion` 与 `X-MultiAgentCom-Runtime-Protocol`，支持嵌套 `usage`、兼容旧版 flat token 字段，并把非 2xx、超时、网络、malformed、超大响应和协议版本不匹配归一化为结构化 provider error；系统会基于 PRD 生成标准交付包（README、Go 后端、Node 预览前端、Dockerfile、Compose、元数据），并在 `metadata/manifest.json` 输出 `delivery.bundle.v1` 交付契约、在 `metadata/release-gate.json` 输出本地 release gate 报告。
 - Contract Hub 当前为**最小可演示实现**：支持基于最新 PRD 规则生成 CRUD 风格 API/Schema 契约，并按版本保存在服务状态中。
 - 契约校验当前支持**合并前最小闸门**：可检查候选 endpoints/schemas 与契约的缺失、类型不一致、额外字段；若存在冲突，会拒绝校验并自动创建修复任务。
 - 并行调度当前支持**双 Agent + 简单 DAG**：可生成后端/前端实现任务，并在依赖满足后触发集成任务；失败任务可单独创建 retry 任务，不影响其他任务继续推进。
@@ -117,5 +117,5 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 CI 基线：
 
 - GitHub Actions 会在 `push` / `pull_request` 上自动执行 `go test ./...`
-- 同时会执行 `DEMO_RUNS=1 bash scripts/release-check.sh` 作为 release smoke，保证预览、交付包和关键脚本链路可用
+- 同时会执行 `DEMO_RUNS=1 bash scripts/release-check.sh` 作为 release smoke，保证预览、交付包、`delivery.bundle.v1` 契约和关键脚本链路可用
 - 本地发布前仍建议执行默认三轮的 `bash scripts/release-check.sh`

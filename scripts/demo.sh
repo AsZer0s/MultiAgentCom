@@ -139,6 +139,70 @@ assert_zip_contains() {
   done
 }
 
+assert_delivery_gate_contract() {
+  local zip_path="$1"
+  /usr/bin/python3 - "$zip_path" <<'PY'
+import json
+import sys
+import zipfile
+
+zip_path = sys.argv[1]
+required_paths = {
+    "README.md",
+    "docker-compose.yml",
+    "generated-app/go.mod",
+    "generated-app/main.go",
+    "generated-app/Dockerfile",
+    "web-app/package.json",
+    "web-app/server.js",
+    "web-app/index.html",
+    "web-app/Dockerfile",
+    "metadata/prd.json",
+    "metadata/task.json",
+    "metadata/run.json",
+    "metadata/release-gate.json",
+}
+
+with zipfile.ZipFile(zip_path) as archive:
+    names = set(archive.namelist())
+    missing = sorted((required_paths | {"metadata/manifest.json"}) - names)
+    if missing:
+        raise SystemExit("delivery bundle missing required paths: " + ", ".join(missing))
+    manifest = json.loads(archive.read("metadata/manifest.json"))
+    gate = json.loads(archive.read("metadata/release-gate.json"))
+
+if manifest.get("schemaVersion") != "delivery.bundle.v1":
+    raise SystemExit("manifest schemaVersion must be delivery.bundle.v1")
+if manifest.get("kind") != "delivery_bundle":
+    raise SystemExit("manifest kind must be delivery_bundle")
+release_gate = manifest.get("releaseGate") or {}
+if release_gate.get("path") != "metadata/release-gate.json" or release_gate.get("status") != "PASS":
+    raise SystemExit("manifest releaseGate must point to PASS metadata/release-gate.json")
+if gate.get("schemaVersion") != "delivery.release_gate.v1" or gate.get("status") != "PASS":
+    raise SystemExit("release gate must be PASS delivery.release_gate.v1")
+entrypoints = manifest.get("entrypoints") or {}
+if entrypoints.get("frontend") != "http://127.0.0.1:3000":
+    raise SystemExit("manifest frontend entrypoint mismatch")
+if entrypoints.get("backendHealth") != "http://127.0.0.1:8081/health":
+    raise SystemExit("manifest backend health entrypoint mismatch")
+if entrypoints.get("composeFile") != "docker-compose.yml":
+    raise SystemExit("manifest compose file entrypoint mismatch")
+files = {item.get("path"): item for item in manifest.get("files") or []}
+for path in sorted(required_paths):
+    item = files.get(path)
+    if not item:
+        raise SystemExit(f"manifest missing descriptor for {path}")
+    if item.get("required") is not True:
+        raise SystemExit(f"manifest descriptor for {path} must be required")
+    if not item.get("sha256"):
+        raise SystemExit(f"manifest descriptor for {path} missing sha256")
+    if int(item.get("sizeBytes") or 0) <= 0:
+        raise SystemExit(f"manifest descriptor for {path} missing positive sizeBytes")
+if "metadata/manifest.json" in files:
+    raise SystemExit("manifest must not include self-referential metadata/manifest.json descriptor")
+PY
+}
+
 run_demo_once() {
   local index="$1"
   local suffix
@@ -226,7 +290,10 @@ run_demo_once() {
     "web-app/package.json" \
     "web-app/server.js" \
     "web-app/index.html" \
-    "web-app/Dockerfile"
+    "web-app/Dockerfile" \
+    "metadata/manifest.json" \
+    "metadata/release-gate.json"
+  assert_delivery_gate_contract "$artifact_zip"
 
   local panel_html
   panel_html="$(get_page "$BASE_URL/status/panel")"
