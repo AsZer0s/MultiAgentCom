@@ -63,6 +63,8 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - `GET /status/panel` 页面包含 `Operations Dashboard`
 - `GET /status/panel` 页面包含 `Readiness`
 - `GET /status/panel` 页面包含 `Status Matrix`
+- `GET /status/panel` 页面包含 `Task Topology`
+- `GET /status/panel` 任务拓扑展示依赖边、agent lane、通信 badge，并可点击任务节点按 `taskId` 过滤日志
 - `GET /status/panel` 页面包含 `Agent Message Log`
 - `GET /status/panel` 页面包含 `Failure Alerts`
 - `GET /status/panel` 页面包含 `Audit Trail`
@@ -76,6 +78,8 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - `GET /projects/{id}/communications?taskId=...&limit=...&offset=...` 返回 `checksum` 和分页元数据
 - `GET /projects/{id}/audit-logs?limit=1&since=...` 返回分页后的关键操作审计流
 - `GET /projects/{id}/token-costs?taskId=...` 返回 `totalTokens` 与 `budgetStatus`
+- `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回 `runtime.http.v1` success 时可执行成功并采用嵌套 `usage`
+- `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回结构化非 2xx error 时，run 失败原因包含稳定 code/status/retryable/requestId，且项目告警记录该失败
 - 配置 `MULTI_AGENT_API_TOKEN` 后，未带 token 的 API 请求返回 `401`
 - 配置 `MULTI_AGENT_API_TOKEN` 后，带 token 的 API 请求可正常创建项目并写入审计
 - 配置 `MULTI_AGENT_AUTH_TOKENS` 或 `MULTI_AGENT_AUTH_TOKENS_FILE` 后，带 roles/project scope 的 token 可授权或拒绝对应关键操作

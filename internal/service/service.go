@@ -58,6 +58,7 @@ type Service struct {
 	logger          *slog.Logger
 	alertClient     *http.Client
 	runtimeRegistry *agentruntime.Registry
+	runtimeInitErr  error
 	store           store.Store
 
 	mu             sync.RWMutex
@@ -413,28 +414,38 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 	runtimeRegistry := agentruntime.NewRegistry()
 	_ = runtimeRegistry.Register("local", agentruntime.NewMockRunner())
 
+	runtimeProvider := strings.TrimSpace(cfg.RuntimeProvider)
+	if runtimeProvider == "" {
+		runtimeProvider = "local"
+	}
+	explicitRuntimeProvider := strings.TrimSpace(cfg.RuntimeProvider) != ""
+	var runtimeInitErr error
+
 	if endpoint := strings.TrimSpace(cfg.RuntimeEndpoint); endpoint != "" {
 		if runner, err := agentruntime.NewHTTPRunner(endpoint, &http.Client{Timeout: cfg.RuntimeTimeout}); err != nil {
+			runtimeInitErr = fmt.Errorf("initialize http runtime runner: %w", err)
 			if logger != nil {
 				logger.Warn("failed to initialize http runtime runner", "endpoint", endpoint, "error", err)
 			}
 		} else if err := runtimeRegistry.Register("http", runner); err != nil {
+			runtimeInitErr = fmt.Errorf("register http runtime runner: %w", err)
 			if logger != nil {
 				logger.Warn("failed to register http runtime runner", "endpoint", endpoint, "error", err)
 			}
 		}
 	}
 
-	runtimeProvider := strings.TrimSpace(cfg.RuntimeProvider)
-	if runtimeProvider == "" {
-		runtimeProvider = "local"
-	}
 	if err := runtimeRegistry.SetDefault(runtimeProvider); err != nil {
-		if logger != nil {
-			logger.Warn("configured runtime provider unavailable, falling back to local", "provider", runtimeProvider, "error", err)
+		if explicitRuntimeProvider {
+			runtimeInitErr = fmt.Errorf("configured runtime provider %q unavailable: %w", runtimeProvider, err)
+			cfg.RuntimeProvider = runtimeProvider
+		} else {
+			if logger != nil {
+				logger.Warn("configured runtime provider unavailable, falling back to local", "provider", runtimeProvider, "error", err)
+			}
+			_ = runtimeRegistry.SetDefault("local")
+			cfg.RuntimeProvider = "local"
 		}
-		_ = runtimeRegistry.SetDefault("local")
-		cfg.RuntimeProvider = "local"
 	} else {
 		cfg.RuntimeProvider = runtimeProvider
 	}
@@ -444,6 +455,7 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		logger:          logger,
 		alertClient:     &http.Client{Timeout: 3 * time.Second},
 		runtimeRegistry: runtimeRegistry,
+		runtimeInitErr:  runtimeInitErr,
 		store:           newServiceStore(cfg),
 	}
 	svc.resetStateLocked()
@@ -1980,13 +1992,11 @@ func (s *Service) executeRun(runID string) {
 
 	communicationCount := s.communicationCountForTaskLocked(project.ID, storedTask.ID)
 	promptTokens, completionTokens, totalTokens := estimateRunTokens(storedTask, plan, communicationCount, false)
+	runtimeResponse = normalizeRuntimeUsage(runtimeResponse)
 	if runtimeResponse.PromptTokens > 0 || runtimeResponse.CompletionTokens > 0 || runtimeResponse.TotalTokens > 0 {
 		promptTokens = runtimeResponse.PromptTokens
 		completionTokens = runtimeResponse.CompletionTokens
 		totalTokens = runtimeResponse.TotalTokens
-		if totalTokens <= 0 {
-			totalTokens = promptTokens + completionTokens
-		}
 	}
 	estimatedCostUSD := s.estimateCostFromTokens(promptTokens, completionTokens)
 	storedRun.Status = domain.RunStatusSucceeded
@@ -2023,6 +2033,9 @@ func (s *Service) executeRun(runID string) {
 }
 
 func (s *Service) executeRuntimeRun(run *domain.AgentRun, task *domain.Task, plan *domain.Plan, project *domain.Project, sandbox *domain.Sandbox) (agentruntime.Response, error) {
+	if s.runtimeInitErr != nil {
+		return agentruntime.Response{}, s.runtimeInitErr
+	}
 	if s.runtimeRegistry == nil {
 		return agentruntime.Response{}, errors.New("runtime registry is not initialized")
 	}
@@ -2056,6 +2069,25 @@ func (s *Service) executeRuntimeRun(run *domain.AgentRun, task *domain.Task, pla
 	}
 
 	return runner.Run(ctx, request)
+}
+
+func normalizeRuntimeUsage(response agentruntime.Response) agentruntime.Response {
+	if response.PromptTokens < 0 {
+		response.PromptTokens = 0
+	}
+	if response.CompletionTokens < 0 {
+		response.CompletionTokens = 0
+	}
+	if response.TotalTokens < 0 {
+		response.TotalTokens = 0
+	}
+	if response.TotalTokens <= 0 {
+		response.TotalTokens = response.PromptTokens + response.CompletionTokens
+	}
+	if response.TotalTokens > 0 && response.PromptTokens == 0 && response.CompletionTokens == 0 {
+		response.PromptTokens = response.TotalTokens
+	}
+	return response
 }
 
 func sandboxRootPath(sandbox *domain.Sandbox) string {

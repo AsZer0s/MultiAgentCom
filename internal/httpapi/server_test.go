@@ -522,6 +522,8 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 		"Operations Dashboard",
 		"Readiness",
 		"Status Matrix",
+		"Task Topology",
+		"topologyPanel",
 		"Failure Alerts",
 		"Audit Trail",
 		"Agent Message Log",
@@ -548,6 +550,9 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 	}
 	if !strings.Contains(bodyText, "renderPanelFetch") {
 		t.Fatalf("expected status panel html to isolate project panel fetch failures, got %s", bodyText)
+	}
+	if !strings.Contains(bodyText, "renderTopology") || !strings.Contains(bodyText, "createElementNS") {
+		t.Fatalf("expected status panel html to render SVG task topology safely, got %s", bodyText)
 	}
 }
 

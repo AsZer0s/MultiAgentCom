@@ -280,6 +280,66 @@ func TestRunUsesHTTPRuntimeProviderWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestRunUsesTotalOnlyRuntimeUsageForCost(t *testing.T) {
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocolVersion": "runtime.http.v1",
+			"model":           "runtime-http-v1",
+			"output":          "runtime returned total-only usage",
+			"usage": map[string]any{
+				"totalTokens": 50,
+			},
+		})
+	}))
+	defer runtimeServer.Close()
+
+	cfg := config.Config{
+		Address:                    ":0",
+		ServiceName:                "test-runtime-total-only",
+		ArtifactRoot:               t.TempDir(),
+		DefaultAgent:               "go-backend-agent",
+		RuntimeProvider:            "http",
+		RuntimeEndpoint:            runtimeServer.URL,
+		RuntimeTimeout:             2 * time.Second,
+		TokenPromptPricePerMillion: 10,
+		TokenOutputPricePerMillion: 20,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Runtime Total Usage Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo API",
+		Content: "实现 Todo API 并返回可交付产物",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s (%s)", status.Run.Status, status.Run.Error)
+	}
+	if status.Run.PromptTokens != 50 || status.Run.CompletionTokens != 0 || status.Run.TotalTokens != 50 {
+		t.Fatalf("expected normalized total-only tokens 50/0/50, got %d/%d/%d", status.Run.PromptTokens, status.Run.CompletionTokens, status.Run.TotalTokens)
+	}
+	if status.Run.EstimatedCostUSD <= 0 {
+		t.Fatalf("expected non-zero cost from total-only usage, got %.9f", status.Run.EstimatedCostUSD)
+	}
+}
+
 func TestStartRunFailsWhenPrivateSandboxWorkspaceCannotBeCreated(t *testing.T) {
 	sandboxRootFile := filepath.Join(t.TempDir(), "sandbox-root-file")
 	if err := os.WriteFile(sandboxRootFile, []byte("not a directory"), 0o644); err != nil {
@@ -1635,6 +1695,124 @@ func TestGetArtifactMissingFileDoesNotRecordDownload(t *testing.T) {
 		if item.Action == "DELIVERY_DOWNLOAD" {
 			t.Fatalf("did not expect download audit for missing file, got %+v", items)
 		}
+	}
+}
+
+func TestRunFailsWhenHTTPRuntimeProviderUnavailable(t *testing.T) {
+	cfg := config.Config{
+		Address:         ":0",
+		ServiceName:     "test-runtime-unavailable",
+		ArtifactRoot:    t.TempDir(),
+		SandboxRoot:     t.TempDir(),
+		DefaultAgent:    "go-backend-agent",
+		RuntimeProvider: "http",
+		RuntimeTimeout:  2 * time.Second,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Runtime Unavailable Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo API",
+		Content: "实现 Todo API 并返回可交付产物",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusFailed {
+		t.Fatalf("expected failed run, got %s", status.Run.Status)
+	}
+	if !strings.Contains(status.Run.Error, "configured runtime provider") || strings.Contains(status.Run.ResultSummary, "mock") {
+		t.Fatalf("expected explicit http provider failure without local fallback, got error=%q summary=%q", status.Run.Error, status.Run.ResultSummary)
+	}
+
+	items, err := svc.ListAlerts(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list alerts: %v", err)
+	}
+	if len(items) == 0 || items[0].Type != "RUN_FAILURE" {
+		t.Fatalf("expected RUN_FAILURE alert, got %+v", items)
+	}
+}
+
+func TestRunFailsOnStructuredRuntimeProviderError(t *testing.T) {
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocolVersion": "runtime.http.v1",
+			"error": map[string]any{
+				"code":           "UPSTREAM_UNAVAILABLE",
+				"message":        "runtime dependency unavailable",
+				"retryable":      true,
+				"providerStatus": http.StatusServiceUnavailable,
+				"requestId":      "req_service_123",
+			},
+		})
+	}))
+	defer runtimeServer.Close()
+
+	cfg := config.Config{
+		Address:         ":0",
+		ServiceName:     "test-runtime-error",
+		ArtifactRoot:    t.TempDir(),
+		SandboxRoot:     t.TempDir(),
+		DefaultAgent:    "go-backend-agent",
+		RuntimeProvider: "http",
+		RuntimeEndpoint: runtimeServer.URL,
+		RuntimeTimeout:  2 * time.Second,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Runtime Error Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{
+		Title:   "实现 Todo API",
+		Content: "实现 Todo API 并返回可交付产物",
+	}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusFailed {
+		t.Fatalf("expected failed run, got %s", status.Run.Status)
+	}
+	for _, want := range []string{"UPSTREAM_UNAVAILABLE", "status=502", "providerStatus=503", "retryable=true", "requestId=req_service_123"} {
+		if !strings.Contains(status.Run.Error, want) {
+			t.Fatalf("expected run error to contain %q, got %q", want, status.Run.Error)
+		}
+	}
+
+	items, err := svc.ListAlerts(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list alerts: %v", err)
+	}
+	if len(items) == 0 || !strings.Contains(items[0].Message, "UPSTREAM_UNAVAILABLE") {
+		t.Fatalf("expected alert with provider error, got %+v", items)
 	}
 }
 

@@ -1348,6 +1348,19 @@ func renderStatusPanelHTML(serviceName string) string {
     th { color: var(--muted); font-weight: 600; }
     .task-meta { margin-top: 4px; color: var(--muted); font-size: 12px; word-break: break-all; }
     .task-row.highlight td, .item.highlight { background: var(--accent-soft); }
+    .topology-wrap { margin-top: 12px; overflow-x: auto; }
+    .topology-svg { min-width: 760px; width: 100%%; border: 1px solid rgba(214, 202, 184, 0.7); border-radius: 20px; background: rgba(255,255,255,0.55); }
+    .topology-edge { stroke: rgba(103, 92, 79, 0.45); stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    .topology-lane { fill: rgba(255,255,255,0.7); stroke: rgba(214, 202, 184, 0.7); }
+    .topology-label { fill: var(--muted); font-size: 12px; }
+    .topology-node { cursor: pointer; }
+    .topology-card { fill: #fff; stroke: var(--line); stroke-width: 1.5; filter: drop-shadow(0 8px 16px rgba(24, 20, 16, 0.08)); }
+    .topology-node.SUCCEEDED .topology-card, .topology-node.DONE .topology-card, .topology-node.COMPLETED .topology-card { stroke: rgba(15, 139, 76, 0.55); }
+    .topology-node.RUNNING .topology-card, .topology-node.ACTIVE .topology-card { stroke: rgba(22, 93, 255, 0.6); }
+    .topology-node.FAILED .topology-card, .topology-node.ERROR .topology-card, .topology-node.BLOCKED .topology-card { stroke: rgba(180, 35, 24, 0.6); }
+    .topology-title { fill: var(--ink); font-size: 13px; font-weight: 700; }
+    .topology-meta { fill: var(--muted); font-size: 11px; }
+    .topology-badge { fill: var(--accent-soft); stroke: rgba(22, 93, 255, 0.2); }
     .item-list { display: grid; gap: 12px; margin-top: 12px; }
     .item {
       border: 1px solid rgba(214, 202, 184, 0.7);
@@ -1397,6 +1410,7 @@ func renderStatusPanelHTML(serviceName string) string {
 
     <section id="kpiPanel" class="panel"></section>
     <div class="dashboard-grid">
+      <section id="topologyPanel" class="panel"></section>
       <section id="matrixPanel" class="panel"></section>
       <div class="two-col">
         <section id="alertPanel" class="panel"></section>
@@ -1418,6 +1432,7 @@ func renderStatusPanelHTML(serviceName string) string {
     const refreshBtn = document.getElementById("refreshBtn");
     const readinessPanel = document.getElementById("readinessPanel");
     const kpiPanel = document.getElementById("kpiPanel");
+    const topologyPanel = document.getElementById("topologyPanel");
     const matrixPanel = document.getElementById("matrixPanel");
     const generatedAt = document.getElementById("generatedAt");
     const streamState = document.getElementById("streamState");
@@ -1554,6 +1569,7 @@ func renderStatusPanelHTML(serviceName string) string {
       const matrices = view.matrices || [];
       if (!matrices.length) {
         matrixPanel.replaceChildren(panelHead('Status Matrix', 'Status Matrix', []), empty('还没有可展示的项目状态。先创建项目并派发任务，再回来查看。'));
+        renderTopology(view, null);
         return;
       }
 
@@ -1594,6 +1610,147 @@ func renderStatusPanelHTML(serviceName string) string {
         content.appendChild(section);
       });
       matrixPanel.replaceChildren(panelHead('Status Matrix', 'Agent and Task Matrix', []), content);
+    }
+
+    function svgEl(tag, attrs, text) {
+      const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+      Object.entries(attrs || {}).forEach(([key, value]) => node.setAttribute(key, String(value)));
+      if (text !== undefined && text !== null) node.textContent = String(text);
+      return node;
+    }
+
+    function renderTopology(view, communications) {
+      const projectId = filter.value || '';
+      if (!projectId) {
+        topologyPanel.replaceChildren(panelHead('Topology', 'Task Topology', []), empty('选择一个项目后可查看任务拓扑。'));
+        return;
+      }
+      const matrix = (view.matrices || []).find((item) => (item.project || {}).id === projectId) || (view.matrices || [])[0];
+      const tasks = matrix ? (matrix.taskMatrix || []) : [];
+      if (!tasks.length) {
+        topologyPanel.replaceChildren(panelHead('Topology', 'Task Topology', ['Project ' + projectId]), empty('No tasks to visualize.'));
+        return;
+      }
+
+      const taskById = new Map(tasks.map((task) => [task.id, task]));
+      const depthCache = new Map();
+      let hasWarning = false;
+      function depthFor(task, visiting) {
+        if (!task || !task.id) return 0;
+        if (depthCache.has(task.id)) return depthCache.get(task.id);
+        if (visiting.has(task.id)) {
+          hasWarning = true;
+          return 0;
+        }
+        visiting.add(task.id);
+        const depths = (task.dependsOn || []).map((depId) => {
+          const dep = taskById.get(depId);
+          if (!dep) {
+            hasWarning = true;
+            return -1;
+          }
+          return depthFor(dep, visiting);
+        });
+        visiting.delete(task.id);
+        const depth = depths.length ? Math.max(...depths) + 1 : 0;
+        depthCache.set(task.id, depth);
+        return depth;
+      }
+
+      const lanes = Array.from(new Set(tasks.map((task) => task.assigneeAgent || 'unassigned'))).sort();
+      const laneIndex = new Map(lanes.map((lane, index) => [lane, index]));
+      const placed = tasks.map((task, index) => ({ task, index, depth: depthFor(task, new Set()), lane: laneIndex.get(task.assigneeAgent || 'unassigned') || 0 }));
+      const stackCounts = new Map();
+      placed.forEach((node) => {
+        const key = node.depth + ':' + node.lane;
+        const count = stackCounts.get(key) || 0;
+        node.stack = count;
+        stackCounts.set(key, count + 1);
+      });
+      const nodeById = new Map(placed.map((node) => [node.task.id, node]));
+      const comms = communications || { items: [] };
+      const commCount = new Map();
+      (comms.items || []).forEach((item) => {
+        if (!item.taskId) return;
+        commCount.set(item.taskId, (commCount.get(item.taskId) || 0) + 1);
+      });
+
+      const colWidth = 220;
+      const laneHeight = 132;
+      const stackOffset = 34;
+      const cardWidth = 172;
+      const cardHeight = 86;
+      const left = 120;
+      const top = 56;
+      const maxDepth = Math.max(...placed.map((node) => node.depth), 0);
+      const maxStack = Math.max(...placed.map((node) => node.stack), 0);
+      const width = Math.max(760, left + (maxDepth + 1) * colWidth + cardWidth + 60);
+      const height = Math.max(260, top + lanes.length * laneHeight + maxStack * stackOffset + 40);
+      placed.forEach((node) => {
+        node.x = left + node.depth * colWidth;
+        node.y = top + node.lane * laneHeight + node.stack * stackOffset;
+      });
+
+      const svg = svgEl('svg', { class: 'topology-svg', viewBox: '0 0 ' + width + ' ' + height, role: 'img', 'aria-label': 'Task dependency topology' });
+      const defs = svgEl('defs');
+      const marker = svgEl('marker', { id: 'arrow', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' });
+      marker.appendChild(svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: 'rgba(103, 92, 79, 0.55)' }));
+      defs.appendChild(marker);
+      svg.appendChild(defs);
+
+      lanes.forEach((lane, index) => {
+        const y = top - 26 + index * laneHeight;
+        svg.appendChild(svgEl('rect', { class: 'topology-lane', x: 20, y, width: width - 40, height: laneHeight - 12, rx: 16 }));
+        svg.appendChild(svgEl('text', { class: 'topology-label', x: 34, y: y + 24 }, lane));
+      });
+
+      placed.forEach((node) => {
+        (node.task.dependsOn || []).forEach((depId) => {
+          const dep = nodeById.get(depId);
+          if (!dep) return;
+          svg.appendChild(svgEl('path', {
+            class: 'topology-edge',
+            d: 'M ' + (dep.x + cardWidth) + ' ' + (dep.y + cardHeight / 2) + ' C ' + (dep.x + cardWidth + 45) + ' ' + (dep.y + cardHeight / 2) + ', ' + (node.x - 45) + ' ' + (node.y + cardHeight / 2) + ', ' + node.x + ' ' + (node.y + cardHeight / 2)
+          }));
+        });
+      });
+
+      placed.forEach((node) => {
+        const task = node.task;
+        const group = svgEl('g', { class: 'topology-node ' + statusClass(task.latestRunStatus || task.status), tabindex: 0 });
+        group.appendChild(svgEl('title', {}, [task.id || '-', task.type || '-', task.assigneeAgent || '-', 'task=' + (task.status || '-'), 'run=' + (task.latestRunStatus || '-')].join(' · ')));
+        group.appendChild(svgEl('rect', { class: 'topology-card', x: node.x, y: node.y, width: cardWidth, height: cardHeight, rx: 14 }));
+        group.appendChild(svgEl('text', { class: 'topology-title', x: node.x + 14, y: node.y + 24 }, task.name || task.id || '-'));
+        group.appendChild(svgEl('text', { class: 'topology-meta', x: node.x + 14, y: node.y + 44 }, (task.type || '-') + ' · ' + (task.status || '-')));
+        group.appendChild(svgEl('text', { class: 'topology-meta', x: node.x + 14, y: node.y + 62 }, 'run ' + (task.latestRunStatus || '-')));
+        const count = commCount.get(task.id) || 0;
+        if (count > 0) {
+          group.appendChild(svgEl('rect', { class: 'topology-badge', x: node.x + cardWidth - 54, y: node.y + 54, width: 40, height: 20, rx: 10 }));
+          group.appendChild(svgEl('text', { class: 'topology-meta', x: node.x + cardWidth - 44, y: node.y + 68 }, count + ' msg'));
+        }
+        group.addEventListener('click', function() {
+          taskLogFilter.value = task.id || '';
+          loadDashboard();
+        });
+        group.addEventListener('keydown', function(event) {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            taskLogFilter.value = task.id || '';
+            loadDashboard();
+          }
+        });
+        svg.appendChild(group);
+      });
+
+      const wrap = el('div', 'topology-wrap');
+      wrap.appendChild(svg);
+      const legend = el('div', 'meta');
+      legend.appendChild(pill('Dependency edge: prerequisite → dependent'));
+      legend.appendChild(pill('Badge: communication count'));
+      legend.appendChild(pill('Click a task to filter logs'));
+      const pills = ['Project ' + projectId, 'Tasks ' + tasks.length, 'Agents ' + lanes.length];
+      if (hasWarning) pills.push('Topology warning: missing or cyclic dependency');
+      topologyPanel.replaceChildren(panelHead('Topology', 'Task Topology', pills), wrap, legend);
     }
 
     function table(headers) {
@@ -1756,13 +1913,13 @@ func renderStatusPanelHTML(serviceName string) string {
         renderCosts('', { points: [], totalTokens: 0, estimatedCostUsd: 0, maxTokens: 0 });
         renderSandboxes('', { items: [], count: 0 });
         renderSnapshots('', { items: [], count: 0 });
-        return null;
+        return { costs: null, communications: null };
       }
       const taskId = taskLogFilter.value.trim();
       const limit = encodeURIComponent(logLimit.value || '25');
       const scopedTask = taskId ? '&taskId=' + encodeURIComponent(taskId) : '';
       const costPath = '/projects/' + encodeURIComponent(projectId) + '/token-costs' + (taskId ? '?taskId=' + encodeURIComponent(taskId) : '');
-      const [, , , costs] = await Promise.all([
+      const [, , communications, costs] = await Promise.all([
         renderPanelFetch(alertPanel, 'Failure Alerts', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/alerts?limit=' + limit), (payload) => renderAlerts(projectId, payload)),
         renderPanelFetch(auditPanel, 'Audit Trail', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/audit-logs?limit=' + limit), (payload) => renderAuditLogs(projectId, payload)),
         renderPanelFetch(commPanel, 'Agent Message Log', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/communications?limit=' + limit + scopedTask), (payload) => renderCommunications(projectId, payload)),
@@ -1770,7 +1927,7 @@ func renderStatusPanelHTML(serviceName string) string {
         renderPanelFetch(sandboxPanel, 'Sandboxes', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/sandboxes'), (payload) => renderSandboxes(projectId, payload)),
         renderPanelFetch(snapshotPanel, 'Snapshots', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/snapshots'), (payload) => renderSnapshots(projectId, payload))
       ]);
-      return costs;
+      return { costs, communications };
     }
 
     async function loadDashboard() {
@@ -1786,8 +1943,9 @@ func renderStatusPanelHTML(serviceName string) string {
         const view = await fetchJSON('/status/matrix' + value);
         renderMatrix(view);
         const projectId = filter.value || '';
-        const costs = await loadProjectPanels(projectId);
-        renderKPIs(view, costs);
+        const panels = await loadProjectPanels(projectId);
+        renderTopology(view, panels ? panels.communications : null);
+        renderKPIs(view, panels ? panels.costs : null);
       } catch (err) {
         renderError(matrixPanel, 'Status Matrix', err);
       }
