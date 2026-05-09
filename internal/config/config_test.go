@@ -50,6 +50,26 @@ func TestLoadStoreOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadWorkspaceProviderDefaults(t *testing.T) {
+	t.Setenv("MULTI_AGENT_WORKSPACE_PROVIDER", "")
+
+	cfg := Load()
+
+	if cfg.WorkspaceProvider != "directory" {
+		t.Fatalf("WorkspaceProvider = %q, want directory", cfg.WorkspaceProvider)
+	}
+}
+
+func TestLoadWorkspaceProviderOverrides(t *testing.T) {
+	t.Setenv("MULTI_AGENT_WORKSPACE_PROVIDER", "directory")
+
+	cfg := Load()
+
+	if cfg.WorkspaceProvider != "directory" {
+		t.Fatalf("WorkspaceProvider = %q, want directory", cfg.WorkspaceProvider)
+	}
+}
+
 func TestLoadRuntimeDefaults(t *testing.T) {
 	t.Setenv("MULTI_AGENT_RUNTIME_PROVIDER", "")
 	t.Setenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", "")
@@ -168,6 +188,14 @@ func TestValidateRejectsInvalidProductionConfig(t *testing.T) {
 		if !fields[field] {
 			t.Fatalf("expected issue for %s, got %v", field, issues)
 		}
+	}
+}
+
+func TestValidateRejectsInvalidWorkspaceProvider(t *testing.T) {
+	err := Validate(Config{WorkspaceProvider: "git-local"})
+	issues := ValidationIssues(err)
+	if len(issues) != 1 || issues[0].Field != "WorkspaceProvider" {
+		t.Fatalf("expected WorkspaceProvider issue, got %v", issues)
 	}
 }
 

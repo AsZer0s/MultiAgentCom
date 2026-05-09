@@ -1268,6 +1268,19 @@ func TestMergeSharedSandboxSuccess(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(result.Sandbox.RootPath, "workspace", "manifest.json")); err != nil {
 		t.Fatalf("expected shared sandbox manifest: %v", err)
 	}
+	workspaceManifestPath := filepath.Join(result.Sandbox.WorkspacePath, ".multiagent", "workspace-manifest.json")
+	workspaceManifestPayload, err := os.ReadFile(workspaceManifestPath)
+	if err != nil {
+		t.Fatalf("expected shared workspace manifest: %v", err)
+	}
+	if !strings.Contains(string(workspaceManifestPayload), `"schemaVersion":"workspace.manifest.v1"`) && !strings.Contains(string(workspaceManifestPayload), `"schemaVersion": "workspace.manifest.v1"`) {
+		t.Fatalf("workspace manifest missing schema version: %s", string(workspaceManifestPayload))
+	}
+	for _, artifactID := range result.ArtifactIDs {
+		if _, err := os.Stat(filepath.Join(result.Sandbox.WorkspacePath, "artifacts", artifactID, "metadata", "manifest.json")); err != nil {
+			t.Fatalf("expected materialized artifact %s manifest: %v", artifactID, err)
+		}
+	}
 
 	sandboxes, err := svc.ListSandboxes(ctx, project.ID)
 	if err != nil {
@@ -1480,6 +1493,84 @@ func TestSharedSandboxFailureAutoRollbackToLatestStableSnapshot(t *testing.T) {
 	}
 	if len(sandboxes) != 3 {
 		t.Fatalf("expected rollback to restore 3 sandboxes, got %d", len(sandboxes))
+	}
+}
+
+func TestRollbackToSnapshotResolvesFileStateRef(t *testing.T) {
+	cfg := config.Config{
+		Address:       ":0",
+		ServiceName:   "test-snapshot-file-state-ref",
+		ArtifactRoot:  t.TempDir(),
+		SandboxRoot:   t.TempDir(),
+		StoreProvider: "file",
+		DataRoot:      t.TempDir(),
+		DefaultAgent:  "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	if _, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	}); err != nil {
+		t.Fatalf("create initial stable snapshot: %v", err)
+	}
+	snapshots, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	delete(svc.snapshotState, snapshots[0].ID)
+
+	rollback, err := svc.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{SnapshotID: snapshots[0].ID, Reason: "file state ref rollback"})
+	if err != nil {
+		t.Fatalf("rollback from file state ref: %v", err)
+	}
+	if rollback.RestoredFrom.ID != snapshots[0].ID {
+		t.Fatalf("expected restored snapshot %s, got %s", snapshots[0].ID, rollback.RestoredFrom.ID)
+	}
+}
+
+func TestRollbackToSnapshotRejectsFileChecksumMismatch(t *testing.T) {
+	cfg := config.Config{
+		Address:       ":0",
+		ServiceName:   "test-snapshot-file-checksum",
+		ArtifactRoot:  t.TempDir(),
+		SandboxRoot:   t.TempDir(),
+		StoreProvider: "file",
+		DataRoot:      t.TempDir(),
+		DefaultAgent:  "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	if _, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	}); err != nil {
+		t.Fatalf("create initial stable snapshot: %v", err)
+	}
+	snapshots, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	delete(svc.snapshotState, snapshots[0].ID)
+	statePath := strings.TrimPrefix(snapshots[0].StateRef, "file://")
+	if err := os.WriteFile(statePath, []byte(`{"corrupt":true}`), 0o644); err != nil {
+		t.Fatalf("corrupt snapshot state: %v", err)
+	}
+
+	_, err = svc.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{SnapshotID: snapshots[0].ID, Reason: "checksum mismatch"})
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != "CONFLICT" || !strings.Contains(appErr.Message, "checksum mismatch") {
+		t.Fatalf("expected checksum conflict, got %v", err)
 	}
 }
 
@@ -2306,6 +2397,144 @@ func main() {
 	conflictLog := filepath.Join(sandbox.Sandbox.RootPath, "workspace", "bundle", "metadata", "lock-conflicts.log")
 	if _, err := os.Stat(conflictLog); err != nil {
 		t.Fatalf("expected lock conflict log: %v", err)
+	}
+}
+
+func TestCodeLockPreservesLateGeneratedHumanContent(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-code-lock-late-file",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Late Lock Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Todo", Content: "Implement todo app."}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	lockedHTML := "<html><body><!-- LOCKED BY HUMAN -->late generated lock</body></html>\n"
+	if _, err := svc.ApplyCodeLock(ctx, project.ID, ApplyCodeLockInput{
+		TaskID:    planResult.Task.ID,
+		Path:      "web-app/index.html",
+		Content:   lockedHTML,
+		CreatedBy: "reviewer",
+	}); err != nil {
+		t.Fatalf("apply code lock: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s", status.Run.Status)
+	}
+	sandbox, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(sandbox.Sandbox.WorkspacePath, "bundle", "web-app", "index.html"))
+	if err != nil {
+		t.Fatalf("read locked html: %v", err)
+	}
+	if string(data) != lockedHTML {
+		t.Fatalf("expected locked html, got %s", string(data))
+	}
+}
+
+func TestGoSymbolCodeLockReplacesOnlyFunction(t *testing.T) {
+	cfg := config.Config{
+		Address:      ":0",
+		ServiceName:  "test-code-lock-go-symbol",
+		ArtifactRoot: t.TempDir(),
+		SandboxRoot:  t.TempDir(),
+		DefaultAgent: "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Go Symbol Lock Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Todo", Content: "Implement todo app."}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	lockedSource := `package main
+
+import "fmt"
+
+func main() {
+	// LOCKED BY HUMAN
+	fmt.Println("symbol lock")
+}
+`
+	if _, err := svc.ApplyCodeLock(ctx, project.ID, ApplyCodeLockInput{
+		TaskID:     planResult.Task.ID,
+		Path:       "generated-app/main.go",
+		Content:    lockedSource,
+		LockMode:   "go_symbol",
+		Language:   "go",
+		SymbolKind: "func",
+		SymbolName: "main",
+		CreatedBy:  "reviewer",
+	}); err != nil {
+		t.Fatalf("apply go symbol lock: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s", status.Run.Status)
+	}
+	sandbox, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(sandbox.Sandbox.WorkspacePath, "bundle", "generated-app", "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	source := string(data)
+	if !strings.Contains(source, `fmt.Println("symbol lock")`) || !strings.Contains(source, "type todo struct") {
+		t.Fatalf("expected locked main and preserved generated declarations, got:\n%s", source)
+	}
+}
+
+func TestGoSymbolCodeLockRejectsInvalidInput(t *testing.T) {
+	svc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Invalid Go Lock Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.ApplyCodeLock(ctx, project.ID, ApplyCodeLockInput{
+		Path:       "generated-app/main.go",
+		Content:    "package main\n\n// LOCKED BY HUMAN\nfunc other() {}\n",
+		LockMode:   "go_symbol",
+		Language:   "go",
+		SymbolKind: "func",
+		SymbolName: "main",
+	}); err == nil {
+		t.Fatal("expected invalid go symbol lock to fail")
 	}
 }
 

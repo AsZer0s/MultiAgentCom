@@ -1164,10 +1164,14 @@ func TestHTTPApplyCodeLock(t *testing.T) {
 
 	lockedSource := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\t// LOCKED BY HUMAN\n\tfmt.Println(\"human locked main\")\n}\n"
 	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/locks", map[string]any{
-		"taskId":    planResult.Task.ID,
-		"path":      "generated-app/main.go",
-		"content":   lockedSource,
-		"createdBy": "reviewer",
+		"taskId":     planResult.Task.ID,
+		"path":       "generated-app/main.go",
+		"content":    lockedSource,
+		"lockMode":   "go_symbol",
+		"language":   "go",
+		"symbolKind": "func",
+		"symbolName": "main",
+		"createdBy":  "reviewer",
 	})
 
 	runBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/run", map[string]any{
@@ -1184,13 +1188,13 @@ func TestHTTPApplyCodeLock(t *testing.T) {
 	var sandbox service.SandboxView
 	decodeResponse(t, sandboxBody, &sandbox)
 
-	mainPath := filepath.Join(sandbox.Sandbox.RootPath, "workspace", "bundle", "generated-app", "main.go")
+	mainPath := filepath.Join(sandbox.Sandbox.WorkspacePath, "bundle", "generated-app", "main.go")
 	data, err := os.ReadFile(mainPath)
 	if err != nil {
 		t.Fatalf("read locked main.go: %v", err)
 	}
-	if string(data) != lockedSource {
-		t.Fatalf("expected locked source to be preserved, got:\n%s", string(data))
+	if !strings.Contains(string(data), "human locked main") || !strings.Contains(string(data), "type todo struct") {
+		t.Fatalf("expected locked main function and preserved generated declarations, got:\n%s", string(data))
 	}
 }
 

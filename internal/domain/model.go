@@ -102,17 +102,20 @@ const (
 )
 
 type Sandbox struct {
-	ID            string        `json:"id"`
-	ProjectID     string        `json:"projectId"`
-	RunID         string        `json:"runId"`
-	TaskID        string        `json:"taskId"`
-	AgentType     string        `json:"agentType"`
-	Scope         string        `json:"scope"`
-	RootPath      string        `json:"rootPath"`
-	Status        SandboxStatus `json:"status"`
-	FailureReason string        `json:"failureReason,omitempty"`
-	CreatedAt     time.Time     `json:"createdAt"`
-	UpdatedAt     time.Time     `json:"updatedAt"`
+	ID                   string        `json:"id"`
+	ProjectID            string        `json:"projectId"`
+	RunID                string        `json:"runId"`
+	TaskID               string        `json:"taskId"`
+	AgentType            string        `json:"agentType"`
+	Scope                string        `json:"scope"`
+	RootPath             string        `json:"rootPath"`
+	WorkspacePath        string        `json:"workspacePath,omitempty"`
+	WorkspaceProvider    string        `json:"workspaceProvider,omitempty"`
+	WorkspaceManifestRef string        `json:"workspaceManifestRef,omitempty"`
+	Status               SandboxStatus `json:"status"`
+	FailureReason        string        `json:"failureReason,omitempty"`
+	CreatedAt            time.Time     `json:"createdAt"`
+	UpdatedAt            time.Time     `json:"updatedAt"`
 }
 
 type Snapshot struct {
@@ -139,13 +142,17 @@ type HumanOverride struct {
 }
 
 type CodeLock struct {
-	ID        string    `json:"id"`
-	ProjectID string    `json:"projectId"`
-	TaskID    string    `json:"taskId,omitempty"`
-	Path      string    `json:"path"`
-	Content   string    `json:"content"`
-	CreatedBy string    `json:"createdBy"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID         string    `json:"id"`
+	ProjectID  string    `json:"projectId"`
+	TaskID     string    `json:"taskId,omitempty"`
+	Path       string    `json:"path"`
+	Content    string    `json:"content"`
+	LockMode   string    `json:"lockMode,omitempty"`
+	Language   string    `json:"language,omitempty"`
+	SymbolKind string    `json:"symbolKind,omitempty"`
+	SymbolName string    `json:"symbolName,omitempty"`
+	CreatedBy  string    `json:"createdBy"`
+	CreatedAt  time.Time `json:"createdAt"`
 }
 
 type Preview struct {

@@ -10,6 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -17,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -283,10 +287,14 @@ type HumanOverrideResult struct {
 }
 
 type ApplyCodeLockInput struct {
-	TaskID    string `json:"taskId"`
-	Path      string `json:"path"`
-	Content   string `json:"content"`
-	CreatedBy string `json:"createdBy"`
+	TaskID     string `json:"taskId"`
+	Path       string `json:"path"`
+	Content    string `json:"content"`
+	LockMode   string `json:"lockMode"`
+	Language   string `json:"language"`
+	SymbolKind string `json:"symbolKind"`
+	SymbolName string `json:"symbolName"`
+	CreatedBy  string `json:"createdBy"`
 }
 
 type CodeLockResult struct {
@@ -400,6 +408,9 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 	}
 	if strings.TrimSpace(cfg.DataRoot) == "" {
 		cfg.DataRoot = filepath.Join(os.TempDir(), "multiagentcom", "data")
+	}
+	if strings.TrimSpace(cfg.WorkspaceProvider) == "" {
+		cfg.WorkspaceProvider = "directory"
 	}
 	if cfg.RuntimeTimeout == 0 {
 		cfg.RuntimeTimeout = 30 * time.Second
@@ -1267,6 +1278,16 @@ func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input App
 	if !strings.Contains(lockContent, "LOCKED BY HUMAN") {
 		return nil, newValidationError("content must include LOCKED BY HUMAN marker")
 	}
+	lockMode := normalizeLockMode(input.LockMode)
+	if lockMode == "" {
+		return nil, newValidationError("lockMode must be file or go_symbol")
+	}
+	symbolKind := strings.TrimSpace(input.SymbolKind)
+	symbolName := strings.TrimSpace(input.SymbolName)
+	language := strings.TrimSpace(input.Language)
+	if err := validateCodeLock(lockPath, lockContent, lockMode, language, symbolKind, symbolName); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(input.TaskID) != "" {
 		if _, err := s.resolveTaskLocked(projectID, input.TaskID); err != nil {
 			return nil, err
@@ -1274,13 +1295,17 @@ func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input App
 	}
 
 	lock := &domain.CodeLock{
-		ID:        nextID("lock"),
-		ProjectID: projectID,
-		TaskID:    strings.TrimSpace(input.TaskID),
-		Path:      filepath.ToSlash(lockPath),
-		Content:   lockContent,
-		CreatedBy: strings.TrimSpace(input.CreatedBy),
-		CreatedAt: now,
+		ID:         nextID("lock"),
+		ProjectID:  projectID,
+		TaskID:     strings.TrimSpace(input.TaskID),
+		Path:       filepath.ToSlash(lockPath),
+		Content:    lockContent,
+		LockMode:   lockMode,
+		Language:   language,
+		SymbolKind: symbolKind,
+		SymbolName: symbolName,
+		CreatedBy:  strings.TrimSpace(input.CreatedBy),
+		CreatedAt:  now,
 	}
 	if lock.CreatedBy == "" {
 		lock.CreatedBy = "human-operator"
@@ -2231,7 +2256,9 @@ func (s *Service) failRun(runID string, failure error) {
 func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.Task, plan *domain.Plan, run *domain.AgentRun, sandbox *domain.Sandbox) (*domain.Artifact, string, error) {
 	runDir := filepath.Join(s.cfg.ArtifactRoot, project.ID, run.ID)
 	bundleDir := filepath.Join(runDir, "bundle")
-	if sandbox != nil && strings.TrimSpace(sandbox.RootPath) != "" {
+	if sandbox != nil && strings.TrimSpace(sandbox.WorkspacePath) != "" {
+		bundleDir = filepath.Join(sandbox.WorkspacePath, "bundle")
+	} else if sandbox != nil && strings.TrimSpace(sandbox.RootPath) != "" {
 		bundleDir = filepath.Join(sandbox.RootPath, "workspace", "bundle")
 	}
 
@@ -2249,9 +2276,6 @@ func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.T
 		return nil, "", err
 	}
 	if err := writeFile(filepath.Join(bundleDir, "generated-app", "Dockerfile"), []byte(renderBackendDockerfile())); err != nil {
-		return nil, "", err
-	}
-	if err := s.applyProjectLocksToBundle(project.ID, task.ID, bundleDir); err != nil {
 		return nil, "", err
 	}
 	if err := writeFile(filepath.Join(bundleDir, "web-app", "package.json"), []byte(renderFrontendPackageJSON(project))); err != nil {
@@ -2278,6 +2302,14 @@ func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.T
 	}
 	if err := writeJSONFile(filepath.Join(bundleDir, "metadata", "run.json"), run); err != nil {
 		return nil, "", err
+	}
+	if err := s.applyProjectLocksToBundle(project.ID, task.ID, bundleDir); err != nil {
+		return nil, "", err
+	}
+	if sandbox != nil && strings.TrimSpace(sandbox.WorkspacePath) != "" {
+		if err := writeWorkspaceManifest(sandbox, sandbox.WorkspacePath, nil); err != nil {
+			return nil, "", err
+		}
 	}
 
 	now := time.Now().UTC()
@@ -2502,6 +2534,161 @@ func collectDeliveryFileDescriptors(bundleDir string, required []deliveryRequire
 	return descriptors, nil
 }
 
+type workspaceFileDescriptor struct {
+	Path      string `json:"path"`
+	Role      string `json:"role"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"sizeBytes"`
+}
+
+type workspaceManifest struct {
+	SchemaVersion string                    `json:"schemaVersion"`
+	SandboxID     string                    `json:"sandboxId"`
+	ProjectID     string                    `json:"projectId"`
+	TaskID        string                    `json:"taskId,omitempty"`
+	Provider      string                    `json:"provider"`
+	WorkspacePath string                    `json:"workspacePath"`
+	TreeHash      string                    `json:"treeHash"`
+	Files         []workspaceFileDescriptor `json:"files"`
+	Artifacts     any                       `json:"artifacts,omitempty"`
+	GeneratedAt   time.Time                 `json:"generatedAt"`
+}
+
+func workspaceProvider(cfg config.Config) string {
+	provider := strings.TrimSpace(cfg.WorkspaceProvider)
+	if provider == "" {
+		return "directory"
+	}
+	return provider
+}
+
+func writeWorkspaceManifest(sandbox *domain.Sandbox, workspacePath string, artifacts any) error {
+	files, treeHash, err := collectWorkspaceFiles(workspacePath)
+	if err != nil {
+		return err
+	}
+	manifest := workspaceManifest{
+		SchemaVersion: "workspace.manifest.v1",
+		SandboxID:     sandbox.ID,
+		ProjectID:     sandbox.ProjectID,
+		TaskID:        sandbox.TaskID,
+		Provider:      sandbox.WorkspaceProvider,
+		WorkspacePath: workspacePath,
+		TreeHash:      treeHash,
+		Files:         files,
+		Artifacts:     artifacts,
+		GeneratedAt:   time.Now().UTC(),
+	}
+	return writeJSONFile(filepath.Join(workspacePath, ".multiagent", "workspace-manifest.json"), manifest)
+}
+
+func collectWorkspaceFiles(workspacePath string) ([]workspaceFileDescriptor, string, error) {
+	manifestPath := filepath.Join(workspacePath, ".multiagent", "workspace-manifest.json")
+	files := make([]workspaceFileDescriptor, 0)
+	if err := filepath.WalkDir(workspacePath, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if path == manifestPath {
+			return nil
+		}
+		relativePath, err := filepath.Rel(workspacePath, path)
+		if err != nil {
+			return err
+		}
+		checksum, size, err := fileChecksum(path)
+		if err != nil {
+			return err
+		}
+		pathSlash := filepath.ToSlash(relativePath)
+		files = append(files, workspaceFileDescriptor{
+			Path:      pathSlash,
+			Role:      workspaceFileRole(pathSlash),
+			SHA256:    checksum,
+			SizeBytes: size,
+		})
+		return nil
+	}); err != nil {
+		return nil, "", err
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	treeHash := sha256.New()
+	for _, file := range files {
+		fmt.Fprintf(treeHash, "%s\x00%s\x00%d\n", file.Path, file.SHA256, file.SizeBytes)
+	}
+	return files, hex.EncodeToString(treeHash.Sum(nil)), nil
+}
+
+func workspaceFileRole(path string) string {
+	switch {
+	case strings.HasPrefix(path, "bundle/metadata/"):
+		return "bundle_metadata"
+	case strings.HasPrefix(path, "bundle/generated-app/"):
+		return "backend_source"
+	case strings.HasPrefix(path, "bundle/web-app/"):
+		return "frontend_source"
+	case strings.HasPrefix(path, "bundle/"):
+		return "delivery_bundle"
+	case strings.HasPrefix(path, "artifacts/"):
+		return "materialized_artifact"
+	case path == "manifest.json":
+		return "shared_manifest"
+	default:
+		return "workspace_file"
+	}
+}
+
+func materializeArtifact(sourcePath, destinationDir string) error {
+	if err := os.RemoveAll(destinationDir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(destinationDir, 0o755); err != nil {
+		return err
+	}
+	archive, err := zip.OpenReader(sourcePath)
+	if err != nil {
+		payload, readErr := os.ReadFile(sourcePath)
+		if readErr != nil {
+			return fmt.Errorf("read artifact %s: %w", sourcePath, readErr)
+		}
+		return writeFile(filepath.Join(destinationDir, filepath.Base(sourcePath)), payload)
+	}
+	defer archive.Close()
+
+	for _, file := range archive.File {
+		targetPath := filepath.Join(destinationDir, filepath.FromSlash(file.Name))
+		cleanDestination := filepath.Clean(destinationDir) + string(os.PathSeparator)
+		if !strings.HasPrefix(filepath.Clean(targetPath), cleanDestination) {
+			return fmt.Errorf("artifact %s contains unsafe path %s", sourcePath, file.Name)
+		}
+		if file.FileInfo().IsDir() {
+			if err := os.MkdirAll(targetPath, file.Mode()); err != nil {
+				return err
+			}
+			continue
+		}
+		reader, err := file.Open()
+		if err != nil {
+			return err
+		}
+		payload, err := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if err := writeFile(targetPath, payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Service) resolveTaskLocked(projectID, taskID string) (*domain.Task, error) {
 	if taskID != "" {
 		task, ok := s.tasks[taskID]
@@ -2706,11 +2893,24 @@ func (s *Service) applyProjectLocksToBundle(projectID, taskID, bundleDir string)
 		}
 
 		targetPath := filepath.Join(bundleDir, filepath.FromSlash(lock.Path))
-		if existing, err := os.ReadFile(targetPath); err == nil && string(existing) != lock.Content {
-			conflicts = append(conflicts, fmt.Sprintf("skipped overwrite for %s because LOCKED BY HUMAN content from %s takes precedence", lock.Path, lock.CreatedBy))
-		}
-		if err := writeFile(targetPath, []byte(lock.Content)); err != nil {
-			return err
+		switch normalizeLockMode(lock.LockMode) {
+		case "file":
+			if existing, err := os.ReadFile(targetPath); err == nil && string(existing) != lock.Content {
+				conflicts = append(conflicts, fmt.Sprintf("overwrote generated content for %s because LOCKED BY HUMAN content from %s takes precedence", lock.Path, lock.CreatedBy))
+			}
+			if err := writeFile(targetPath, []byte(lock.Content)); err != nil {
+				return err
+			}
+		case "go_symbol":
+			changed, conflict, err := applyGoSymbolLock(targetPath, lock)
+			if err != nil {
+				return err
+			}
+			if changed && conflict != "" {
+				conflicts = append(conflicts, conflict)
+			}
+		default:
+			return fmt.Errorf("unsupported code lock mode %q", lock.LockMode)
 		}
 	}
 
@@ -2719,6 +2919,95 @@ func (s *Service) applyProjectLocksToBundle(projectID, taskID, bundleDir string)
 	}
 
 	return nil
+}
+
+func normalizeLockMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return "file"
+	}
+	if mode == "file" || mode == "go_symbol" {
+		return mode
+	}
+	return ""
+}
+
+func validateCodeLock(path, content, lockMode, language, symbolKind, symbolName string) error {
+	if lockMode == "file" {
+		return nil
+	}
+	if lockMode != "go_symbol" {
+		return newValidationError("lockMode must be file or go_symbol")
+	}
+	if !strings.HasSuffix(filepath.ToSlash(path), ".go") {
+		return newValidationError("go_symbol locks require a Go source path")
+	}
+	if language != "" && !strings.EqualFold(language, "go") {
+		return newValidationError("go_symbol locks require language go")
+	}
+	if symbolKind != "func" {
+		return newValidationError("go_symbol locks currently support symbolKind func")
+	}
+	if symbolName == "" {
+		return newValidationError("symbolName is required for go_symbol locks")
+	}
+	if _, _, err := findGoFunc([]byte(content), symbolName); err != nil {
+		return newValidationError(err.Error())
+	}
+	return nil
+}
+
+func applyGoSymbolLock(targetPath string, lock *domain.CodeLock) (bool, string, error) {
+	target, err := os.ReadFile(targetPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, "", err
+	}
+	locked := []byte(lock.Content)
+	lockedStart, lockedEnd, err := findGoFunc(locked, lock.SymbolName)
+	if err != nil {
+		return false, "", err
+	}
+	lockedFunc := locked[lockedStart:lockedEnd]
+	if len(target) == 0 {
+		return true, fmt.Sprintf("created %s with locked Go function %s from %s", lock.Path, lock.SymbolName, lock.CreatedBy), writeFile(targetPath, appendNewline(lockedFunc))
+	}
+	targetStart, targetEnd, err := findGoFunc(target, lock.SymbolName)
+	if err != nil {
+		if _, parseErr := parser.ParseFile(token.NewFileSet(), targetPath, target, parser.ParseComments); parseErr != nil {
+			return false, "", fmt.Errorf("parse generated Go target %s: %w", lock.Path, parseErr)
+		}
+		merged := append(appendNewline(target), appendNewline(lockedFunc)...)
+		return true, fmt.Sprintf("appended locked Go function %s to %s because generated target was missing it", lock.SymbolName, lock.Path), writeFile(targetPath, merged)
+	}
+	merged := make([]byte, 0, len(target)-targetEnd+targetStart+len(lockedFunc))
+	merged = append(merged, target[:targetStart]...)
+	merged = append(merged, lockedFunc...)
+	merged = append(merged, target[targetEnd:]...)
+	return true, fmt.Sprintf("replaced generated Go function %s in %s with LOCKED BY HUMAN content from %s", lock.SymbolName, lock.Path, lock.CreatedBy), writeFile(targetPath, merged)
+}
+
+func findGoFunc(source []byte, symbolName string) (int, int, error) {
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "lock.go", source, parser.ParseComments)
+	if err != nil {
+		return 0, 0, fmt.Errorf("go_symbol lock content must be parseable Go: %w", err)
+	}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv != nil || fn.Name == nil || fn.Name.Name != symbolName {
+			continue
+		}
+		return fileSet.Position(fn.Pos()).Offset, fileSet.Position(fn.End()).Offset, nil
+	}
+	return 0, 0, fmt.Errorf("go_symbol lock content must contain top-level func %s", symbolName)
+}
+
+func appendNewline(payload []byte) []byte {
+	if len(payload) == 0 || payload[len(payload)-1] == '\n' {
+		return append([]byte(nil), payload...)
+	}
+	copyPayload := append([]byte(nil), payload...)
+	return append(copyPayload, '\n')
 }
 
 func (s *Service) resolveLatestReleasedSharedSandboxLocked(projectID string) (*domain.Sandbox, error) {
@@ -3053,7 +3342,10 @@ func (s *Service) createPrivateSandboxLocked(projectID string, task *domain.Task
 		UpdatedAt: now,
 	}
 	sandbox.RootPath = filepath.Join(s.cfg.SandboxRoot, projectID, sandbox.ID)
-	if err := os.MkdirAll(filepath.Join(sandbox.RootPath, "workspace"), 0o755); err != nil {
+	sandbox.WorkspacePath = filepath.Join(sandbox.RootPath, "workspace")
+	sandbox.WorkspaceProvider = workspaceProvider(s.cfg)
+	sandbox.WorkspaceManifestRef = "file://" + filepath.Join(sandbox.WorkspacePath, ".multiagent", "workspace-manifest.json")
+	if err := os.MkdirAll(sandbox.WorkspacePath, 0o755); err != nil {
 		return nil, newInternalError("SANDBOX_CREATE_FAILED", "sandbox workspace could not be created")
 	}
 
@@ -3076,7 +3368,10 @@ func (s *Service) createSharedSandboxLocked(projectID string, tasks []*domain.Ta
 		sandbox.TaskID = tasks[len(tasks)-1].ID
 	}
 	sandbox.RootPath = filepath.Join(s.cfg.SandboxRoot, "shared", projectID, sandbox.ID)
-	if err := os.MkdirAll(filepath.Join(sandbox.RootPath, "workspace"), 0o755); err != nil {
+	sandbox.WorkspacePath = filepath.Join(sandbox.RootPath, "workspace")
+	sandbox.WorkspaceProvider = workspaceProvider(s.cfg)
+	sandbox.WorkspaceManifestRef = "file://" + filepath.Join(sandbox.WorkspacePath, ".multiagent", "workspace-manifest.json")
+	if err := os.MkdirAll(sandbox.WorkspacePath, 0o755); err != nil {
 		return nil, newInternalError("SANDBOX_CREATE_FAILED", "sandbox workspace could not be created")
 	}
 
@@ -3208,6 +3503,10 @@ func (s *Service) writeSharedSandboxManifest(sharedSandbox *domain.Sandbox, task
 			Checksum:  artifact.Checksum,
 			SizeBytes: artifact.SizeBytes,
 		})
+		artifactDir := filepath.Join(sharedSandbox.WorkspacePath, "artifacts", artifact.ID)
+		if err := materializeArtifact(artifact.URI, artifactDir); err != nil {
+			return err
+		}
 	}
 
 	manifest := map[string]any{
@@ -3218,7 +3517,10 @@ func (s *Service) writeSharedSandboxManifest(sharedSandbox *domain.Sandbox, task
 		"mergePassed": true,
 	}
 
-	return writeJSONFile(filepath.Join(sharedSandbox.RootPath, "workspace", "manifest.json"), manifest)
+	if err := writeJSONFile(filepath.Join(sharedSandbox.WorkspacePath, "manifest.json"), manifest); err != nil {
+		return err
+	}
+	return writeWorkspaceManifest(sharedSandbox, sharedSandbox.WorkspacePath, artifactRefs)
 }
 
 func (s *Service) currentBranchLocked(projectID string) string {
@@ -3282,9 +3584,9 @@ func (s *Service) rollbackToSnapshotLocked(projectID, snapshotID, reason string,
 	if !ok || snapshot.ProjectID != projectID {
 		return nil, newNotFoundError("snapshot not found")
 	}
-	state, ok := s.snapshotState[snapshotID]
-	if !ok {
-		return nil, newNotFoundError("snapshot state not found")
+	state, err := s.resolveSnapshotStateLocked(snapshot)
+	if err != nil {
+		return nil, err
 	}
 
 	previousBranch := s.currentBranchLocked(projectID)
@@ -3309,6 +3611,48 @@ func (s *Service) rollbackToSnapshotLocked(projectID, snapshotID, reason string,
 		RestoredTasks:   len(s.taskOrder[projectID]),
 		Message:         "project rolled back to snapshot " + snapshot.ID,
 	}, nil
+}
+
+func (s *Service) resolveSnapshotStateLocked(snapshot *domain.Snapshot) (*projectSnapshotState, error) {
+	if snapshot == nil {
+		return nil, newNotFoundError("snapshot not found")
+	}
+	if state, ok := s.snapshotState[snapshot.ID]; ok {
+		return state, nil
+	}
+	stateRef := strings.TrimSpace(snapshot.StateRef)
+	if stateRef == "" {
+		return nil, newNotFoundError("snapshot state not found")
+	}
+	if strings.HasPrefix(stateRef, "memory://") {
+		stateID := strings.TrimPrefix(stateRef, "memory://")
+		if state, ok := s.snapshotState[stateID]; ok {
+			return state, nil
+		}
+		return nil, newNotFoundError("snapshot memory state not found")
+	}
+	if strings.HasPrefix(stateRef, "file://") {
+		path := strings.TrimPrefix(stateRef, "file://")
+		payload, err := os.ReadFile(path)
+		if err != nil {
+			return nil, newNotFoundError("snapshot file state not found")
+		}
+		if checksum := strings.TrimSpace(snapshot.Checksum); checksum != "" {
+			sum := sha256.Sum256(payload)
+			if !strings.EqualFold(hex.EncodeToString(sum[:]), checksum) {
+				return nil, newConflictError("snapshot file checksum mismatch")
+			}
+		}
+		var state projectSnapshotState
+		if err := json.Unmarshal(payload, &state); err != nil {
+			return nil, newConflictError("snapshot file state is invalid")
+		}
+		return &state, nil
+	}
+	if strings.HasPrefix(stateRef, "repo://") {
+		return nil, newConflictError("repo snapshot restore is not implemented")
+	}
+	return nil, newNotFoundError("unsupported snapshot state ref")
 }
 
 func (s *Service) nextRollbackBranchLocked(projectID, baseBranch string) string {

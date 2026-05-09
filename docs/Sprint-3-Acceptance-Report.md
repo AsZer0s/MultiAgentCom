@@ -15,8 +15,8 @@
 | AC-07 | 私有沙盒隔离 | `TestPrivateSandboxIsolation`、`TestHTTPSandboxIsolationFlow` |
 | AC-08 | 共享沙盒失败回滚 | `TestMergeSharedSandboxBlocksOnIntegrationFailure`、`TestSharedSandboxFailureAutoRollbackToLatestStableSnapshot`、`TestHTTPSharedSandboxMergeIntegrationFailure`、`TestHTTPSharedSandboxFailureAutoRollback` |
 | AC-09 | HITL 强制接管 | `TestApplyHumanOverrideAtSafetyCheckpoint`、`TestHTTPApplyHumanOverride` |
-| AC-10 | 人类锁定代码不可覆盖 | `TestCodeLockPreservesHumanContent`、`TestHTTPApplyCodeLock` |
-| AC-11 | 语义快照与平行分支 | `TestRollbackToSnapshotCreatesParallelBranchTimeline`、`TestHTTPRollbackSnapshotCreatesParallelBranchTimeline` |
+| AC-10 | 人类锁定代码不可覆盖 | `TestCodeLockPreservesHumanContent`、`TestCodeLockPreservesLateGeneratedHumanContent`、`TestGoSymbolCodeLockReplacesOnlyFunction`、`TestHTTPApplyCodeLock` |
+| AC-11 | 语义快照与平行分支 | `TestRollbackToSnapshotCreatesParallelBranchTimeline`、`TestRollbackToSnapshotResolvesFileStateRef`、`TestRollbackToSnapshotRejectsFileChecksumMismatch`、`TestHTTPRollbackSnapshotCreatesParallelBranchTimeline` |
 
 ## Results
 
@@ -46,7 +46,8 @@
 - Result: `PASS`
 - Notes:
   - `POST /projects/{id}/locks` 要求提交内容中包含 `LOCKED BY HUMAN` 标记。
-  - 后续自动 bundle 生成会保留人工代码内容，并在 `metadata/lock-conflicts.log` 记录“跳过覆盖”行为。
+  - 后续自动 bundle 生成末尾会保留人工内容，避免 `web-app/index.html` / `docker-compose.yml` 等晚生成文件覆盖锁。
+  - `go_symbol` 模式支持锁定 Go 顶层 `func`，只替换目标函数并保留同文件中的 generated imports/types/其它声明。
 
 ### AC-11 Snapshot Timeline Branching
 
@@ -54,6 +55,7 @@
 - Notes:
   - `GET /projects/{id}/snapshots` 可查看稳定快照和回滚后产生的新时间线分支。
   - `POST /projects/{id}/snapshots/rollback` 不会覆写旧历史，而是创建新的 rollback branch，并保留原 `main` 分支快照。
+  - 文件存储模式下 rollback 可从 `file://` StateRef 读取落盘 `state.json`，并在 checksum 不匹配时拒绝恢复。
 
 ## Regression Summary
 
@@ -75,6 +77,7 @@
 
 ## Residual Risk
 
-- 当前 HITL 与代码锁定仍是 MVP 级内存模型，尚未接入真实代码仓或 AST 级锁区解析。
-- 时间线快照当前为语义内存快照，尚未覆盖外部依赖、真实文件系统和多分支工作树。
+- 当前 HITL 仍是 MVP 级服务状态模型，尚未接入真实代码仓权限流或分布式锁。
+- 代码锁已支持 Go 顶层函数级替换，但尚未覆盖 Go methods/types/import reconciliation 或跨语言 AST 锁。
+- 时间线快照已支持 `file://` StateRef 恢复与 checksum 校验，但尚未覆盖外部依赖、真实 Git worktree 和 repo merge/rebase。
 - Sprint 4 之前，预览环境与标准化交付链路仍未纳入回滚后的联动验收。

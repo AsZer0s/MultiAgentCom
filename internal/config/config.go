@@ -24,6 +24,7 @@ type Config struct {
 	AlertWebhookURL            string
 	StoreProvider              string
 	DataRoot                   string
+	WorkspaceProvider          string
 	RuntimeProvider            string
 	RuntimeEndpoint            string
 	RuntimeTimeout             time.Duration
@@ -69,6 +70,7 @@ func Load() Config {
 		AlertWebhookURL:            getenv("MULTI_AGENT_ALERT_WEBHOOK_URL", ""),
 		StoreProvider:              getenv("MULTI_AGENT_STORE_PROVIDER", "memory"),
 		DataRoot:                   getenv("MULTI_AGENT_DATA_ROOT", filepath.Join(os.TempDir(), "multiagentcom", "data")),
+		WorkspaceProvider:          getenv("MULTI_AGENT_WORKSPACE_PROVIDER", "directory"),
 		RuntimeProvider:            getenv("MULTI_AGENT_RUNTIME_PROVIDER", "local"),
 		RuntimeEndpoint:            getenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", ""),
 		RuntimeTimeout:             getenvDuration("MULTI_AGENT_RUNTIME_HTTP_TIMEOUT", 30*time.Second),
@@ -103,6 +105,9 @@ func WithDefaults(cfg Config) Config {
 	}
 	if strings.TrimSpace(cfg.DataRoot) == "" {
 		cfg.DataRoot = filepath.Join(os.TempDir(), "multiagentcom", "data")
+	}
+	if strings.TrimSpace(cfg.WorkspaceProvider) == "" {
+		cfg.WorkspaceProvider = "directory"
 	}
 	if strings.TrimSpace(cfg.RuntimeProvider) == "" {
 		cfg.RuntimeProvider = "local"
@@ -142,6 +147,11 @@ func Validate(cfg Config) error {
 	}
 	if strings.TrimSpace(cfg.SandboxRoot) == "" {
 		issues = append(issues, ValidationIssue{Field: "SandboxRoot", Message: "is required"})
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.WorkspaceProvider)) {
+	case "directory":
+	default:
+		issues = append(issues, ValidationIssue{Field: "WorkspaceProvider", Message: "must be directory"})
 	}
 
 	switch strings.ToLower(strings.TrimSpace(cfg.RuntimeProvider)) {
