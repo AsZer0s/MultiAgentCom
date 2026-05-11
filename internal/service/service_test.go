@@ -2642,6 +2642,72 @@ func main() {
 	}
 }
 
+func TestGoSymbolCodeLockReconcilesImports(t *testing.T) {
+	bundleDir := t.TempDir()
+	targetPath := filepath.Join(bundleDir, "generated-app", "main.go")
+	targetSource := []byte(`package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+)
+
+type todo struct {
+	ID string
+}
+
+func main() {
+	fmt.Println("generated")
+}
+`)
+	if err := writeFile(targetPath, targetSource); err != nil {
+		t.Fatalf("write target source: %v", err)
+	}
+	lock := &domain.CodeLock{
+		Path: "generated-app/main.go",
+		Content: `package main
+
+import (
+	"log"
+	"strings"
+)
+
+func main() {
+	// LOCKED BY HUMAN
+	log.Println(strings.TrimSpace(" human "))
+}
+`,
+		LockMode:   "go_symbol",
+		Language:   "go",
+		SymbolKind: "func",
+		SymbolName: "main",
+		CreatedBy:  "reviewer",
+	}
+	changed, _, err := applyGoSymbolLock(targetPath, lock)
+	if err != nil {
+		t.Fatalf("apply go symbol lock: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected lock to change target source")
+	}
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("read target source: %v", err)
+	}
+	source := string(data)
+	for _, fragment := range []string{`"log"`, `"strings"`, `log.Println(strings.TrimSpace`, "type todo struct"} {
+		if !strings.Contains(source, fragment) {
+			t.Fatalf("expected reconciled source to contain %s, got:\n%s", fragment, source)
+		}
+	}
+	for _, fragment := range []string{`"encoding/json"`, `"fmt"`, `"net/http"`} {
+		if strings.Contains(source, fragment) {
+			t.Fatalf("expected unused import %s to be removed, got:\n%s", fragment, source)
+		}
+	}
+}
+
 func TestGoSymbolCodeLockSupportsMethodTypeVarAndConst(t *testing.T) {
 	targetSource := []byte(`package main
 

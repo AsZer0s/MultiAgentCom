@@ -84,7 +84,7 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - 共享沙盒成功合并后，directory provider 的 `workspace/artifacts/<artifactId>/` 包含 materialized delivery bundle 内容，且共享工作区包含 `.multiagent/workspace-manifest.json`
 - Git provider 的共享沙盒成功合并后，私有任务 head 是共享 `workspaceHeadRef` 的 ancestor，快照包含 `workspaceStateRef` 与 `workspaceChecksum`
 - 文件存储模式下，快照 rollback 可从 `file://` StateRef 恢复；checksum 被篡改时应拒绝回滚
-- `POST /projects/{id}/locks` 可提交 `lockMode=go_symbol`、`language=go`、`symbolKind=func|method|type|var|const` 和 `symbolName`，并只替换对应 Go 声明
+- `POST /projects/{id}/locks` 可提交 `lockMode=go_symbol`、`language=go`、`symbolKind=func|method|type|var|const` 和 `symbolName`，并只替换对应 Go 声明，同时合并锁内容所需 imports、移除替换后不再使用的普通 imports
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回 `runtime.http.v1` success 时可执行成功并采用嵌套 `usage`
 - `MULTI_AGENT_RUNTIME_HTTP_BEARER_TOKEN` 配置后，runtime provider 请求携带 `Authorization: Bearer ...`
 - `MULTI_AGENT_RUNTIME_HTTP_MAX_ATTEMPTS` 配置后，runtime provider 对 retryable 失败执行有界重试；`release-check.sh` 会验证一次 `503` 后成功恢复

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"io"
@@ -3023,21 +3024,225 @@ func applyGoSymbolLock(targetPath string, lock *domain.CodeLock) (bool, string, 
 	}
 	lockedSymbol := locked[lockedStart:lockedEnd]
 	if len(target) == 0 {
-		return true, fmt.Sprintf("created %s with locked Go %s %s from %s", lock.Path, lock.SymbolKind, lock.SymbolName, lock.CreatedBy), writeFile(targetPath, appendNewline(lockedSymbol))
+		merged, err := reconcileGoImports(appendNewline(lockedSymbol), locked)
+		if err != nil {
+			return false, "", err
+		}
+		return true, fmt.Sprintf("created %s with locked Go %s %s from %s", lock.Path, lock.SymbolKind, lock.SymbolName, lock.CreatedBy), writeFile(targetPath, merged)
 	}
 	targetStart, targetEnd, err := findGoSymbol(target, lock.SymbolKind, lock.SymbolName)
 	if err != nil {
 		if _, parseErr := parser.ParseFile(token.NewFileSet(), targetPath, target, parser.ParseComments); parseErr != nil {
 			return false, "", fmt.Errorf("parse generated Go target %s: %w", lock.Path, parseErr)
 		}
-		merged := append(appendNewline(target), appendNewline(lockedSymbol)...)
+		merged, err := reconcileGoImports(append(appendNewline(target), appendNewline(lockedSymbol)...), locked)
+		if err != nil {
+			return false, "", err
+		}
 		return true, fmt.Sprintf("appended locked Go %s %s to %s because generated target was missing it", lock.SymbolKind, lock.SymbolName, lock.Path), writeFile(targetPath, merged)
 	}
 	merged := make([]byte, 0, len(target)-targetEnd+targetStart+len(lockedSymbol))
 	merged = append(merged, target[:targetStart]...)
 	merged = append(merged, lockedSymbol...)
 	merged = append(merged, target[targetEnd:]...)
+	merged, err = reconcileGoImports(merged, locked)
+	if err != nil {
+		return false, "", err
+	}
 	return true, fmt.Sprintf("replaced generated Go %s %s in %s with LOCKED BY HUMAN content from %s", lock.SymbolKind, lock.SymbolName, lock.Path, lock.CreatedBy), writeFile(targetPath, merged)
+}
+
+func reconcileGoImports(source, lockedSource []byte) ([]byte, error) {
+	imports, err := goImportSpecs(lockedSource)
+	if err != nil {
+		return nil, err
+	}
+	withImports, err := addMissingGoImports(source, imports)
+	if err != nil {
+		return nil, err
+	}
+	cleaned, err := removeUnusedGoImports(withImports)
+	if err != nil {
+		return nil, err
+	}
+	formatted, err := format.Source(cleaned)
+	if err != nil {
+		return nil, fmt.Errorf("format reconciled Go source: %w", err)
+	}
+	return formatted, nil
+}
+
+func goImportSpecs(source []byte) ([]goImportSpec, error) {
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "lock.go", source, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parse Go imports: %w", err)
+	}
+	imports := make([]goImportSpec, 0, len(file.Imports))
+	for _, item := range file.Imports {
+		if item.Path == nil {
+			continue
+		}
+		name := ""
+		if item.Name != nil {
+			name = item.Name.Name
+		}
+		imports = append(imports, goImportSpec{Name: name, Path: item.Path.Value})
+	}
+	return imports, nil
+}
+
+type goImportSpec struct {
+	Name string
+	Path string
+}
+
+func addMissingGoImports(source []byte, imports []goImportSpec) ([]byte, error) {
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "target.go", source, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parse merged Go source: %w", err)
+	}
+	existing := make(map[string]struct{}, len(file.Imports))
+	for _, item := range file.Imports {
+		if item.Path != nil {
+			existing[item.Path.Value] = struct{}{}
+		}
+	}
+	missing := make([]goImportSpec, 0)
+	for _, item := range imports {
+		if _, ok := existing[item.Path]; !ok {
+			missing = append(missing, item)
+		}
+	}
+	if len(missing) == 0 {
+		return append([]byte(nil), source...), nil
+	}
+	sort.Slice(missing, func(i, j int) bool { return missing[i].Path < missing[j].Path })
+	insertOffset := goImportInsertOffset(fileSet, file, source)
+	block := renderGoImportBlock(missing, fileHasImports(file))
+	merged := make([]byte, 0, len(source)+len(block))
+	merged = append(merged, source[:insertOffset]...)
+	merged = append(merged, block...)
+	merged = append(merged, source[insertOffset:]...)
+	return merged, nil
+}
+
+func fileHasImports(file *ast.File) bool {
+	return len(file.Imports) > 0
+}
+
+func goImportInsertOffset(fileSet *token.FileSet, file *ast.File, source []byte) int {
+	if len(file.Imports) > 0 {
+		return fileSet.Position(file.Imports[len(file.Imports)-1].End()).Offset
+	}
+	packageOffset := fileSet.Position(file.Name.End()).Offset
+	for packageOffset < len(source) && (source[packageOffset] == '\r' || source[packageOffset] == '\n') {
+		packageOffset++
+	}
+	return packageOffset
+}
+
+func renderGoImportBlock(imports []goImportSpec, appendToExisting bool) []byte {
+	var builder strings.Builder
+	if appendToExisting {
+		for _, item := range imports {
+			builder.WriteByte('\n')
+			builder.WriteString(renderGoImportSpec(item))
+		}
+		return []byte(builder.String())
+	}
+	builder.WriteString("\n\nimport (\n")
+	for _, item := range imports {
+		builder.WriteByte('\t')
+		builder.WriteString(renderGoImportSpec(item))
+		builder.WriteByte('\n')
+	}
+	builder.WriteString(")")
+	return []byte(builder.String())
+}
+
+func renderGoImportSpec(item goImportSpec) string {
+	if item.Name != "" {
+		return item.Name + " " + item.Path
+	}
+	return item.Path
+}
+
+func removeUnusedGoImports(source []byte) ([]byte, error) {
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "target.go", source, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parse merged Go source imports: %w", err)
+	}
+	used := goUsedSelectors(file)
+	unused := make([]goImportRange, 0)
+	for _, item := range file.Imports {
+		if item.Path == nil || item.Name != nil {
+			continue
+		}
+		alias := goDefaultImportName(item.Path.Value)
+		if alias == "" || used[alias] {
+			continue
+		}
+		unused = append(unused, goImportRange{Start: fileSet.Position(item.Pos()).Offset, End: fileSet.Position(item.End()).Offset})
+	}
+	if len(unused) == 0 {
+		return append([]byte(nil), source...), nil
+	}
+	sort.Slice(unused, func(i, j int) bool { return unused[i].Start > unused[j].Start })
+	cleaned := append([]byte(nil), source...)
+	for _, item := range unused {
+		start, end := expandGoImportRemoval(cleaned, item.Start, item.End)
+		cleaned = append(cleaned[:start], cleaned[end:]...)
+	}
+	return cleaned, nil
+}
+
+type goImportRange struct {
+	Start int
+	End   int
+}
+
+func expandGoImportRemoval(source []byte, start, end int) (int, int) {
+	for start > 0 && (source[start-1] == ' ' || source[start-1] == '\t') {
+		start--
+	}
+	for end < len(source) && (source[end] == ' ' || source[end] == '\t') {
+		end++
+	}
+	if end < len(source) && source[end] == '\r' {
+		end++
+	}
+	if end < len(source) && source[end] == '\n' {
+		end++
+	}
+	return start, end
+}
+
+func goUsedSelectors(file *ast.File) map[string]bool {
+	used := map[string]bool{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		ident, ok := selector.X.(*ast.Ident)
+		if ok {
+			used[ident.Name] = true
+		}
+		return true
+	})
+	return used
+}
+
+func goDefaultImportName(pathValue string) string {
+	pathValue = strings.Trim(pathValue, "\"")
+	if pathValue == "" {
+		return ""
+	}
+	parts := strings.Split(pathValue, "/")
+	return parts[len(parts)-1]
 }
 
 func isSupportedGoSymbolKind(kind string) bool {
