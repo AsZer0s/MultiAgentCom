@@ -79,6 +79,45 @@ func TestLoadWorkspaceProviderOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadWorkspaceGitCleanupDefaults(t *testing.T) {
+	cfg := Load()
+
+	if !cfg.WorkspaceGitCleanupEnabled {
+		t.Fatal("expected git cleanup to be enabled by default")
+	}
+	if cfg.WorkspaceGitCleanupDeleteBranches {
+		t.Fatal("expected git cleanup branch deletion to be disabled by default")
+	}
+	if cfg.WorkspaceGitCleanupFailedEnabled {
+		t.Fatal("expected failed sandbox cleanup to be disabled by default")
+	}
+	if cfg.WorkspaceGitCleanupMinAge != 0 {
+		t.Fatalf("WorkspaceGitCleanupMinAge = %s, want 0", cfg.WorkspaceGitCleanupMinAge)
+	}
+}
+
+func TestLoadWorkspaceGitCleanupOverrides(t *testing.T) {
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_ENABLED", "false")
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_DELETE_BRANCHES", "true")
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_FAILED_ENABLED", "true")
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_MIN_AGE", "2h")
+
+	cfg := Load()
+
+	if cfg.WorkspaceGitCleanupEnabled {
+		t.Fatal("expected git cleanup to be disabled by env")
+	}
+	if !cfg.WorkspaceGitCleanupDeleteBranches {
+		t.Fatal("expected branch cleanup to be enabled by env")
+	}
+	if !cfg.WorkspaceGitCleanupFailedEnabled {
+		t.Fatal("expected failed sandbox cleanup to be enabled by env")
+	}
+	if cfg.WorkspaceGitCleanupMinAge != 2*time.Hour {
+		t.Fatalf("WorkspaceGitCleanupMinAge = %s, want 2h", cfg.WorkspaceGitCleanupMinAge)
+	}
+}
+
 func TestLoadRuntimeDefaults(t *testing.T) {
 	t.Setenv("MULTI_AGENT_RUNTIME_PROVIDER", "")
 	t.Setenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", "")
@@ -223,17 +262,17 @@ func TestValidateRejectsInvalidWorkspaceProvider(t *testing.T) {
 }
 
 func TestValidateRejectsInvalidRuntimeRetryConfig(t *testing.T) {
-	err := Validate(Config{RuntimeHTTPMaxAttempts: -1, RuntimeHTTPRetryBaseDelay: -time.Millisecond})
+	err := Validate(Config{RuntimeHTTPMaxAttempts: -1, RuntimeHTTPRetryBaseDelay: -time.Millisecond, WorkspaceGitCleanupMinAge: -time.Second})
 	issues := ValidationIssues(err)
-	if len(issues) != 2 {
-		t.Fatalf("expected 2 validation issues, got %v", issues)
+	if len(issues) != 3 {
+		t.Fatalf("expected 3 validation issues, got %v", issues)
 	}
 
 	fields := map[string]bool{}
 	for _, issue := range issues {
 		fields[issue.Field] = true
 	}
-	for _, field := range []string{"RuntimeHTTPMaxAttempts", "RuntimeHTTPRetryBaseDelay"} {
+	for _, field := range []string{"RuntimeHTTPMaxAttempts", "RuntimeHTTPRetryBaseDelay", "WorkspaceGitCleanupMinAge"} {
 		if !fields[field] {
 			t.Fatalf("expected issue for %s, got %v", field, issues)
 		}

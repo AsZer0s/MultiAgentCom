@@ -61,6 +61,7 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("POST /projects/{id}/overrides", server.handleApplyHumanOverride)
 	mux.HandleFunc("POST /projects/{id}/locks", server.handleApplyCodeLock)
 	mux.HandleFunc("POST /projects/{id}/shared-sandbox/merge", server.handleMergeSharedSandbox)
+	mux.HandleFunc("POST /projects/{id}/workspaces/cleanup", server.handleCleanupWorkspaces)
 	mux.HandleFunc("GET /projects/{id}/snapshots", server.handleListSnapshots)
 	mux.HandleFunc("POST /projects/{id}/snapshots/rollback", server.handleRollbackSnapshot)
 	mux.HandleFunc("POST /projects/{id}/preview/start", server.handleStartPreview)
@@ -489,6 +490,25 @@ func (s *Server) handleMergeSharedSandbox(w http.ResponseWriter, r *http.Request
 		status = http.StatusConflict
 	}
 	writeJSON(w, status, result)
+}
+
+func (s *Server) handleCleanupWorkspaces(w http.ResponseWriter, r *http.Request) {
+	if !authorizeRequest(w, r, r.PathValue("id"), "operator") {
+		return
+	}
+	var input service.CleanupWorkspacesInput
+	if err := decodeJSONAllowEmpty(r, &input); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	result, err := s.svc.CleanupWorkspaces(r.Context(), r.PathValue("id"), input)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {

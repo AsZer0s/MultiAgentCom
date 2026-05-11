@@ -102,23 +102,30 @@ const (
 )
 
 type Sandbox struct {
-	ID                   string        `json:"id"`
-	ProjectID            string        `json:"projectId"`
-	RunID                string        `json:"runId"`
-	TaskID               string        `json:"taskId"`
-	AgentType            string        `json:"agentType"`
-	Scope                string        `json:"scope"`
-	RootPath             string        `json:"rootPath"`
-	WorkspacePath        string        `json:"workspacePath,omitempty"`
-	WorkspaceProvider    string        `json:"workspaceProvider,omitempty"`
-	WorkspaceManifestRef string        `json:"workspaceManifestRef,omitempty"`
-	WorkspaceBranch      string        `json:"workspaceBranch,omitempty"`
-	WorkspaceBaseRef     string        `json:"workspaceBaseRef,omitempty"`
-	WorkspaceHeadRef     string        `json:"workspaceHeadRef,omitempty"`
-	Status               SandboxStatus `json:"status"`
-	FailureReason        string        `json:"failureReason,omitempty"`
-	CreatedAt            time.Time     `json:"createdAt"`
-	UpdatedAt            time.Time     `json:"updatedAt"`
+	ID                     string        `json:"id"`
+	ProjectID              string        `json:"projectId"`
+	RunID                  string        `json:"runId"`
+	TaskID                 string        `json:"taskId"`
+	AgentType              string        `json:"agentType"`
+	Scope                  string        `json:"scope"`
+	RootPath               string        `json:"rootPath"`
+	WorkspacePath          string        `json:"workspacePath,omitempty"`
+	WorkspaceProvider      string        `json:"workspaceProvider,omitempty"`
+	WorkspaceManifestRef   string        `json:"workspaceManifestRef,omitempty"`
+	WorkspaceBranch        string        `json:"workspaceBranch,omitempty"`
+	WorkspaceBaseRef       string        `json:"workspaceBaseRef,omitempty"`
+	WorkspaceHeadRef       string        `json:"workspaceHeadRef,omitempty"`
+	WorkspaceCleanupStatus string        `json:"workspaceCleanupStatus,omitempty"`
+	WorkspaceCleanedAt     time.Time     `json:"workspaceCleanedAt,omitempty"`
+	WorkspaceCleanupReason string        `json:"workspaceCleanupReason,omitempty"`
+	WorkspaceCleanupError  string        `json:"workspaceCleanupError,omitempty"`
+	WorkspaceWorktreeGone  bool          `json:"workspaceWorktreeGone,omitempty"`
+	WorkspaceBranchGone    bool          `json:"workspaceBranchGone,omitempty"`
+	WorkspaceRetainedRef   string        `json:"workspaceRetainedRef,omitempty"`
+	Status                 SandboxStatus `json:"status"`
+	FailureReason          string        `json:"failureReason,omitempty"`
+	CreatedAt              time.Time     `json:"createdAt"`
+	UpdatedAt              time.Time     `json:"updatedAt"`
 }
 
 type Snapshot struct {

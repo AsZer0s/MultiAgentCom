@@ -1367,17 +1367,19 @@ func TestGitWorkspaceProviderCreatesPrivateWorktreeAndCommitsRun(t *testing.T) {
 func TestGitMergeSharedSandboxUsesGitMerge(t *testing.T) {
 	repoPath := initTempGitRepo(t)
 	cfg := config.Config{
-		Address:                   ":0",
-		ServiceName:               "test-git-workspace-merge",
-		ArtifactRoot:              t.TempDir(),
-		SandboxRoot:               t.TempDir(),
-		DefaultAgent:              "manager-agent",
-		WorkspaceProvider:         "git",
-		WorkspaceGitRepoPath:      repoPath,
-		WorkspaceGitBaseRef:       "main",
-		RuntimeProvider:           "local",
-		RuntimeHTTPMaxAttempts:    1,
-		RuntimeHTTPRetryBaseDelay: time.Millisecond,
+		Address:                           ":0",
+		ServiceName:                       "test-git-workspace-merge",
+		ArtifactRoot:                      t.TempDir(),
+		SandboxRoot:                       t.TempDir(),
+		DefaultAgent:                      "manager-agent",
+		WorkspaceProvider:                 "git",
+		WorkspaceGitRepoPath:              repoPath,
+		WorkspaceGitBaseRef:               "main",
+		WorkspaceGitCleanupEnabled:        true,
+		WorkspaceGitCleanupDeleteBranches: false,
+		RuntimeProvider:                   "local",
+		RuntimeHTTPMaxAttempts:            1,
+		RuntimeHTTPRetryBaseDelay:         time.Millisecond,
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	svc := New(cfg, logger)
@@ -1413,6 +1415,9 @@ func TestGitMergeSharedSandboxUsesGitMerge(t *testing.T) {
 	for _, head := range privateHeads {
 		runTestGit(t, result.Sandbox.WorkspacePath, "merge-base", "--is-ancestor", head, result.Sandbox.WorkspaceHeadRef)
 	}
+	if result.Cleanup == nil || result.Cleanup.RemovedWorktrees != 2 || result.Cleanup.DeletedBranches != 0 {
+		t.Fatalf("expected automatic private worktree cleanup without branch deletion, got %+v", result.Cleanup)
+	}
 	if dirty := strings.TrimSpace(runTestGit(t, result.Sandbox.WorkspacePath, "status", "--porcelain")); dirty != "M .multiagent/workspace-manifest.json" {
 		t.Fatalf("expected only workspace manifest metadata to remain uncommitted, got %q", dirty)
 	}
@@ -1422,6 +1427,112 @@ func TestGitMergeSharedSandboxUsesGitMerge(t *testing.T) {
 	}
 	if len(snapshots) != 1 || snapshots[0].WorkspaceChecksum != result.Sandbox.WorkspaceHeadRef || !strings.HasPrefix(snapshots[0].WorkspaceStateRef, "repo://local/") {
 		t.Fatalf("expected workspace snapshot ref for shared head, got %+v", snapshots)
+	}
+}
+
+func TestGitWorkspaceCleanupKeepsBranchesWhenSafeDeleteIsRefused(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{
+		Address:                   ":0",
+		ServiceName:               "test-git-workspace-cleanup-branches",
+		ArtifactRoot:              t.TempDir(),
+		SandboxRoot:               t.TempDir(),
+		DefaultAgent:              "manager-agent",
+		WorkspaceProvider:         "git",
+		WorkspaceGitRepoPath:      repoPath,
+		WorkspaceGitBaseRef:       "main",
+		RuntimeProvider:           "local",
+		RuntimeHTTPMaxAttempts:    1,
+		RuntimeHTTPRetryBaseDelay: time.Millisecond,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	privateBranches := make([]string, 0, 2)
+	privateHeads := make([]string, 0, 2)
+	for _, sandboxView := range mustListSandboxes(t, svc, ctx, project.ID) {
+		if sandboxView.Sandbox.Scope == "PRIVATE" {
+			privateBranches = append(privateBranches, sandboxView.Sandbox.WorkspaceBranch)
+			privateHeads = append(privateHeads, sandboxView.Sandbox.WorkspaceHeadRef)
+		}
+	}
+
+	mergeResult, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	})
+	if err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	cleanup, err := svc.CleanupWorkspaces(ctx, project.ID, CleanupWorkspacesInput{Scope: "PRIVATE", DeleteBranches: true})
+	if err != nil {
+		t.Fatalf("cleanup workspaces: %v", err)
+	}
+	if cleanup.DeletedBranches != 0 || cleanup.RemovedWorktrees != len(privateBranches) || cleanup.Skipped != len(privateBranches) {
+		t.Fatalf("expected worktrees removed and branch deletion safely skipped, got %+v", cleanup)
+	}
+	for idx, branch := range privateBranches {
+		if out := runTestGit(t, repoPath, "branch", "--list", branch); !strings.Contains(out, branch) {
+			t.Fatalf("expected branch %s to remain after non-force cleanup, got %q", branch, out)
+		}
+		runTestGit(t, mergeResult.Sandbox.WorkspacePath, "merge-base", "--is-ancestor", privateHeads[idx], mergeResult.Sandbox.WorkspaceHeadRef)
+	}
+	if out := runTestGit(t, repoPath, "branch", "--list", mergeResult.Sandbox.WorkspaceBranch); !strings.Contains(out, mergeResult.Sandbox.WorkspaceBranch) {
+		t.Fatalf("expected shared branch to remain, got %q", out)
+	}
+}
+
+func TestGitWorkspaceCleanupDryRunKeepsWorktrees(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{
+		Address:                    ":0",
+		ServiceName:                "test-git-workspace-cleanup-dry-run",
+		ArtifactRoot:               t.TempDir(),
+		SandboxRoot:                t.TempDir(),
+		DefaultAgent:               "manager-agent",
+		WorkspaceProvider:          "git",
+		WorkspaceGitRepoPath:       repoPath,
+		WorkspaceGitBaseRef:        "main",
+		WorkspaceGitCleanupEnabled: false,
+		RuntimeProvider:            "local",
+		RuntimeHTTPMaxAttempts:     1,
+		RuntimeHTTPRetryBaseDelay:  time.Millisecond,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	privatePaths := make([]string, 0, 2)
+	for _, sandboxView := range mustListSandboxes(t, svc, ctx, project.ID) {
+		if sandboxView.Sandbox.Scope == "PRIVATE" {
+			privatePaths = append(privatePaths, sandboxView.Sandbox.WorkspacePath)
+		}
+	}
+	if _, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	}); err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	cleanup, err := svc.CleanupWorkspaces(ctx, project.ID, CleanupWorkspacesInput{Scope: "PRIVATE", DryRun: true})
+	if err != nil {
+		t.Fatalf("cleanup workspaces dry run: %v", err)
+	}
+	if cleanup.RemovedWorktrees != len(privatePaths) {
+		t.Fatalf("expected dry-run planned removals, got %+v", cleanup)
+	}
+	worktrees := runTestGit(t, repoPath, "worktree", "list", "--porcelain")
+	for _, path := range privatePaths {
+		if !strings.Contains(worktrees, path) {
+			t.Fatalf("expected dry run to keep worktree %s, got\n%s", path, worktrees)
+		}
 	}
 }
 
@@ -2873,6 +2984,15 @@ func TestStartPreviewFromSharedSandbox(t *testing.T) {
 	if result.RefreshIntervalMs != 3000 {
 		t.Fatalf("expected refresh interval 3000, got %d", result.RefreshIntervalMs)
 	}
+}
+
+func mustListSandboxes(t *testing.T, svc *Service, ctx context.Context, projectID string) []SandboxView {
+	t.Helper()
+	sandboxes, err := svc.ListSandboxes(ctx, projectID)
+	if err != nil {
+		t.Fatalf("list sandboxes: %v", err)
+	}
+	return sandboxes
 }
 
 func initTempGitRepo(t *testing.T) string {

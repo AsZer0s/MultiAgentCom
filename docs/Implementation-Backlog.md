@@ -296,6 +296,12 @@
 - **目标：** 保持文档与实现一致。
 - **DoD：** 每次里程碑后更新 Spec/Plan/Case。
 
+### BL-905 Git workspace 清理生命周期
+- **优先级：** P1
+- **估时：** 1 PD
+- **目标：** 减少 local Git provider 长期运行后的 worktree/branch 污染。
+- **DoD：** 已合并私有 worktree 可安全清理，cleanup API 支持 dry-run；分支删除保持显式 opt-in 且不使用 force。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：

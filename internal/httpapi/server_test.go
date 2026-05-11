@@ -989,6 +989,44 @@ func TestHTTPSharedSandboxMergeIntegrationFailure(t *testing.T) {
 	}
 }
 
+func TestHTTPWorkspaceCleanupDryRun(t *testing.T) {
+	repoPath := initHTTPTempGitRepo(t)
+	cfg := config.Config{
+		Address:                    ":0",
+		ServiceName:                "test-http-workspace-cleanup",
+		ArtifactRoot:               t.TempDir(),
+		SandboxRoot:                t.TempDir(),
+		DefaultAgent:               "http-manager-agent",
+		WorkspaceProvider:          "git",
+		WorkspaceGitRepoPath:       repoPath,
+		WorkspaceGitBaseRef:        "main",
+		WorkspaceGitCleanupEnabled: false,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	project, contract, dispatched := prepareHTTPSharedSandboxMergeScenario(t, server)
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/shared-sandbox/merge", map[string]any{
+		"taskIds":    []string{dispatched[0].ID, dispatched[1].ID},
+		"contractId": contract.ID,
+		"endpoints":  contract.Endpoints,
+		"schemas":    contract.Schemas,
+	})
+
+	body := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/workspaces/cleanup", map[string]any{"dryRun": true, "scope": "PRIVATE"})
+	var cleanup service.CleanupWorkspacesResult
+	decodeResponse(t, body, &cleanup)
+	if !cleanup.DryRun || cleanup.RemovedWorktrees != 2 || cleanup.DeletedBranches != 0 {
+		t.Fatalf("expected dry-run private worktree cleanup plan, got %+v", cleanup)
+	}
+	worktrees := runHTTPTestGit(t, repoPath, "worktree", "list", "--porcelain")
+	if strings.Count(worktrees, "multiagent/") < 3 {
+		t.Fatalf("expected dry run to keep private and shared worktrees, got\n%s", worktrees)
+	}
+}
+
 func TestHTTPSharedSandboxFailureAutoRollback(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",

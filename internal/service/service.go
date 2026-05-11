@@ -324,7 +324,39 @@ type SharedSandboxMergeResult struct {
 	RemediationTask   *domain.Task                 `json:"remediationTask,omitempty"`
 	Rollback          *RollbackResult              `json:"rollback,omitempty"`
 	ArtifactIDs       []string                     `json:"artifactIds,omitempty"`
+	Cleanup           *CleanupWorkspacesResult     `json:"cleanup,omitempty"`
 	Message           string                       `json:"message,omitempty"`
+}
+
+type CleanupWorkspacesInput struct {
+	DryRun           bool     `json:"dryRun"`
+	Scope            string   `json:"scope,omitempty"`
+	SandboxIDs       []string `json:"sandboxIds,omitempty"`
+	DeleteBranches   bool     `json:"deleteBranches,omitempty"`
+	IncludeFailed    bool     `json:"includeFailed,omitempty"`
+	OlderThanSeconds int64    `json:"olderThanSeconds,omitempty"`
+}
+
+type WorkspaceCleanupResult struct {
+	SandboxID       string `json:"sandboxId"`
+	Scope           string `json:"scope"`
+	Provider        string `json:"provider"`
+	Status          string `json:"status"`
+	Reason          string `json:"reason,omitempty"`
+	Error           string `json:"error,omitempty"`
+	WorktreeRemoved bool   `json:"worktreeRemoved"`
+	BranchDeleted   bool   `json:"branchDeleted"`
+	RetainedRef     string `json:"retainedRef,omitempty"`
+}
+
+type CleanupWorkspacesResult struct {
+	ProjectID        string                   `json:"projectId"`
+	DryRun           bool                     `json:"dryRun"`
+	Results          []WorkspaceCleanupResult `json:"results"`
+	RemovedWorktrees int                      `json:"removedWorktrees"`
+	DeletedBranches  int                      `json:"deletedBranches"`
+	Skipped          int                      `json:"skipped"`
+	Failed           int                      `json:"failed"`
 }
 
 type RollbackSnapshotInput struct {
@@ -1600,6 +1632,9 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 	_ = snapshot
 	if strings.EqualFold(sharedSandbox.WorkspaceProvider, "git") {
 		result.Message = "git branches merged into shared sandbox"
+		if s.cfg.WorkspaceGitCleanupEnabled {
+			result.Cleanup = s.cleanupWorkspacesLocked(ctx, projectID, CleanupWorkspacesInput{Scope: "PRIVATE", SandboxIDs: s.sourceSandboxIDsForArtifactsLocked(artifactIDs), DeleteBranches: s.cfg.WorkspaceGitCleanupDeleteBranches, IncludeFailed: s.cfg.WorkspaceGitCleanupFailedEnabled}, sharedSandbox.UpdatedAt)
+		}
 	} else {
 		result.Message = "artifacts merged into shared sandbox"
 	}
@@ -1607,6 +1642,18 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 	s.persistLocked()
 
 	return result, nil
+}
+
+func (s *Service) CleanupWorkspaces(ctx context.Context, projectID string, input CleanupWorkspacesInput) (*CleanupWorkspacesResult, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+	return s.cleanupWorkspacesLocked(ctx, projectID, input, now), nil
 }
 
 func (s *Service) RollbackToSnapshot(ctx context.Context, projectID string, input RollbackSnapshotInput) (*RollbackResult, error) {
@@ -3849,6 +3896,174 @@ func (s *Service) writeSharedSandboxManifest(sharedSandbox *domain.Sandbox, task
 		return writeWorkspaceManifest(sharedSandbox, sharedSandbox.WorkspacePath, artifactRefs)
 	}
 	return nil
+}
+
+func (s *Service) cleanupWorkspacesLocked(ctx context.Context, projectID string, input CleanupWorkspacesInput, now time.Time) *CleanupWorkspacesResult {
+	scope := strings.ToUpper(strings.TrimSpace(input.Scope))
+	if scope == "" {
+		scope = "PRIVATE"
+	}
+	selectedIDs := map[string]struct{}{}
+	for _, id := range input.SandboxIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			selectedIDs[id] = struct{}{}
+		}
+	}
+	result := &CleanupWorkspacesResult{ProjectID: projectID, DryRun: input.DryRun, Results: make([]WorkspaceCleanupResult, 0)}
+	retainedHeads := s.retainedWorkspaceHeadsLocked(projectID)
+	for _, sandbox := range s.sandboxes[projectID] {
+		if sandbox == nil || !strings.EqualFold(sandbox.WorkspaceProvider, "git") {
+			continue
+		}
+		if len(selectedIDs) > 0 {
+			if _, ok := selectedIDs[sandbox.ID]; !ok {
+				continue
+			}
+		}
+		if scope != "ALL" && sandbox.Scope != scope {
+			continue
+		}
+		if sandbox.Scope == "SHARED" {
+			continue
+		}
+		if sandbox.Status == domain.SandboxStatusFailed && !input.IncludeFailed {
+			continue
+		}
+		if input.OlderThanSeconds > 0 && now.Sub(sandbox.UpdatedAt) < time.Duration(input.OlderThanSeconds)*time.Second {
+			continue
+		}
+		providerResult, err := s.workspaceProvider.Cleanup(ctx, sandbox, workspaceCleanupPolicy{
+			DryRun:        input.DryRun,
+			DeleteBranch:  input.DeleteBranches,
+			RetainedHeads: retainedHeads,
+			Reason:        "workspace cleanup",
+			Now:           now,
+		})
+		if providerResult == nil {
+			providerResult = &workspaceCleanupResult{SandboxID: sandbox.ID, Provider: sandbox.WorkspaceProvider}
+		}
+		if err != nil {
+			providerResult.Error = err.Error()
+		}
+		item := s.applyWorkspaceCleanupResultLocked(ctx, projectID, sandbox, providerResult, input.DryRun, now)
+		result.Results = append(result.Results, item)
+		switch item.Status {
+		case "FAILED":
+			result.Failed++
+		case "SKIPPED":
+			result.Skipped++
+		}
+		if item.WorktreeRemoved {
+			result.RemovedWorktrees++
+		}
+		if item.BranchDeleted {
+			result.DeletedBranches++
+		}
+	}
+	return result
+}
+
+func (s *Service) applyWorkspaceCleanupResultLocked(ctx context.Context, projectID string, sandbox *domain.Sandbox, providerResult *workspaceCleanupResult, dryRun bool, now time.Time) WorkspaceCleanupResult {
+	status := "CLEANED"
+	reason := strings.TrimSpace(providerResult.SkipReason)
+	if providerResult.Error != "" {
+		status = "FAILED"
+		reason = providerResult.Error
+	} else if providerResult.Skipped {
+		status = "SKIPPED"
+	} else if !providerResult.WorktreeRemoved && !providerResult.BranchDeleted {
+		status = "SKIPPED"
+		reason = "no cleanup action was needed"
+	}
+	if dryRun && status == "CLEANED" {
+		reason = "dry run"
+	}
+	if !dryRun {
+		sandbox.WorkspaceCleanupStatus = status
+		sandbox.WorkspaceCleanedAt = now
+		sandbox.WorkspaceCleanupReason = reason
+		sandbox.WorkspaceCleanupError = providerResult.Error
+		if providerResult.WorktreeRemoved {
+			sandbox.WorkspaceWorktreeGone = true
+		}
+		if providerResult.BranchDeleted {
+			sandbox.WorkspaceBranchGone = true
+		}
+		sandbox.WorkspaceRetainedRef = providerResult.RetainedRef
+		sandbox.UpdatedAt = now
+	}
+	action := "WORKSPACE_CLEANUP_SKIPPED"
+	if status == "FAILED" {
+		action = "WORKSPACE_CLEANUP_FAILED"
+	} else if providerResult.BranchDeleted {
+		action = "WORKSPACE_BRANCH_CLEANED"
+	} else if providerResult.WorktreeRemoved {
+		action = "WORKSPACE_WORKTREE_CLEANED"
+	}
+	if !dryRun {
+		s.recordAuditLocked(ctx, projectID, action, "sandbox", sandbox.ID, reason, now)
+	}
+	return WorkspaceCleanupResult{
+		SandboxID:       sandbox.ID,
+		Scope:           sandbox.Scope,
+		Provider:        providerResult.Provider,
+		Status:          status,
+		Reason:          reason,
+		Error:           providerResult.Error,
+		WorktreeRemoved: providerResult.WorktreeRemoved,
+		BranchDeleted:   providerResult.BranchDeleted,
+		RetainedRef:     providerResult.RetainedRef,
+	}
+}
+
+func (s *Service) sourceSandboxIDsForArtifactsLocked(artifactIDs []string) []string {
+	seen := map[string]struct{}{}
+	ids := make([]string, 0, len(artifactIDs))
+	for _, artifactID := range artifactIDs {
+		artifact := s.artifacts[artifactID]
+		if artifact == nil {
+			continue
+		}
+		run := s.runs[artifact.RunID]
+		if run == nil || strings.TrimSpace(run.SandboxID) == "" {
+			continue
+		}
+		if _, ok := seen[run.SandboxID]; ok {
+			continue
+		}
+		seen[run.SandboxID] = struct{}{}
+		ids = append(ids, run.SandboxID)
+	}
+	return ids
+}
+
+func (s *Service) retainedWorkspaceHeadsLocked(projectID string) []string {
+	seen := map[string]struct{}{}
+	var refs []string
+	add := func(ref string) {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			return
+		}
+		if _, ok := seen[ref]; ok {
+			return
+		}
+		seen[ref] = struct{}{}
+		refs = append(refs, ref)
+	}
+	for _, sandbox := range s.sandboxes[projectID] {
+		if sandbox != nil && sandbox.Scope == "SHARED" && sandbox.Status == domain.SandboxStatusReleased {
+			add(sandbox.WorkspaceHeadRef)
+		}
+	}
+	for _, snapshot := range s.snapshots[projectID] {
+		if snapshot != nil {
+			add(snapshot.WorkspaceChecksum)
+		}
+	}
+	add(s.cfg.WorkspaceGitBaseRef)
+	return refs
 }
 
 func (s *Service) currentBranchLocked(projectID string) string {

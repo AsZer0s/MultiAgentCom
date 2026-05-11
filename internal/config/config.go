@@ -13,30 +13,34 @@ import (
 )
 
 type Config struct {
-	Address                    string
-	ServiceName                string
-	ArtifactRoot               string
-	SandboxRoot                string
-	DefaultAgent               string
-	APIToken                   string
-	AuthTokens                 string
-	AuthTokensFile             string
-	AlertWebhookURL            string
-	StoreProvider              string
-	DataRoot                   string
-	WorkspaceProvider          string
-	WorkspaceGitRepoPath       string
-	WorkspaceGitBaseRef        string
-	RuntimeProvider            string
-	RuntimeEndpoint            string
-	RuntimeTimeout             time.Duration
-	RuntimeHTTPBearerToken     string
-	RuntimeHTTPMaxAttempts     int
-	RuntimeHTTPRetryBaseDelay  time.Duration
-	TokenPromptPricePerMillion float64
-	TokenOutputPricePerMillion float64
-	TokenBudgetWarnUSD         float64
-	TokenBudgetBlockUSD        float64
+	Address                           string
+	ServiceName                       string
+	ArtifactRoot                      string
+	SandboxRoot                       string
+	DefaultAgent                      string
+	APIToken                          string
+	AuthTokens                        string
+	AuthTokensFile                    string
+	AlertWebhookURL                   string
+	StoreProvider                     string
+	DataRoot                          string
+	WorkspaceProvider                 string
+	WorkspaceGitRepoPath              string
+	WorkspaceGitBaseRef               string
+	WorkspaceGitCleanupEnabled        bool
+	WorkspaceGitCleanupDeleteBranches bool
+	WorkspaceGitCleanupFailedEnabled  bool
+	WorkspaceGitCleanupMinAge         time.Duration
+	RuntimeProvider                   string
+	RuntimeEndpoint                   string
+	RuntimeTimeout                    time.Duration
+	RuntimeHTTPBearerToken            string
+	RuntimeHTTPMaxAttempts            int
+	RuntimeHTTPRetryBaseDelay         time.Duration
+	TokenPromptPricePerMillion        float64
+	TokenOutputPricePerMillion        float64
+	TokenBudgetWarnUSD                float64
+	TokenBudgetBlockUSD               float64
 }
 
 type ValidationIssue struct {
@@ -61,30 +65,34 @@ func (e *ValidationError) Error() string {
 
 func Load() Config {
 	return WithDefaults(Config{
-		Address:                    getenv("MULTI_AGENT_ADDR", ":8080"),
-		ServiceName:                getenv("MULTI_AGENT_SERVICE_NAME", "multiagentcom-api"),
-		ArtifactRoot:               getenv("MULTI_AGENT_ARTIFACT_ROOT", "runtime/artifacts"),
-		SandboxRoot:                getenv("MULTI_AGENT_SANDBOX_ROOT", "runtime/sandboxes"),
-		DefaultAgent:               getenv("MULTI_AGENT_DEFAULT_AGENT", "manager-agent-sprint1"),
-		APIToken:                   getenv("MULTI_AGENT_API_TOKEN", ""),
-		AuthTokens:                 getenv("MULTI_AGENT_AUTH_TOKENS", ""),
-		AuthTokensFile:             getenv("MULTI_AGENT_AUTH_TOKENS_FILE", ""),
-		AlertWebhookURL:            getenv("MULTI_AGENT_ALERT_WEBHOOK_URL", ""),
-		StoreProvider:              getenv("MULTI_AGENT_STORE_PROVIDER", "memory"),
-		DataRoot:                   getenv("MULTI_AGENT_DATA_ROOT", filepath.Join(os.TempDir(), "multiagentcom", "data")),
-		WorkspaceProvider:          getenv("MULTI_AGENT_WORKSPACE_PROVIDER", "directory"),
-		WorkspaceGitRepoPath:       getenv("MULTI_AGENT_WORKSPACE_GIT_REPO_PATH", ""),
-		WorkspaceGitBaseRef:        getenv("MULTI_AGENT_WORKSPACE_GIT_BASE_REF", "HEAD"),
-		RuntimeProvider:            getenv("MULTI_AGENT_RUNTIME_PROVIDER", "local"),
-		RuntimeEndpoint:            getenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", ""),
-		RuntimeTimeout:             getenvDuration("MULTI_AGENT_RUNTIME_HTTP_TIMEOUT", 30*time.Second),
-		RuntimeHTTPBearerToken:     getenv("MULTI_AGENT_RUNTIME_HTTP_BEARER_TOKEN", ""),
-		RuntimeHTTPMaxAttempts:     getenvInt("MULTI_AGENT_RUNTIME_HTTP_MAX_ATTEMPTS", 1),
-		RuntimeHTTPRetryBaseDelay:  getenvDuration("MULTI_AGENT_RUNTIME_HTTP_RETRY_BASE_DELAY", 100*time.Millisecond),
-		TokenPromptPricePerMillion: getenvFloat("MULTI_AGENT_TOKEN_PROMPT_PRICE_PER_MILLION", 1.5),
-		TokenOutputPricePerMillion: getenvFloat("MULTI_AGENT_TOKEN_OUTPUT_PRICE_PER_MILLION", 2.5),
-		TokenBudgetWarnUSD:         getenvFloat("MULTI_AGENT_TOKEN_BUDGET_WARN_USD", 0),
-		TokenBudgetBlockUSD:        getenvFloat("MULTI_AGENT_TOKEN_BUDGET_BLOCK_USD", 0),
+		Address:                           getenv("MULTI_AGENT_ADDR", ":8080"),
+		ServiceName:                       getenv("MULTI_AGENT_SERVICE_NAME", "multiagentcom-api"),
+		ArtifactRoot:                      getenv("MULTI_AGENT_ARTIFACT_ROOT", "runtime/artifacts"),
+		SandboxRoot:                       getenv("MULTI_AGENT_SANDBOX_ROOT", "runtime/sandboxes"),
+		DefaultAgent:                      getenv("MULTI_AGENT_DEFAULT_AGENT", "manager-agent-sprint1"),
+		APIToken:                          getenv("MULTI_AGENT_API_TOKEN", ""),
+		AuthTokens:                        getenv("MULTI_AGENT_AUTH_TOKENS", ""),
+		AuthTokensFile:                    getenv("MULTI_AGENT_AUTH_TOKENS_FILE", ""),
+		AlertWebhookURL:                   getenv("MULTI_AGENT_ALERT_WEBHOOK_URL", ""),
+		StoreProvider:                     getenv("MULTI_AGENT_STORE_PROVIDER", "memory"),
+		DataRoot:                          getenv("MULTI_AGENT_DATA_ROOT", filepath.Join(os.TempDir(), "multiagentcom", "data")),
+		WorkspaceProvider:                 getenv("MULTI_AGENT_WORKSPACE_PROVIDER", "directory"),
+		WorkspaceGitRepoPath:              getenv("MULTI_AGENT_WORKSPACE_GIT_REPO_PATH", ""),
+		WorkspaceGitBaseRef:               getenv("MULTI_AGENT_WORKSPACE_GIT_BASE_REF", "HEAD"),
+		WorkspaceGitCleanupEnabled:        getenvBool("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_ENABLED", true),
+		WorkspaceGitCleanupDeleteBranches: getenvBool("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_DELETE_BRANCHES", false),
+		WorkspaceGitCleanupFailedEnabled:  getenvBool("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_FAILED_ENABLED", false),
+		WorkspaceGitCleanupMinAge:         getenvNonNegativeDuration("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_MIN_AGE", 0),
+		RuntimeProvider:                   getenv("MULTI_AGENT_RUNTIME_PROVIDER", "local"),
+		RuntimeEndpoint:                   getenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", ""),
+		RuntimeTimeout:                    getenvDuration("MULTI_AGENT_RUNTIME_HTTP_TIMEOUT", 30*time.Second),
+		RuntimeHTTPBearerToken:            getenv("MULTI_AGENT_RUNTIME_HTTP_BEARER_TOKEN", ""),
+		RuntimeHTTPMaxAttempts:            getenvInt("MULTI_AGENT_RUNTIME_HTTP_MAX_ATTEMPTS", 1),
+		RuntimeHTTPRetryBaseDelay:         getenvDuration("MULTI_AGENT_RUNTIME_HTTP_RETRY_BASE_DELAY", 100*time.Millisecond),
+		TokenPromptPricePerMillion:        getenvFloat("MULTI_AGENT_TOKEN_PROMPT_PRICE_PER_MILLION", 1.5),
+		TokenOutputPricePerMillion:        getenvFloat("MULTI_AGENT_TOKEN_OUTPUT_PRICE_PER_MILLION", 2.5),
+		TokenBudgetWarnUSD:                getenvFloat("MULTI_AGENT_TOKEN_BUDGET_WARN_USD", 0),
+		TokenBudgetBlockUSD:               getenvFloat("MULTI_AGENT_TOKEN_BUDGET_BLOCK_USD", 0),
 	})
 }
 
@@ -175,6 +183,9 @@ func Validate(cfg Config) error {
 		}
 	default:
 		issues = append(issues, ValidationIssue{Field: "RuntimeProvider", Message: "must be local or http"})
+	}
+	if cfg.WorkspaceGitCleanupMinAge < 0 {
+		issues = append(issues, ValidationIssue{Field: "WorkspaceGitCleanupMinAge", Message: "must be non-negative"})
 	}
 	if cfg.RuntimeTimeout <= 0 {
 		issues = append(issues, ValidationIssue{Field: "RuntimeTimeout", Message: "must be positive"})
@@ -280,6 +291,31 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return duration
+}
+
+func getenvNonNegativeDuration(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < 0 {
+		return fallback
+	}
+	return duration
+}
+
+func getenvBool(key string, fallback bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func getenvFloat(key string, fallback float64) float64 {

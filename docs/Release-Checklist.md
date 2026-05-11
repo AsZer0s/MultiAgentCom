@@ -83,6 +83,8 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - Git provider 完成 run 后，任务分支 commit 中包含 `tasks/<taskId>/bundle/metadata/manifest.json`
 - 共享沙盒成功合并后，directory provider 的 `workspace/artifacts/<artifactId>/` 包含 materialized delivery bundle 内容，且共享工作区包含 `.multiagent/workspace-manifest.json`
 - Git provider 的共享沙盒成功合并后，私有任务 head 是共享 `workspaceHeadRef` 的 ancestor，快照包含 `workspaceStateRef` 与 `workspaceChecksum`
+- Git provider 成功合并后，已合并私有 worktree 会被安全清理或记录跳过原因；released shared worktree/branch 保留
+- `POST /projects/{id}/workspaces/cleanup` dry-run 返回计划清理结果且不移除 worktree；`deleteBranches=true` 只尝试非 force 删除已合并私有分支
 - 文件存储模式下，快照 rollback 可从 `file://` StateRef 恢复；checksum 被篡改时应拒绝回滚
 - `POST /projects/{id}/locks` 可提交 `lockMode=go_symbol`、`language=go`、`symbolKind=func|method|type|var|const` 和 `symbolName`，并只替换对应 Go 声明，同时合并锁内容所需 imports、移除替换后不再使用的普通 imports
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回 `runtime.http.v1` success 时可执行成功并采用嵌套 `usage`

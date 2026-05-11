@@ -21,6 +21,26 @@ type workspaceProvider interface {
 	BundleDir(sandbox *domain.Sandbox, task *domain.Task) string
 	FinalizePrivateRun(ctx context.Context, sandbox *domain.Sandbox, task *domain.Task, run *domain.AgentRun) error
 	MergeShared(ctx context.Context, sharedSandbox *domain.Sandbox, tasks []*domain.Task, artifacts []*domain.Artifact, sourceSandboxes []*domain.Sandbox) error
+	Cleanup(ctx context.Context, sandbox *domain.Sandbox, policy workspaceCleanupPolicy) (*workspaceCleanupResult, error)
+}
+
+type workspaceCleanupPolicy struct {
+	DryRun        bool
+	DeleteBranch  bool
+	RetainedHeads []string
+	Reason        string
+	Now           time.Time
+}
+
+type workspaceCleanupResult struct {
+	SandboxID       string
+	Provider        string
+	Skipped         bool
+	SkipReason      string
+	WorktreeRemoved bool
+	BranchDeleted   bool
+	RetainedRef     string
+	Error           string
 }
 
 type directoryWorkspaceProvider struct{}
@@ -53,6 +73,10 @@ func (p directoryWorkspaceProvider) MergeShared(_ context.Context, sharedSandbox
 		}
 	}
 	return nil
+}
+
+func (p directoryWorkspaceProvider) Cleanup(_ context.Context, sandbox *domain.Sandbox, _ workspaceCleanupPolicy) (*workspaceCleanupResult, error) {
+	return &workspaceCleanupResult{SandboxID: sandbox.ID, Provider: p.Name(), Skipped: true, SkipReason: "directory workspace cleanup is not supported"}, nil
 }
 
 type gitWorkspaceProvider struct {
@@ -123,6 +147,124 @@ func (p gitWorkspaceProvider) MergeShared(ctx context.Context, sharedSandbox *do
 	return nil
 }
 
+func (p gitWorkspaceProvider) Cleanup(ctx context.Context, sandbox *domain.Sandbox, policy workspaceCleanupPolicy) (*workspaceCleanupResult, error) {
+	result := &workspaceCleanupResult{SandboxID: sandbox.ID, Provider: p.Name()}
+	if !strings.EqualFold(sandbox.WorkspaceProvider, "git") {
+		result.Skipped = true
+		result.SkipReason = "sandbox is not a git workspace"
+		return result, nil
+	}
+	if sandbox.Scope != "PRIVATE" {
+		result.Skipped = true
+		result.SkipReason = "only private workspaces are cleaned"
+		return result, nil
+	}
+	if sandbox.Status != domain.SandboxStatusReleased {
+		result.Skipped = true
+		result.SkipReason = "sandbox is not released"
+		return result, nil
+	}
+	if strings.TrimSpace(sandbox.WorkspacePath) == "" || strings.TrimSpace(sandbox.WorkspaceBranch) == "" || strings.TrimSpace(sandbox.WorkspaceHeadRef) == "" {
+		result.Skipped = true
+		result.SkipReason = "git workspace metadata is incomplete"
+		return result, nil
+	}
+	if !strings.HasPrefix(sandbox.WorkspaceBranch, "multiagent/") {
+		result.Skipped = true
+		result.SkipReason = "workspace branch is not managed by multiagent"
+		return result, nil
+	}
+
+	worktrees, err := gitWorktreeList(ctx, p.repoPath)
+	if err != nil {
+		return result, err
+	}
+	registeredBranch, registered := worktrees[normalizeGitWorktreePath(sandbox.WorkspacePath)]
+	if !registered {
+		if _, statErr := os.Stat(sandbox.WorkspacePath); os.IsNotExist(statErr) {
+			result.WorktreeRemoved = true
+		} else {
+			result.Skipped = true
+			result.SkipReason = "workspace path is not a registered git worktree"
+			return result, nil
+		}
+	} else {
+		if registeredBranch != "" && registeredBranch != sandbox.WorkspaceBranch {
+			result.Skipped = true
+			result.SkipReason = "registered worktree branch does not match sandbox metadata"
+			return result, nil
+		}
+		if dirty, err := gitWorktreeDirty(ctx, sandbox.WorkspacePath); err != nil {
+			return result, err
+		} else if dirty {
+			metadataOnly, err := gitWorktreeDirtyOnlyWorkspaceManifest(ctx, sandbox.WorkspacePath)
+			if err != nil {
+				return result, err
+			}
+			if !metadataOnly {
+				result.Skipped = true
+				result.SkipReason = "workspace has uncommitted changes"
+				return result, nil
+			}
+			if !policy.DryRun {
+				if err := os.RemoveAll(filepath.Join(sandbox.WorkspacePath, ".multiagent")); err != nil && !os.IsNotExist(err) {
+					return result, err
+				}
+			}
+		}
+		if policy.DryRun {
+			result.WorktreeRemoved = true
+		} else if _, err := runGitInRepo(ctx, p.repoPath, "worktree", "remove", sandbox.WorkspacePath); err != nil {
+			return result, err
+		} else {
+			result.WorktreeRemoved = true
+		}
+	}
+
+	if !policy.DeleteBranch {
+		return result, nil
+	}
+	if !strings.Contains(sandbox.WorkspaceBranch, "/task/") {
+		result.Skipped = true
+		result.SkipReason = "only private task branches are deleted"
+		return result, nil
+	}
+	branchHead, exists, err := gitBranchHead(ctx, p.repoPath, sandbox.WorkspaceBranch)
+	if err != nil {
+		return result, err
+	}
+	if !exists {
+		result.BranchDeleted = true
+		return result, nil
+	}
+	if branchHead != strings.TrimSpace(sandbox.WorkspaceHeadRef) {
+		result.Skipped = true
+		result.SkipReason = "branch head moved after sandbox metadata was recorded"
+		return result, nil
+	}
+	retainedRef, ok, err := gitHeadRetainedBy(ctx, p.repoPath, sandbox.WorkspaceHeadRef, policy.RetainedHeads)
+	if err != nil {
+		return result, err
+	}
+	if !ok {
+		result.Skipped = true
+		result.SkipReason = "branch head is not merged into a retained shared head"
+		return result, nil
+	}
+	result.RetainedRef = retainedRef
+	if policy.DryRun {
+		result.BranchDeleted = true
+		return result, nil
+	}
+	if _, err := runGitInRepo(ctx, p.repoPath, "branch", "-d", sandbox.WorkspaceBranch); err != nil {
+		result.Skipped = true
+		result.SkipReason = "git branch -d refused to delete branch"
+		return result, nil
+	}
+	result.BranchDeleted = true
+	return result, nil
+}
+
 func (p gitWorkspaceProvider) addWorktree(ctx context.Context, path, branch, baseRef string) error {
 	if strings.TrimSpace(p.repoPath) == "" {
 		return errors.New("git workspace repo path is required")
@@ -157,12 +299,92 @@ func gitWorktreeDirty(ctx context.Context, worktreePath string) (bool, error) {
 	return strings.TrimSpace(status) != "", nil
 }
 
+func gitWorktreeDirtyOnlyWorkspaceManifest(ctx context.Context, worktreePath string) (bool, error) {
+	status, err := runGit(ctx, worktreePath, "status", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	lines := strings.FieldsFunc(strings.TrimSpace(status), func(r rune) bool { return r == '\n' || r == '\r' })
+	if len(lines) == 0 {
+		return false, nil
+	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasSuffix(line, ".multiagent/workspace-manifest.json") && !strings.HasSuffix(line, ".multiagent/") {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func gitRevParse(ctx context.Context, worktreePath, ref string) (string, error) {
 	out, err := runGit(ctx, worktreePath, "rev-parse", ref)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(out), nil
+}
+
+func gitWorktreeList(ctx context.Context, repoPath string) (map[string]string, error) {
+	out, err := runGitInRepo(ctx, repoPath, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	worktrees := map[string]string{}
+	var currentPath string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			currentPath = normalizeGitWorktreePath(strings.TrimSpace(strings.TrimPrefix(line, "worktree ")))
+			worktrees[currentPath] = ""
+		case strings.HasPrefix(line, "branch ") && currentPath != "":
+			branch := strings.TrimSpace(strings.TrimPrefix(line, "branch "))
+			branch = strings.TrimPrefix(branch, "refs/heads/")
+			worktrees[currentPath] = branch
+		case line == "":
+			currentPath = ""
+		}
+	}
+	return worktrees, nil
+}
+
+func normalizeGitWorktreePath(path string) string {
+	path = filepath.Clean(path)
+	if evaluated, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Clean(evaluated)
+	}
+	return path
+}
+
+func gitBranchHead(ctx context.Context, repoPath, branch string) (string, bool, error) {
+	out, err := runGitInRepo(ctx, repoPath, "show-ref", "--verify", "refs/heads/"+branch)
+	if err != nil {
+		if strings.Contains(err.Error(), "exit status 1") {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return "", false, nil
+	}
+	return fields[0], true, nil
+}
+
+func gitHeadRetainedBy(ctx context.Context, repoPath, head string, retainedHeads []string) (string, bool, error) {
+	for _, retained := range retainedHeads {
+		retained = strings.TrimSpace(retained)
+		if retained == "" {
+			continue
+		}
+		if _, err := runGitInRepo(ctx, repoPath, "merge-base", "--is-ancestor", head, retained); err == nil {
+			return retained, true, nil
+		} else if !strings.Contains(err.Error(), "exit status 1") {
+			return "", false, err
+		}
+	}
+	return "", false, nil
 }
 
 func runGit(ctx context.Context, worktreePath string, args ...string) (string, error) {
