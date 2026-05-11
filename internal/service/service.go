@@ -2999,13 +2999,13 @@ func validateCodeLock(path, content, lockMode, language, symbolKind, symbolName 
 	if language != "" && !strings.EqualFold(language, "go") {
 		return newValidationError("go_symbol locks require language go")
 	}
-	if symbolKind != "func" {
-		return newValidationError("go_symbol locks currently support symbolKind func")
+	if !isSupportedGoSymbolKind(symbolKind) {
+		return newValidationError("go_symbol locks support symbolKind func, method, type, var, or const")
 	}
 	if symbolName == "" {
 		return newValidationError("symbolName is required for go_symbol locks")
 	}
-	if _, _, err := findGoFunc([]byte(content), symbolName); err != nil {
+	if _, _, err := findGoSymbol([]byte(content), symbolKind, symbolName); err != nil {
 		return newValidationError(err.Error())
 	}
 	return nil
@@ -3017,43 +3017,87 @@ func applyGoSymbolLock(targetPath string, lock *domain.CodeLock) (bool, string, 
 		return false, "", err
 	}
 	locked := []byte(lock.Content)
-	lockedStart, lockedEnd, err := findGoFunc(locked, lock.SymbolName)
+	lockedStart, lockedEnd, err := findGoSymbol(locked, lock.SymbolKind, lock.SymbolName)
 	if err != nil {
 		return false, "", err
 	}
-	lockedFunc := locked[lockedStart:lockedEnd]
+	lockedSymbol := locked[lockedStart:lockedEnd]
 	if len(target) == 0 {
-		return true, fmt.Sprintf("created %s with locked Go function %s from %s", lock.Path, lock.SymbolName, lock.CreatedBy), writeFile(targetPath, appendNewline(lockedFunc))
+		return true, fmt.Sprintf("created %s with locked Go %s %s from %s", lock.Path, lock.SymbolKind, lock.SymbolName, lock.CreatedBy), writeFile(targetPath, appendNewline(lockedSymbol))
 	}
-	targetStart, targetEnd, err := findGoFunc(target, lock.SymbolName)
+	targetStart, targetEnd, err := findGoSymbol(target, lock.SymbolKind, lock.SymbolName)
 	if err != nil {
 		if _, parseErr := parser.ParseFile(token.NewFileSet(), targetPath, target, parser.ParseComments); parseErr != nil {
 			return false, "", fmt.Errorf("parse generated Go target %s: %w", lock.Path, parseErr)
 		}
-		merged := append(appendNewline(target), appendNewline(lockedFunc)...)
-		return true, fmt.Sprintf("appended locked Go function %s to %s because generated target was missing it", lock.SymbolName, lock.Path), writeFile(targetPath, merged)
+		merged := append(appendNewline(target), appendNewline(lockedSymbol)...)
+		return true, fmt.Sprintf("appended locked Go %s %s to %s because generated target was missing it", lock.SymbolKind, lock.SymbolName, lock.Path), writeFile(targetPath, merged)
 	}
-	merged := make([]byte, 0, len(target)-targetEnd+targetStart+len(lockedFunc))
+	merged := make([]byte, 0, len(target)-targetEnd+targetStart+len(lockedSymbol))
 	merged = append(merged, target[:targetStart]...)
-	merged = append(merged, lockedFunc...)
+	merged = append(merged, lockedSymbol...)
 	merged = append(merged, target[targetEnd:]...)
-	return true, fmt.Sprintf("replaced generated Go function %s in %s with LOCKED BY HUMAN content from %s", lock.SymbolName, lock.Path, lock.CreatedBy), writeFile(targetPath, merged)
+	return true, fmt.Sprintf("replaced generated Go %s %s in %s with LOCKED BY HUMAN content from %s", lock.SymbolKind, lock.SymbolName, lock.Path, lock.CreatedBy), writeFile(targetPath, merged)
 }
 
-func findGoFunc(source []byte, symbolName string) (int, int, error) {
+func isSupportedGoSymbolKind(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "func", "method", "type", "var", "const":
+		return true
+	default:
+		return false
+	}
+}
+
+func findGoSymbol(source []byte, symbolKind, symbolName string) (int, int, error) {
 	fileSet := token.NewFileSet()
 	file, err := parser.ParseFile(fileSet, "lock.go", source, parser.ParseComments)
 	if err != nil {
 		return 0, 0, fmt.Errorf("go_symbol lock content must be parseable Go: %w", err)
 	}
+	symbolKind = strings.ToLower(strings.TrimSpace(symbolKind))
 	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Recv != nil || fn.Name == nil || fn.Name.Name != symbolName {
-			continue
+		if start, end, ok := goDeclSymbolRange(fileSet, decl, symbolKind, symbolName); ok {
+			return start, end, nil
 		}
-		return fileSet.Position(fn.Pos()).Offset, fileSet.Position(fn.End()).Offset, nil
 	}
-	return 0, 0, fmt.Errorf("go_symbol lock content must contain top-level func %s", symbolName)
+	return 0, 0, fmt.Errorf("go_symbol lock content must contain Go %s %s", symbolKind, symbolName)
+}
+
+func goDeclSymbolRange(fileSet *token.FileSet, decl ast.Decl, symbolKind, symbolName string) (int, int, bool) {
+	switch typedDecl := decl.(type) {
+	case *ast.FuncDecl:
+		if typedDecl.Name == nil || typedDecl.Name.Name != symbolName {
+			return 0, 0, false
+		}
+		if symbolKind == "func" && typedDecl.Recv == nil || symbolKind == "method" && typedDecl.Recv != nil {
+			return fileSet.Position(typedDecl.Pos()).Offset, fileSet.Position(typedDecl.End()).Offset, true
+		}
+	case *ast.GenDecl:
+		if typedDecl.Tok == token.TYPE && symbolKind != "type" || typedDecl.Tok == token.VAR && symbolKind != "var" || typedDecl.Tok == token.CONST && symbolKind != "const" {
+			return 0, 0, false
+		}
+		for _, spec := range typedDecl.Specs {
+			if goSpecName(spec) == symbolName {
+				return fileSet.Position(typedDecl.Pos()).Offset, fileSet.Position(typedDecl.End()).Offset, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+func goSpecName(spec ast.Spec) string {
+	switch typedSpec := spec.(type) {
+	case *ast.TypeSpec:
+		if typedSpec.Name != nil {
+			return typedSpec.Name.Name
+		}
+	case *ast.ValueSpec:
+		if len(typedSpec.Names) == 1 && typedSpec.Names[0] != nil {
+			return typedSpec.Names[0].Name
+		}
+	}
+	return ""
 }
 
 func appendNewline(payload []byte) []byte {

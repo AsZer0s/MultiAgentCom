@@ -2642,6 +2642,117 @@ func main() {
 	}
 }
 
+func TestGoSymbolCodeLockSupportsMethodTypeVarAndConst(t *testing.T) {
+	targetSource := []byte(`package main
+
+type todo struct {
+	ID string
+}
+
+func (t todo) label() string {
+	return t.ID
+}
+
+var defaultTitle = "generated"
+
+const maxTodos = 10
+
+func main() {}
+`)
+
+	cases := []struct {
+		name       string
+		symbolKind string
+		symbolName string
+		locked     string
+		want       string
+	}{
+		{
+			name:       "method",
+			symbolKind: "method",
+			symbolName: "label",
+			locked: `package main
+
+func (t todo) label() string {
+	// LOCKED BY HUMAN
+	return "human"
+}
+`,
+			want: `return "human"`,
+		},
+		{
+			name:       "type",
+			symbolKind: "type",
+			symbolName: "todo",
+			locked: `package main
+
+type todo struct {
+	// LOCKED BY HUMAN
+	ID string
+	Title string
+}
+`,
+			want: `Title string`,
+		},
+		{
+			name:       "var",
+			symbolKind: "var",
+			symbolName: "defaultTitle",
+			locked: `package main
+
+// LOCKED BY HUMAN
+var defaultTitle = "human"
+`,
+			want: `var defaultTitle = "human"`,
+		},
+		{
+			name:       "const",
+			symbolKind: "const",
+			symbolName: "maxTodos",
+			locked: `package main
+
+// LOCKED BY HUMAN
+const maxTodos = 99
+`,
+			want: `const maxTodos = 99`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bundleDir := t.TempDir()
+			targetPath := filepath.Join(bundleDir, "generated-app", "main.go")
+			if err := writeFile(targetPath, targetSource); err != nil {
+				t.Fatalf("write target source: %v", err)
+			}
+			lock := &domain.CodeLock{
+				Path:       "generated-app/main.go",
+				Content:    tc.locked,
+				LockMode:   "go_symbol",
+				Language:   "go",
+				SymbolKind: tc.symbolKind,
+				SymbolName: tc.symbolName,
+				CreatedBy:  "reviewer",
+			}
+			changed, _, err := applyGoSymbolLock(targetPath, lock)
+			if err != nil {
+				t.Fatalf("apply go symbol lock: %v", err)
+			}
+			if !changed {
+				t.Fatal("expected lock to change target source")
+			}
+			data, err := os.ReadFile(targetPath)
+			if err != nil {
+				t.Fatalf("read target source: %v", err)
+			}
+			source := string(data)
+			if !strings.Contains(source, tc.want) || !strings.Contains(source, "func main()") {
+				t.Fatalf("expected locked %s and preserved target source, got:\n%s", tc.symbolKind, source)
+			}
+		})
+	}
+}
+
 func TestGoSymbolCodeLockRejectsInvalidInput(t *testing.T) {
 	svc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	ctx := context.Background()

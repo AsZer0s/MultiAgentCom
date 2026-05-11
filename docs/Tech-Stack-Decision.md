@@ -19,15 +19,17 @@
 
 ## 3. 技术选型总览
 
+当前实现与目标选型分层如下：
+
 - 后端语言：**Go**
-- 后端框架：**Gin（主选）**
-- 前端框架：**Vue 3 + Vite**
-- 元数据数据库：**PostgreSQL**
-- 缓存/消息：**Redis（缓存 + Stream）**
-- 对象存储：**MinIO（本地）/ S3 兼容（线上）**
-- 沙盒隔离：**Docker 容器**
-- 部署编排：**docker-compose（MVP）**
-- 可观测基线：**结构化日志 + 指标采集 + 基础告警**
+- 当前 HTTP 层：**Go 标准库 `net/http`**；目标演进：**Gin（主选）**
+- 当前前端/UI：**服务端内置状态面板 + 原生 DOM/SVG + SSE**；目标演进：**Vue 3 + Vite**
+- 当前元数据存储：**memory / file provider**；目标演进：**PostgreSQL**
+- 当前缓存/消息：**进程内调度与状态流**；目标演进：**Redis（缓存 + Stream）**
+- 当前 artifact 存储：**本地文件系统**；目标演进：**MinIO（本地）/ S3 兼容（线上）**
+- 当前 workspace/sandbox：**directory provider + local-only Git workspace provider v1**；目标演进：**Docker 容器 + 远程 Git clone/fetch/push/rebase 能力**
+- 部署编排：当前可本地单进程运行；目标演进：**docker-compose（MVP）**
+- 可观测基线：**结构化日志 + readiness/status panel + audit/alert/token cost**
 
 ## 4. 分层选型决策
 
@@ -57,7 +59,7 @@
 - **Echo：** 也可行，但与 Gin 相比团队普及度略低（按常见团队经验）。
 
 ### 结论
-- MVP 采用 Gin；若后续有明确性能瓶颈再评估迁移。
+- 当前实现先采用 Go 标准库 `net/http` 跑通闭环；Gin 保持为后续 API 层演进主选，迁移时应复用现有 service/domain 边界。
 
 ## 4.3 前端技术：Vue 3 + Vite
 
@@ -71,7 +73,7 @@
 - **Svelte：** 轻量，但团队熟悉度和生态覆盖可能不足。
 
 ### 结论
-- 前端统一 Vue 3，减少跨项目切换成本。
+- 当前状态面板先以内置 HTML/DOM/SVG/SSE 保持零构建依赖；Vue 3 保持为后续完整操作台/高级工作台演进方向。
 
 ## 4.4 数据库：PostgreSQL
 
@@ -85,7 +87,7 @@
 - **MongoDB：** 文档模型灵活，但事务与关系查询成本更高。
 
 ### 结论
-- 核心元数据统一 PostgreSQL。
+- 当前实现支持 memory / file provider 以降低 MVP 运维成本；PostgreSQL 是生产化多实例与复杂查询阶段的目标存储。
 
 ## 4.5 缓存与消息：Redis
 
@@ -100,7 +102,7 @@
 - **NATS：** 很优秀，但团队若经验不足可能增加学习成本。
 
 ### 结论
-- MVP 先用 Redis；后续若吞吐和可靠性需求上升再升级消息系统。
+- 当前实现先用进程内状态推进与 SSE 状态流；后续若需要多实例任务分发、重放和可靠消费，再升级到 Redis Stream 或专业消息系统。
 
 ## 4.6 对象存储：MinIO / S3
 
@@ -112,7 +114,7 @@
 - **本地磁盘直存：** 简单但不利于扩展和多实例共享。
 
 ### 结论
-- 开发测试用 MinIO，线上切 S3 兼容服务。
+- 当前 artifact 先落本地文件系统，配合 file store 可完成重启恢复；MinIO/S3 是多实例共享 artifact 与生产部署阶段的目标对象存储。
 
 ## 4.7 沙盒隔离：Docker
 
@@ -126,7 +128,7 @@
 - **gVisor/Firecracker：** 安全性更高，但接入复杂度更高，适合后续阶段。
 
 ### 结论
-- MVP 使用 Docker；生产加强阶段再评估更强隔离方案。
+- 当前实现提供 directory provider 与 local-only Git workspace provider v1：Git provider 支持本地已有 repo 的 worktree、任务分支 commit、shared sandbox `git merge --no-ff` 和 snapshot workspace ref；远程 clone/fetch/push、rebase 执行和容器隔离仍是后续生产化方向。
 
 ## 4.8 部署：docker-compose（MVP）
 
@@ -138,7 +140,7 @@
 - **Kubernetes：** 强大但 MVP 运维负担偏高。
 
 ### 结论
-- MVP 统一 docker-compose；规模上来后迁移 K8s。
+- 当前服务可单进程本地运行，发布检查通过脚本驱动；docker-compose/Kubernetes 保持为多服务依赖和规模化部署阶段的演进路径。
 
 ## 5. 关键横切能力选型
 

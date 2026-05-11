@@ -47,7 +47,7 @@
 - Notes:
   - `POST /projects/{id}/locks` 要求提交内容中包含 `LOCKED BY HUMAN` 标记。
   - 后续自动 bundle 生成末尾会保留人工内容，避免 `web-app/index.html` / `docker-compose.yml` 等晚生成文件覆盖锁。
-  - `go_symbol` 模式支持锁定 Go 顶层 `func`，只替换目标函数并保留同文件中的 generated imports/types/其它声明。
+  - `go_symbol` 模式初始支持锁定 Go 顶层 `func`；后续已扩展到 Go `func`、`method`、`type`、`var`、`const` 声明级替换，并保留同文件中的 generated imports/其它声明。
 
 ### AC-11 Snapshot Timeline Branching
 
@@ -78,6 +78,6 @@
 ## Residual Risk
 
 - 当前 HITL 仍是 MVP 级服务状态模型，尚未接入真实代码仓权限流或分布式锁。
-- 代码锁已支持 Go 顶层函数级替换，但尚未覆盖 Go methods/types/import reconciliation 或跨语言 AST 锁。
-- 时间线快照已支持 `file://` StateRef 恢复与 checksum 校验，但尚未覆盖外部依赖、真实 Git worktree 和 repo merge/rebase。
+- 代码锁已支持 Go `func`、`method`、`type`、`var`、`const` 声明级替换；尚未覆盖 import reconciliation 或跨语言 AST 锁。
+- 时间线快照已支持 `file://` StateRef 恢复与 checksum 校验；Sprint 4 后已补齐 local-only Git workspace v1（本地已有 repo 的 worktree、任务分支 commit、shared sandbox merge、snapshot workspace ref），但尚未覆盖远程 clone/fetch/push、rebase 执行、外部依赖或纯 Git restore。
 - Sprint 4 之前，预览环境与标准化交付链路仍未纳入回滚后的联动验收。
