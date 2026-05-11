@@ -61,12 +61,21 @@ func TestLoadWorkspaceProviderDefaults(t *testing.T) {
 }
 
 func TestLoadWorkspaceProviderOverrides(t *testing.T) {
-	t.Setenv("MULTI_AGENT_WORKSPACE_PROVIDER", "directory")
+	repoPath := t.TempDir()
+	t.Setenv("MULTI_AGENT_WORKSPACE_PROVIDER", "git")
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_REPO_PATH", repoPath)
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_BASE_REF", "main")
 
 	cfg := Load()
 
-	if cfg.WorkspaceProvider != "directory" {
-		t.Fatalf("WorkspaceProvider = %q, want directory", cfg.WorkspaceProvider)
+	if cfg.WorkspaceProvider != "git" {
+		t.Fatalf("WorkspaceProvider = %q, want git", cfg.WorkspaceProvider)
+	}
+	if cfg.WorkspaceGitRepoPath != repoPath {
+		t.Fatalf("WorkspaceGitRepoPath = %q, want %q", cfg.WorkspaceGitRepoPath, repoPath)
+	}
+	if cfg.WorkspaceGitBaseRef != "main" {
+		t.Fatalf("WorkspaceGitBaseRef = %q, want main", cfg.WorkspaceGitBaseRef)
 	}
 }
 
@@ -188,6 +197,20 @@ func TestValidateRejectsInvalidProductionConfig(t *testing.T) {
 		if !fields[field] {
 			t.Fatalf("expected issue for %s, got %v", field, issues)
 		}
+	}
+}
+
+func TestValidateAcceptsGitWorkspaceProvider(t *testing.T) {
+	if err := Validate(Config{WorkspaceProvider: "git", WorkspaceGitRepoPath: t.TempDir()}); err != nil {
+		t.Fatalf("Validate git workspace config: %v", err)
+	}
+}
+
+func TestValidateRejectsGitWorkspaceProviderWithoutRepoPath(t *testing.T) {
+	err := Validate(Config{WorkspaceProvider: "git"})
+	issues := ValidationIssues(err)
+	if len(issues) != 1 || issues[0].Field != "WorkspaceGitRepoPath" {
+		t.Fatalf("expected WorkspaceGitRepoPath issue, got %v", issues)
 	}
 }
 

@@ -58,12 +58,13 @@ func newInternalError(code, message string) *AppError {
 }
 
 type Service struct {
-	cfg             config.Config
-	logger          *slog.Logger
-	alertClient     *http.Client
-	runtimeRegistry *agentruntime.Registry
-	runtimeInitErr  error
-	store           store.Store
+	cfg               config.Config
+	logger            *slog.Logger
+	alertClient       *http.Client
+	runtimeRegistry   *agentruntime.Registry
+	runtimeInitErr    error
+	store             store.Store
+	workspaceProvider workspaceProvider
 
 	mu             sync.RWMutex
 	projects       map[string]*domain.Project
@@ -356,16 +357,18 @@ type projectSnapshotState struct {
 }
 
 type snapshotManifest struct {
-	SchemaVersion    int       `json:"schemaVersion"`
-	ID               string    `json:"id"`
-	ProjectID        string    `json:"projectId"`
-	Branch           string    `json:"branch"`
-	SourceSnapshotID string    `json:"sourceSnapshotId,omitempty"`
-	Reason           string    `json:"reason"`
-	Stable           bool      `json:"stable"`
-	StateRef         string    `json:"stateRef"`
-	Checksum         string    `json:"checksum"`
-	CreatedAt        time.Time `json:"createdAt"`
+	SchemaVersion     int       `json:"schemaVersion"`
+	ID                string    `json:"id"`
+	ProjectID         string    `json:"projectId"`
+	Branch            string    `json:"branch"`
+	SourceSnapshotID  string    `json:"sourceSnapshotId,omitempty"`
+	Reason            string    `json:"reason"`
+	Stable            bool      `json:"stable"`
+	StateRef          string    `json:"stateRef"`
+	Checksum          string    `json:"checksum"`
+	WorkspaceStateRef string    `json:"workspaceStateRef,omitempty"`
+	WorkspaceChecksum string    `json:"workspaceChecksum,omitempty"`
+	CreatedAt         time.Time `json:"createdAt"`
 }
 
 type persistedServiceState struct {
@@ -467,12 +470,13 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 	}
 
 	svc := &Service{
-		cfg:             cfg,
-		logger:          logger,
-		alertClient:     &http.Client{Timeout: 3 * time.Second},
-		runtimeRegistry: runtimeRegistry,
-		runtimeInitErr:  runtimeInitErr,
-		store:           newServiceStore(cfg),
+		cfg:               cfg,
+		logger:            logger,
+		alertClient:       &http.Client{Timeout: 3 * time.Second},
+		runtimeRegistry:   runtimeRegistry,
+		runtimeInitErr:    runtimeInitErr,
+		store:             newServiceStore(cfg),
+		workspaceProvider: newWorkspaceProvider(cfg),
 	}
 	svc.resetStateLocked()
 	if err := svc.loadPersistedState(context.Background()); err != nil && logger != nil {
@@ -708,16 +712,18 @@ func (s *Service) writeSnapshotRecord(snapshot *domain.Snapshot, state *projectS
 	checksum := sha256.Sum256(statePayload)
 	stateRef := "file://" + statePath
 	manifest := snapshotManifest{
-		SchemaVersion:    1,
-		ID:               snapshot.ID,
-		ProjectID:        snapshot.ProjectID,
-		Branch:           snapshot.Branch,
-		SourceSnapshotID: snapshot.SourceSnapshotID,
-		Reason:           snapshot.Reason,
-		Stable:           snapshot.Stable,
-		StateRef:         stateRef,
-		Checksum:         hex.EncodeToString(checksum[:]),
-		CreatedAt:        snapshot.CreatedAt,
+		SchemaVersion:     1,
+		ID:                snapshot.ID,
+		ProjectID:         snapshot.ProjectID,
+		Branch:            snapshot.Branch,
+		SourceSnapshotID:  snapshot.SourceSnapshotID,
+		Reason:            snapshot.Reason,
+		Stable:            snapshot.Stable,
+		StateRef:          stateRef,
+		Checksum:          hex.EncodeToString(checksum[:]),
+		WorkspaceStateRef: snapshot.WorkspaceStateRef,
+		WorkspaceChecksum: snapshot.WorkspaceChecksum,
+		CreatedAt:         snapshot.CreatedAt,
 	}
 	if err := writeJSONFile(filepath.Join(s.snapshotRoot(snapshot), "manifest.json"), manifest); err != nil {
 		return "", "", err
@@ -1584,14 +1590,18 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 	sharedSandbox.UpdatedAt = time.Now().UTC()
 	result.Sandbox = *cloneSandbox(sharedSandbox)
 	result.Passed = true
-	snapshot, snapshotErr := s.recordSnapshotLocked(projectID, s.currentBranchLocked(projectID), "shared sandbox merge checkpoint", true, s.latestSnapshotIDLocked(projectID), sharedSandbox.UpdatedAt)
+	snapshot, snapshotErr := s.recordSnapshotWithWorkspaceLocked(projectID, s.currentBranchLocked(projectID), "shared sandbox merge checkpoint", true, s.latestSnapshotIDLocked(projectID), sharedSandbox.UpdatedAt, sharedSandbox)
 	if snapshotErr != nil {
 		result.Message = "artifacts merged into shared sandbox, but checkpoint creation failed: " + snapshotErr.Error()
 		s.persistLocked()
 		return result, nil
 	}
 	_ = snapshot
-	result.Message = "artifacts merged into shared sandbox"
+	if strings.EqualFold(sharedSandbox.WorkspaceProvider, "git") {
+		result.Message = "git branches merged into shared sandbox"
+	} else {
+		result.Message = "artifacts merged into shared sandbox"
+	}
 	s.recordAuditLocked(ctx, projectID, "SHARED_SANDBOX_MERGE", "sandbox", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
 	s.persistLocked()
 
@@ -2002,6 +2012,18 @@ func (s *Service) executeRun(runID string) {
 		s.failRun(runID, err)
 		return
 	}
+	if sandbox != nil {
+		if err := s.workspaceProvider.FinalizePrivateRun(context.Background(), sandbox, task, run); err != nil {
+			s.logger.Error("workspace finalization failed", "runId", run.ID, "taskId", task.ID, "sandboxId", sandbox.ID, "error", err)
+			s.failRun(runID, err)
+			return
+		}
+		if err := writeWorkspaceManifest(sandbox, sandbox.WorkspacePath, nil); err != nil {
+			s.logger.Error("workspace manifest failed", "runId", run.ID, "taskId", task.ID, "sandboxId", sandbox.ID, "error", err)
+			s.failRun(runID, err)
+			return
+		}
+	}
 
 	now := time.Now().UTC()
 
@@ -2052,9 +2074,14 @@ func (s *Service) executeRun(runID string) {
 		s.logger.Error("failed to transition task to done", "taskId", storedTask.ID, "error", err)
 	}
 	if storedRun.SandboxID != "" {
-		if sandbox, exists := s.sandboxIndex[storedRun.SandboxID]; exists {
-			sandbox.Status = domain.SandboxStatusReleased
-			sandbox.UpdatedAt = now
+		if storedSandbox, exists := s.sandboxIndex[storedRun.SandboxID]; exists {
+			if sandbox != nil {
+				storedSandbox.WorkspaceHeadRef = sandbox.WorkspaceHeadRef
+				storedSandbox.WorkspaceBranch = sandbox.WorkspaceBranch
+				storedSandbox.WorkspaceBaseRef = sandbox.WorkspaceBaseRef
+			}
+			storedSandbox.Status = domain.SandboxStatusReleased
+			storedSandbox.UpdatedAt = now
 		}
 	}
 	s.persistLocked()
@@ -2095,6 +2122,10 @@ func (s *Service) executeRuntimeRun(run *domain.AgentRun, task *domain.Task, pla
 			"plan=" + plan.ID,
 			"sandbox=" + run.SandboxID,
 			"path=" + sandboxRootPath(sandbox),
+			"workspacePath=" + sandboxWorkspacePath(sandbox),
+			"workspaceProvider=" + sandboxWorkspaceProvider(sandbox),
+			"workspaceBranch=" + sandboxWorkspaceBranch(sandbox),
+			"workspaceBaseRef=" + sandboxWorkspaceBaseRef(sandbox),
 		}, "; "),
 	}
 
@@ -2125,6 +2156,34 @@ func sandboxRootPath(sandbox *domain.Sandbox) string {
 		return ""
 	}
 	return strings.TrimSpace(sandbox.RootPath)
+}
+
+func sandboxWorkspacePath(sandbox *domain.Sandbox) string {
+	if sandbox == nil {
+		return ""
+	}
+	return strings.TrimSpace(sandbox.WorkspacePath)
+}
+
+func sandboxWorkspaceProvider(sandbox *domain.Sandbox) string {
+	if sandbox == nil {
+		return ""
+	}
+	return strings.TrimSpace(sandbox.WorkspaceProvider)
+}
+
+func sandboxWorkspaceBranch(sandbox *domain.Sandbox) string {
+	if sandbox == nil {
+		return ""
+	}
+	return strings.TrimSpace(sandbox.WorkspaceBranch)
+}
+
+func sandboxWorkspaceBaseRef(sandbox *domain.Sandbox) string {
+	if sandbox == nil {
+		return ""
+	}
+	return strings.TrimSpace(sandbox.WorkspaceBaseRef)
 }
 
 func (s *Service) estimateCostFromTokens(promptTokens, completionTokens int) float64 {
@@ -2257,7 +2316,7 @@ func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.T
 	runDir := filepath.Join(s.cfg.ArtifactRoot, project.ID, run.ID)
 	bundleDir := filepath.Join(runDir, "bundle")
 	if sandbox != nil && strings.TrimSpace(sandbox.WorkspacePath) != "" {
-		bundleDir = filepath.Join(sandbox.WorkspacePath, "bundle")
+		bundleDir = s.workspaceProvider.BundleDir(sandbox, task)
 	} else if sandbox != nil && strings.TrimSpace(sandbox.RootPath) != "" {
 		bundleDir = filepath.Join(sandbox.RootPath, "workspace", "bundle")
 	}
@@ -2306,12 +2365,6 @@ func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.T
 	if err := s.applyProjectLocksToBundle(project.ID, task.ID, bundleDir); err != nil {
 		return nil, "", err
 	}
-	if sandbox != nil && strings.TrimSpace(sandbox.WorkspacePath) != "" {
-		if err := writeWorkspaceManifest(sandbox, sandbox.WorkspacePath, nil); err != nil {
-			return nil, "", err
-		}
-	}
-
 	now := time.Now().UTC()
 	releaseGate, err := buildDeliveryReleaseGate(bundleDir, now)
 	if err != nil {
@@ -2548,18 +2601,13 @@ type workspaceManifest struct {
 	TaskID        string                    `json:"taskId,omitempty"`
 	Provider      string                    `json:"provider"`
 	WorkspacePath string                    `json:"workspacePath"`
+	Branch        string                    `json:"branch,omitempty"`
+	BaseRef       string                    `json:"baseRef,omitempty"`
+	HeadRef       string                    `json:"headRef,omitempty"`
 	TreeHash      string                    `json:"treeHash"`
 	Files         []workspaceFileDescriptor `json:"files"`
 	Artifacts     any                       `json:"artifacts,omitempty"`
 	GeneratedAt   time.Time                 `json:"generatedAt"`
-}
-
-func workspaceProvider(cfg config.Config) string {
-	provider := strings.TrimSpace(cfg.WorkspaceProvider)
-	if provider == "" {
-		return "directory"
-	}
-	return provider
 }
 
 func writeWorkspaceManifest(sandbox *domain.Sandbox, workspacePath string, artifacts any) error {
@@ -2574,6 +2622,9 @@ func writeWorkspaceManifest(sandbox *domain.Sandbox, workspacePath string, artif
 		TaskID:        sandbox.TaskID,
 		Provider:      sandbox.WorkspaceProvider,
 		WorkspacePath: workspacePath,
+		Branch:        sandbox.WorkspaceBranch,
+		BaseRef:       sandbox.WorkspaceBaseRef,
+		HeadRef:       sandbox.WorkspaceHeadRef,
 		TreeHash:      treeHash,
 		Files:         files,
 		Artifacts:     artifacts,
@@ -2590,9 +2641,12 @@ func collectWorkspaceFiles(workspacePath string) ([]workspaceFileDescriptor, str
 			return walkErr
 		}
 		if d.IsDir() {
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
-		if path == manifestPath {
+		if d.Name() == ".git" || path == manifestPath {
 			return nil
 		}
 		relativePath, err := filepath.Rel(workspacePath, path)
@@ -3343,9 +3397,9 @@ func (s *Service) createPrivateSandboxLocked(projectID string, task *domain.Task
 	}
 	sandbox.RootPath = filepath.Join(s.cfg.SandboxRoot, projectID, sandbox.ID)
 	sandbox.WorkspacePath = filepath.Join(sandbox.RootPath, "workspace")
-	sandbox.WorkspaceProvider = workspaceProvider(s.cfg)
+	sandbox.WorkspaceProvider = s.workspaceProvider.Name()
 	sandbox.WorkspaceManifestRef = "file://" + filepath.Join(sandbox.WorkspacePath, ".multiagent", "workspace-manifest.json")
-	if err := os.MkdirAll(sandbox.WorkspacePath, 0o755); err != nil {
+	if err := s.workspaceProvider.CreatePrivate(context.Background(), sandbox, task); err != nil {
 		return nil, newInternalError("SANDBOX_CREATE_FAILED", "sandbox workspace could not be created")
 	}
 
@@ -3369,9 +3423,9 @@ func (s *Service) createSharedSandboxLocked(projectID string, tasks []*domain.Ta
 	}
 	sandbox.RootPath = filepath.Join(s.cfg.SandboxRoot, "shared", projectID, sandbox.ID)
 	sandbox.WorkspacePath = filepath.Join(sandbox.RootPath, "workspace")
-	sandbox.WorkspaceProvider = workspaceProvider(s.cfg)
+	sandbox.WorkspaceProvider = s.workspaceProvider.Name()
 	sandbox.WorkspaceManifestRef = "file://" + filepath.Join(sandbox.WorkspacePath, ".multiagent", "workspace-manifest.json")
-	if err := os.MkdirAll(sandbox.WorkspacePath, 0o755); err != nil {
+	if err := s.workspaceProvider.CreateShared(context.Background(), sandbox, tasks, s.latestWorkspaceHeadRefLocked(projectID)); err != nil {
 		return nil, newInternalError("SANDBOX_CREATE_FAILED", "sandbox workspace could not be created")
 	}
 
@@ -3489,6 +3543,8 @@ func (s *Service) writeSharedSandboxManifest(sharedSandbox *domain.Sandbox, task
 	}
 
 	artifactRefs := make([]sharedArtifactRef, 0, len(artifactIDs))
+	artifacts := make([]*domain.Artifact, 0, len(artifactIDs))
+	sourceSandboxes := make([]*domain.Sandbox, 0, len(artifactIDs))
 	for _, artifactID := range artifactIDs {
 		artifact, ok := s.artifacts[artifactID]
 		if !ok {
@@ -3503,10 +3559,19 @@ func (s *Service) writeSharedSandboxManifest(sharedSandbox *domain.Sandbox, task
 			Checksum:  artifact.Checksum,
 			SizeBytes: artifact.SizeBytes,
 		})
-		artifactDir := filepath.Join(sharedSandbox.WorkspacePath, "artifacts", artifact.ID)
-		if err := materializeArtifact(artifact.URI, artifactDir); err != nil {
-			return err
+		artifacts = append(artifacts, artifact)
+		run, ok := s.runs[artifact.RunID]
+		if !ok || strings.TrimSpace(run.SandboxID) == "" {
+			return newConflictError("artifact has no source sandbox for shared merge")
 		}
+		sourceSandbox, ok := s.sandboxIndex[run.SandboxID]
+		if !ok {
+			return newConflictError("artifact source sandbox not found for shared merge")
+		}
+		sourceSandboxes = append(sourceSandboxes, sourceSandbox)
+	}
+	if err := s.workspaceProvider.MergeShared(context.Background(), sharedSandbox, tasks, artifacts, sourceSandboxes); err != nil {
+		return err
 	}
 
 	manifest := map[string]any{
@@ -3520,7 +3585,21 @@ func (s *Service) writeSharedSandboxManifest(sharedSandbox *domain.Sandbox, task
 	if err := writeJSONFile(filepath.Join(sharedSandbox.WorkspacePath, "manifest.json"), manifest); err != nil {
 		return err
 	}
-	return writeWorkspaceManifest(sharedSandbox, sharedSandbox.WorkspacePath, artifactRefs)
+	if err := writeWorkspaceManifest(sharedSandbox, sharedSandbox.WorkspacePath, artifactRefs); err != nil {
+		return err
+	}
+	if strings.EqualFold(sharedSandbox.WorkspaceProvider, "git") {
+		if err := commitGitWorkspaceChanges(context.Background(), sharedSandbox.WorkspacePath, "multiagent: shared workspace manifest"); err != nil {
+			return err
+		}
+		head, err := gitRevParse(context.Background(), sharedSandbox.WorkspacePath, "HEAD")
+		if err != nil {
+			return err
+		}
+		sharedSandbox.WorkspaceHeadRef = head
+		return writeWorkspaceManifest(sharedSandbox, sharedSandbox.WorkspacePath, artifactRefs)
+	}
+	return nil
 }
 
 func (s *Service) currentBranchLocked(projectID string) string {
@@ -3539,7 +3618,22 @@ func (s *Service) latestSnapshotIDLocked(projectID string) string {
 	return items[len(items)-1].ID
 }
 
+func (s *Service) latestWorkspaceHeadRefLocked(projectID string) string {
+	items := s.snapshots[projectID]
+	for idx := len(items) - 1; idx >= 0; idx-- {
+		if ref := strings.TrimSpace(items[idx].WorkspaceChecksum); ref != "" {
+			return ref
+		}
+	}
+	return ""
+}
+
 func (s *Service) recordSnapshotLocked(projectID, branch, reason string, stable bool, sourceSnapshotID string, now time.Time) (*domain.Snapshot, error) {
+	snapshot, err := s.recordSnapshotWithWorkspaceLocked(projectID, branch, reason, stable, sourceSnapshotID, now, nil)
+	return snapshot, err
+}
+
+func (s *Service) recordSnapshotWithWorkspaceLocked(projectID, branch, reason string, stable bool, sourceSnapshotID string, now time.Time, workspaceSandbox *domain.Sandbox) (*domain.Snapshot, error) {
 	if _, ok := s.projects[projectID]; !ok {
 		return nil, newNotFoundError("project not found")
 	}
@@ -3556,6 +3650,10 @@ func (s *Service) recordSnapshotLocked(projectID, branch, reason string, stable 
 		StateRef:         "",
 		Stable:           stable,
 		CreatedAt:        now,
+	}
+	if workspaceSandbox != nil && strings.TrimSpace(workspaceSandbox.WorkspaceHeadRef) != "" {
+		snapshot.WorkspaceChecksum = strings.TrimSpace(workspaceSandbox.WorkspaceHeadRef)
+		snapshot.WorkspaceStateRef = fmt.Sprintf("repo://local/%s@%s", workspaceSandbox.WorkspaceBranch, workspaceSandbox.WorkspaceHeadRef)
 	}
 	state := s.captureProjectSnapshotStateLocked(projectID)
 	snapshot.StateRef = "memory://" + snapshot.ID

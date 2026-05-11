@@ -112,6 +112,9 @@ type Sandbox struct {
 	WorkspacePath        string        `json:"workspacePath,omitempty"`
 	WorkspaceProvider    string        `json:"workspaceProvider,omitempty"`
 	WorkspaceManifestRef string        `json:"workspaceManifestRef,omitempty"`
+	WorkspaceBranch      string        `json:"workspaceBranch,omitempty"`
+	WorkspaceBaseRef     string        `json:"workspaceBaseRef,omitempty"`
+	WorkspaceHeadRef     string        `json:"workspaceHeadRef,omitempty"`
 	Status               SandboxStatus `json:"status"`
 	FailureReason        string        `json:"failureReason,omitempty"`
 	CreatedAt            time.Time     `json:"createdAt"`
@@ -119,15 +122,17 @@ type Sandbox struct {
 }
 
 type Snapshot struct {
-	ID               string    `json:"id"`
-	ProjectID        string    `json:"projectId"`
-	Branch           string    `json:"branch"`
-	SourceSnapshotID string    `json:"sourceSnapshotId,omitempty"`
-	Reason           string    `json:"reason"`
-	StateRef         string    `json:"stateRef"`
-	Checksum         string    `json:"checksum,omitempty"`
-	Stable           bool      `json:"stable"`
-	CreatedAt        time.Time `json:"createdAt"`
+	ID                string    `json:"id"`
+	ProjectID         string    `json:"projectId"`
+	Branch            string    `json:"branch"`
+	SourceSnapshotID  string    `json:"sourceSnapshotId,omitempty"`
+	Reason            string    `json:"reason"`
+	StateRef          string    `json:"stateRef"`
+	Checksum          string    `json:"checksum,omitempty"`
+	WorkspaceStateRef string    `json:"workspaceStateRef,omitempty"`
+	WorkspaceChecksum string    `json:"workspaceChecksum,omitempty"`
+	Stable            bool      `json:"stable"`
+	CreatedAt         time.Time `json:"createdAt"`
 }
 
 type HumanOverride struct {

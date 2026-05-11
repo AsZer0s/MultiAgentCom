@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1302,6 +1303,128 @@ func TestMergeSharedSandboxSuccess(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceProviderCreatesPrivateWorktreeAndCommitsRun(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{
+		Address:                   ":0",
+		ServiceName:               "test-git-workspace-private",
+		ArtifactRoot:              t.TempDir(),
+		SandboxRoot:               t.TempDir(),
+		DefaultAgent:              "manager-agent",
+		WorkspaceProvider:         "git",
+		WorkspaceGitRepoPath:      repoPath,
+		WorkspaceGitBaseRef:       "main",
+		RuntimeProvider:           "local",
+		RuntimeHTTPMaxAttempts:    1,
+		RuntimeHTTPRetryBaseDelay: time.Millisecond,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Git Workspace Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo", Content: "实现 Todo 交付包"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+
+	sandboxView, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get run sandbox: %v", err)
+	}
+	sandbox := sandboxView.Sandbox
+	if sandbox.WorkspaceProvider != "git" {
+		t.Fatalf("WorkspaceProvider = %q, want git", sandbox.WorkspaceProvider)
+	}
+	if sandbox.WorkspaceBranch == "" || sandbox.WorkspaceBaseRef != "main" || sandbox.WorkspaceHeadRef == "" {
+		t.Fatalf("expected git workspace refs, got %+v", sandbox)
+	}
+	if out := runTestGit(t, sandbox.WorkspacePath, "rev-parse", "--is-inside-work-tree"); strings.TrimSpace(out) != "true" {
+		t.Fatalf("expected git worktree, got %q", out)
+	}
+	runTestGit(t, sandbox.WorkspacePath, "cat-file", "-e", sandbox.WorkspaceHeadRef+":tasks/"+planResult.Task.ID+"/bundle/metadata/manifest.json")
+	manifestPath := filepath.Join(sandbox.WorkspacePath, ".multiagent", "workspace-manifest.json")
+	payload, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read workspace manifest: %v", err)
+	}
+	if !strings.Contains(string(payload), sandbox.WorkspaceHeadRef) {
+		t.Fatalf("expected workspace manifest to contain head ref %s: %s", sandbox.WorkspaceHeadRef, string(payload))
+	}
+}
+
+func TestGitMergeSharedSandboxUsesGitMerge(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{
+		Address:                   ":0",
+		ServiceName:               "test-git-workspace-merge",
+		ArtifactRoot:              t.TempDir(),
+		SandboxRoot:               t.TempDir(),
+		DefaultAgent:              "manager-agent",
+		WorkspaceProvider:         "git",
+		WorkspaceGitRepoPath:      repoPath,
+		WorkspaceGitBaseRef:       "main",
+		RuntimeProvider:           "local",
+		RuntimeHTTPMaxAttempts:    1,
+		RuntimeHTTPRetryBaseDelay: time.Millisecond,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	privateHeads := make([]string, 0, 2)
+	sandboxes, err := svc.ListSandboxes(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list sandboxes: %v", err)
+	}
+	for _, sandboxView := range sandboxes {
+		if sandboxView.Sandbox.Scope == "PRIVATE" {
+			privateHeads = append(privateHeads, sandboxView.Sandbox.WorkspaceHeadRef)
+		}
+	}
+	if len(privateHeads) != 2 {
+		t.Fatalf("expected 2 private git heads, got %v", privateHeads)
+	}
+
+	result, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	})
+	if err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	if !result.Passed || result.Sandbox.WorkspaceProvider != "git" || result.Sandbox.WorkspaceHeadRef == "" {
+		t.Fatalf("expected released git shared sandbox, got %+v", result)
+	}
+	for _, head := range privateHeads {
+		runTestGit(t, result.Sandbox.WorkspacePath, "merge-base", "--is-ancestor", head, result.Sandbox.WorkspaceHeadRef)
+	}
+	if dirty := strings.TrimSpace(runTestGit(t, result.Sandbox.WorkspacePath, "status", "--porcelain")); dirty != "M .multiagent/workspace-manifest.json" {
+		t.Fatalf("expected only workspace manifest metadata to remain uncommitted, got %q", dirty)
+	}
+	snapshots, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	if len(snapshots) != 1 || snapshots[0].WorkspaceChecksum != result.Sandbox.WorkspaceHeadRef || !strings.HasPrefix(snapshots[0].WorkspaceStateRef, "repo://local/") {
+		t.Fatalf("expected workspace snapshot ref for shared head, got %+v", snapshots)
+	}
+}
+
 func TestMergeSharedSandboxFailsWhenWorkspaceCannotBeCreated(t *testing.T) {
 	sandboxRootFile := filepath.Join(t.TempDir(), "sandbox-root-file")
 	if err := os.WriteFile(sandboxRootFile, []byte("not a directory"), 0o644); err != nil {
@@ -2573,6 +2696,35 @@ func TestStartPreviewFromSharedSandbox(t *testing.T) {
 	if result.RefreshIntervalMs != 3000 {
 		t.Fatalf("expected refresh interval 3000, got %d", result.RefreshIntervalMs)
 	}
+}
+
+func initTempGitRepo(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	repoPath := t.TempDir()
+	runTestGit(t, repoPath, "init")
+	runTestGit(t, repoPath, "config", "user.name", "MultiAgentCom Test")
+	runTestGit(t, repoPath, "config", "user.email", "multiagentcom-test@example.invalid")
+	if err := os.WriteFile(filepath.Join(repoPath, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write base file: %v", err)
+	}
+	runTestGit(t, repoPath, "add", "README.md")
+	runTestGit(t, repoPath, "commit", "-m", "initial")
+	runTestGit(t, repoPath, "branch", "-M", "main")
+	return repoPath
+}
+
+func runTestGit(t *testing.T, repoPath string, args ...string) string {
+	t.Helper()
+	fullArgs := append([]string{"-C", repoPath}, args...)
+	cmd := exec.Command("git", fullArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v: %s", strings.Join(fullArgs, " "), err, strings.TrimSpace(string(output)))
+	}
+	return string(output)
 }
 
 func prepareSharedSandboxMergeScenario(t *testing.T, svc *Service, ctx context.Context) (*domain.Project, *domain.Contract, []domain.Task) {

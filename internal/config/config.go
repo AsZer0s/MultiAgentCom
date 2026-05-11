@@ -25,6 +25,8 @@ type Config struct {
 	StoreProvider              string
 	DataRoot                   string
 	WorkspaceProvider          string
+	WorkspaceGitRepoPath       string
+	WorkspaceGitBaseRef        string
 	RuntimeProvider            string
 	RuntimeEndpoint            string
 	RuntimeTimeout             time.Duration
@@ -71,6 +73,8 @@ func Load() Config {
 		StoreProvider:              getenv("MULTI_AGENT_STORE_PROVIDER", "memory"),
 		DataRoot:                   getenv("MULTI_AGENT_DATA_ROOT", filepath.Join(os.TempDir(), "multiagentcom", "data")),
 		WorkspaceProvider:          getenv("MULTI_AGENT_WORKSPACE_PROVIDER", "directory"),
+		WorkspaceGitRepoPath:       getenv("MULTI_AGENT_WORKSPACE_GIT_REPO_PATH", ""),
+		WorkspaceGitBaseRef:        getenv("MULTI_AGENT_WORKSPACE_GIT_BASE_REF", "HEAD"),
 		RuntimeProvider:            getenv("MULTI_AGENT_RUNTIME_PROVIDER", "local"),
 		RuntimeEndpoint:            getenv("MULTI_AGENT_RUNTIME_HTTP_ENDPOINT", ""),
 		RuntimeTimeout:             getenvDuration("MULTI_AGENT_RUNTIME_HTTP_TIMEOUT", 30*time.Second),
@@ -108,6 +112,9 @@ func WithDefaults(cfg Config) Config {
 	}
 	if strings.TrimSpace(cfg.WorkspaceProvider) == "" {
 		cfg.WorkspaceProvider = "directory"
+	}
+	if strings.TrimSpace(cfg.WorkspaceGitBaseRef) == "" {
+		cfg.WorkspaceGitBaseRef = "HEAD"
 	}
 	if strings.TrimSpace(cfg.RuntimeProvider) == "" {
 		cfg.RuntimeProvider = "local"
@@ -150,8 +157,12 @@ func Validate(cfg Config) error {
 	}
 	switch strings.ToLower(strings.TrimSpace(cfg.WorkspaceProvider)) {
 	case "directory":
+	case "git":
+		if strings.TrimSpace(cfg.WorkspaceGitRepoPath) == "" {
+			issues = append(issues, ValidationIssue{Field: "WorkspaceGitRepoPath", Message: "is required when WorkspaceProvider is git"})
+		}
 	default:
-		issues = append(issues, ValidationIssue{Field: "WorkspaceProvider", Message: "must be directory"})
+		issues = append(issues, ValidationIssue{Field: "WorkspaceProvider", Message: "must be directory or git"})
 	}
 
 	switch strings.ToLower(strings.TrimSpace(cfg.RuntimeProvider)) {

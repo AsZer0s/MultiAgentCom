@@ -78,8 +78,11 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - `GET /projects/{id}/communications?taskId=...&limit=...&offset=...` 返回 `checksum` 和分页元数据
 - `GET /projects/{id}/audit-logs?limit=1&since=...` 返回分页后的关键操作审计流
 - `GET /projects/{id}/token-costs?taskId=...` 返回 `totalTokens` 与 `budgetStatus`
-- 私有 run sandbox 返回 `workspacePath`、`workspaceProvider=directory` 和 `workspaceManifestRef`，且工作区包含 `.multiagent/workspace-manifest.json`
-- 共享沙盒成功合并后，`workspace/artifacts/<artifactId>/` 包含 materialized delivery bundle 内容，且共享工作区包含 `.multiagent/workspace-manifest.json`
+- 私有 run sandbox 返回 `workspacePath`、默认 `workspaceProvider=directory` 和 `workspaceManifestRef`，且工作区包含 `.multiagent/workspace-manifest.json`
+- 配置 `MULTI_AGENT_WORKSPACE_PROVIDER=git`、`MULTI_AGENT_WORKSPACE_GIT_REPO_PATH` 和 `MULTI_AGENT_WORKSPACE_GIT_BASE_REF` 后，私有 run sandbox 会创建真实 Git worktree、任务分支和 `workspaceHeadRef`
+- Git provider 完成 run 后，任务分支 commit 中包含 `tasks/<taskId>/bundle/metadata/manifest.json`
+- 共享沙盒成功合并后，directory provider 的 `workspace/artifacts/<artifactId>/` 包含 materialized delivery bundle 内容，且共享工作区包含 `.multiagent/workspace-manifest.json`
+- Git provider 的共享沙盒成功合并后，私有任务 head 是共享 `workspaceHeadRef` 的 ancestor，快照包含 `workspaceStateRef` 与 `workspaceChecksum`
 - 文件存储模式下，快照 rollback 可从 `file://` StateRef 恢复；checksum 被篡改时应拒绝回滚
 - `POST /projects/{id}/locks` 可提交 `lockMode=go_symbol`、`language=go`、`symbolKind=func`、`symbolName=main`，并只替换 Go 顶层函数
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回 `runtime.http.v1` success 时可执行成功并采用嵌套 `usage`

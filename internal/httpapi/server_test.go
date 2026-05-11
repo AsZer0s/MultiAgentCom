@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -172,6 +173,28 @@ func TestHTTPReadyReportsReady(t *testing.T) {
 			t.Fatalf("expected readiness check ok, got %+v", ready.Checks)
 		}
 	}
+}
+
+func TestHTTPReadyChecksGitWorkspace(t *testing.T) {
+	repoPath := initHTTPTempGitRepo(t)
+	cfg := config.Config{
+		Address:              ":0",
+		ServiceName:          "test-http-ready-git",
+		ArtifactRoot:         t.TempDir(),
+		SandboxRoot:          t.TempDir(),
+		WorkspaceProvider:    "git",
+		WorkspaceGitRepoPath: repoPath,
+		WorkspaceGitBaseRef:  "main",
+		RuntimeProvider:      "local",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSON(t, server.Client(), server.URL+"/ready")
+	assertContainsBody(t, body, `"name":"gitWorkspace"`)
+	assertContainsBody(t, body, `"status":"ready"`)
 }
 
 func TestHTTPReadyReportsConfigFailure(t *testing.T) {
@@ -1837,6 +1860,35 @@ func assertContainsBody(t *testing.T, body []byte, fragment string) {
 	if !strings.Contains(string(body), fragment) {
 		t.Fatalf("expected body to contain %s, got %s", fragment, string(body))
 	}
+}
+
+func initHTTPTempGitRepo(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	repoPath := t.TempDir()
+	runHTTPTestGit(t, repoPath, "init")
+	runHTTPTestGit(t, repoPath, "config", "user.name", "MultiAgentCom Test")
+	runHTTPTestGit(t, repoPath, "config", "user.email", "multiagentcom-test@example.invalid")
+	if err := os.WriteFile(filepath.Join(repoPath, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write base file: %v", err)
+	}
+	runHTTPTestGit(t, repoPath, "add", "README.md")
+	runHTTPTestGit(t, repoPath, "commit", "-m", "initial")
+	runHTTPTestGit(t, repoPath, "branch", "-M", "main")
+	return repoPath
+}
+
+func runHTTPTestGit(t *testing.T, repoPath string, args ...string) string {
+	t.Helper()
+	fullArgs := append([]string{"-C", repoPath}, args...)
+	cmd := exec.Command("git", fullArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v: %s", strings.Join(fullArgs, " "), err, strings.TrimSpace(string(output)))
+	}
+	return string(output)
 }
 
 func decodeResponse(t *testing.T, body []byte, target any) {

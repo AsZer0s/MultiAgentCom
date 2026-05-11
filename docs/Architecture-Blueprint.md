@@ -57,6 +57,7 @@
 ### 3.7 Sandbox Runtime Service
 - 管理私有沙盒（每 Agent 独立执行）。
 - 管理共享沙盒（合并与集成验证）。
+- 通过 Workspace Provider 抽象隔离工作区实现：默认 directory provider 负责本地目录和 artifact materialization；Git provider v1 负责本地已有 repo 的 worktree 创建、任务分支 commit、shared sandbox `git merge --no-ff` 与 merge conflict 诊断。
 - 负责集成失败回滚。
 
 ### 3.8 Timeline Engine Service
@@ -148,7 +149,7 @@
 - `id`, `task_id`, `kind`, `uri`, `checksum`, `size_bytes`, `created_at`
 
 ### 7.5 `snapshot`
-- `id`, `project_id`, `branch`, `source_snapshot_id`, `reason`, `state_ref`, `created_at`
+- `id`, `project_id`, `branch`, `source_snapshot_id`, `reason`, `state_ref`, `checksum`, `workspace_state_ref`, `workspace_checksum`, `created_at`
 
 ### 7.6 `human_override`
 - `id`, `project_id`, `task_id`, `operator`, `instruction`, `lock_scope`, `created_at`
