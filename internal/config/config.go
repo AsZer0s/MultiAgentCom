@@ -27,6 +27,13 @@ type Config struct {
 	WorkspaceProvider                 string
 	WorkspaceGitRepoPath              string
 	WorkspaceGitBaseRef               string
+	WorkspaceGitRemoteURL             string
+	WorkspaceGitRemoteName            string
+	WorkspaceGitFetchBeforeUse        bool
+	WorkspaceGitPushEnabled           bool
+	WorkspaceGitAuthToken             string
+	WorkspaceGitAuthTokenFile         string
+	WorkspaceGitAuthUsername          string
 	WorkspaceGitCleanupEnabled        bool
 	WorkspaceGitCleanupDeleteBranches bool
 	WorkspaceGitCleanupFailedEnabled  bool
@@ -79,6 +86,13 @@ func Load() Config {
 		WorkspaceProvider:                 getenv("MULTI_AGENT_WORKSPACE_PROVIDER", "directory"),
 		WorkspaceGitRepoPath:              getenv("MULTI_AGENT_WORKSPACE_GIT_REPO_PATH", ""),
 		WorkspaceGitBaseRef:               getenv("MULTI_AGENT_WORKSPACE_GIT_BASE_REF", "HEAD"),
+		WorkspaceGitRemoteURL:             getenv("MULTI_AGENT_WORKSPACE_GIT_REMOTE_URL", ""),
+		WorkspaceGitRemoteName:            getenv("MULTI_AGENT_WORKSPACE_GIT_REMOTE_NAME", "origin"),
+		WorkspaceGitFetchBeforeUse:        getenvBool("MULTI_AGENT_WORKSPACE_GIT_FETCH_BEFORE_USE", false),
+		WorkspaceGitPushEnabled:           getenvBool("MULTI_AGENT_WORKSPACE_GIT_PUSH_ENABLED", false),
+		WorkspaceGitAuthToken:             getenv("MULTI_AGENT_WORKSPACE_GIT_AUTH_TOKEN", ""),
+		WorkspaceGitAuthTokenFile:         getenv("MULTI_AGENT_WORKSPACE_GIT_AUTH_TOKEN_FILE", ""),
+		WorkspaceGitAuthUsername:          getenv("MULTI_AGENT_WORKSPACE_GIT_AUTH_USERNAME", "x-access-token"),
 		WorkspaceGitCleanupEnabled:        getenvBool("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_ENABLED", true),
 		WorkspaceGitCleanupDeleteBranches: getenvBool("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_DELETE_BRANCHES", false),
 		WorkspaceGitCleanupFailedEnabled:  getenvBool("MULTI_AGENT_WORKSPACE_GIT_CLEANUP_FAILED_ENABLED", false),
@@ -123,6 +137,12 @@ func WithDefaults(cfg Config) Config {
 	}
 	if strings.TrimSpace(cfg.WorkspaceGitBaseRef) == "" {
 		cfg.WorkspaceGitBaseRef = "HEAD"
+	}
+	if strings.TrimSpace(cfg.WorkspaceGitRemoteName) == "" {
+		cfg.WorkspaceGitRemoteName = "origin"
+	}
+	if strings.TrimSpace(cfg.WorkspaceGitAuthUsername) == "" {
+		cfg.WorkspaceGitAuthUsername = "x-access-token"
 	}
 	if strings.TrimSpace(cfg.RuntimeProvider) == "" {
 		cfg.RuntimeProvider = "local"
@@ -183,6 +203,23 @@ func Validate(cfg Config) error {
 		}
 	default:
 		issues = append(issues, ValidationIssue{Field: "RuntimeProvider", Message: "must be local or http"})
+	}
+	if remoteURL := strings.TrimSpace(cfg.WorkspaceGitRemoteURL); remoteURL != "" {
+		if err := validateWorkspaceGitRemoteURL(remoteURL); err != nil {
+			issues = append(issues, ValidationIssue{Field: "WorkspaceGitRemoteURL", Message: err.Error()})
+		}
+	}
+	if strings.TrimSpace(cfg.WorkspaceGitAuthToken) != "" && strings.TrimSpace(cfg.WorkspaceGitAuthTokenFile) != "" {
+		issues = append(issues, ValidationIssue{Field: "WorkspaceGitAuthTokenFile", Message: "must not be set when WorkspaceGitAuthToken is set"})
+	}
+	if tokenFile := strings.TrimSpace(cfg.WorkspaceGitAuthTokenFile); tokenFile != "" {
+		if info, err := os.Stat(tokenFile); err != nil {
+			issues = append(issues, ValidationIssue{Field: "WorkspaceGitAuthTokenFile", Message: "must be readable"})
+		} else if info.IsDir() {
+			issues = append(issues, ValidationIssue{Field: "WorkspaceGitAuthTokenFile", Message: "must be a file"})
+		} else if _, err := os.ReadFile(tokenFile); err != nil {
+			issues = append(issues, ValidationIssue{Field: "WorkspaceGitAuthTokenFile", Message: "must be readable"})
+		}
 	}
 	if cfg.WorkspaceGitCleanupMinAge < 0 {
 		issues = append(issues, ValidationIssue{Field: "WorkspaceGitCleanupMinAge", Message: "must be non-negative"})
@@ -328,6 +365,34 @@ func getenvFloat(key string, fallback float64) float64 {
 		return fallback
 	}
 	return parsed
+}
+
+func validateWorkspaceGitRemoteURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("must be a valid remote URL")
+	}
+	if parsed.Scheme == "" {
+		if strings.Contains(raw, "://") {
+			return fmt.Errorf("must be a valid remote URL")
+		}
+		return nil
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		if parsed.User != nil {
+			return fmt.Errorf("must not embed credentials")
+		}
+	case "ssh":
+		if parsed.User != nil {
+			if _, ok := parsed.User.Password(); ok {
+				return fmt.Errorf("must not embed credentials")
+			}
+		}
+	case "file":
+		return nil
+	}
+	return nil
 }
 
 func getenvInt(key string, fallback int) int {

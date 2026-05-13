@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -829,7 +828,7 @@ func (s *Server) readiness() readinessResult {
 	addCheck("artifactRoot", ensureWritableDir(cfg.ArtifactRoot))
 	addCheck("sandboxRoot", ensureWritableDir(cfg.SandboxRoot))
 	if strings.EqualFold(strings.TrimSpace(cfg.WorkspaceProvider), "git") {
-		addCheck("gitWorkspace", checkGitWorkspace(cfg.WorkspaceGitRepoPath, cfg.WorkspaceGitBaseRef))
+		addCheck("gitWorkspace", service.CheckGitWorkspace(context.Background(), cfg))
 	} else {
 		addCheck("workspace", nil)
 	}
@@ -852,47 +851,6 @@ func (s *Server) readiness() readinessResult {
 		}
 	}
 	return readinessResult{Status: status, Service: cfg.ServiceName, Timestamp: time.Now().UTC(), Checks: checks}
-}
-
-func checkGitWorkspace(repoPath, baseRef string) error {
-	if _, err := exec.LookPath("git"); err != nil {
-		return err
-	}
-	repoPath = strings.TrimSpace(repoPath)
-	if repoPath == "" {
-		return fmt.Errorf("git workspace repo path is required")
-	}
-	info, err := os.Stat(repoPath)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("git workspace repo path is not a directory")
-	}
-	if _, err := runReadinessGit(repoPath, "rev-parse", "--git-dir"); err != nil {
-		return err
-	}
-	baseRef = strings.TrimSpace(baseRef)
-	if baseRef == "" {
-		baseRef = "HEAD"
-	}
-	_, err = runReadinessGit(repoPath, "rev-parse", "--verify", baseRef)
-	return err
-}
-
-func runReadinessGit(repoPath string, args ...string) (string, error) {
-	fullArgs := append([]string{"-C", repoPath}, args...)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", fullArgs...)
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
-		return string(output), ctx.Err()
-	}
-	if err != nil {
-		return string(output), fmt.Errorf("git %s failed: %w: %s", strings.Join(fullArgs, " "), err, strings.TrimSpace(string(output)))
-	}
-	return string(output), nil
 }
 
 func ensureWritableDir(path string) error {

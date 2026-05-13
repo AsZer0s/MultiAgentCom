@@ -197,6 +197,72 @@ func TestHTTPReadyChecksGitWorkspace(t *testing.T) {
 	assertContainsBody(t, body, `"status":"ready"`)
 }
 
+func TestHTTPReadyClonesRemoteGitWorkspace(t *testing.T) {
+	remotePath := initHTTPBareGitRemote(t)
+	repoPath := filepath.Join(t.TempDir(), "workspace-repo")
+	cfg := config.Config{
+		Address:                    ":0",
+		ServiceName:                "test-http-ready-git-remote-clone",
+		ArtifactRoot:               t.TempDir(),
+		SandboxRoot:                t.TempDir(),
+		WorkspaceProvider:          "git",
+		WorkspaceGitRepoPath:       repoPath,
+		WorkspaceGitRemoteURL:      remotePath,
+		WorkspaceGitBaseRef:        "origin/main",
+		WorkspaceGitFetchBeforeUse: true,
+		RuntimeProvider:            "local",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSON(t, server.Client(), server.URL+"/ready")
+	assertContainsBody(t, body, `"name":"gitWorkspace"`)
+	assertContainsBody(t, body, `"status":"ready"`)
+	if out := runHTTPTestGit(t, repoPath, "rev-parse", "--is-inside-work-tree"); strings.TrimSpace(out) != "true" {
+		t.Fatalf("expected cloned repo, got %q", out)
+	}
+}
+
+func TestHTTPReadyFetchesRemoteGitWorkspace(t *testing.T) {
+	remotePath := initHTTPBareGitRemote(t)
+	repoPath := filepath.Join(t.TempDir(), "workspace-repo")
+	runHTTPTestGit(t, t.TempDir(), "clone", remotePath, repoPath)
+	remoteWork := cloneHTTPBareRemote(t, remotePath)
+	if err := os.WriteFile(filepath.Join(remoteWork, "REMOTE.md"), []byte("new base\n"), 0o644); err != nil {
+		t.Fatalf("write remote file: %v", err)
+	}
+	runHTTPTestGit(t, remoteWork, "add", "REMOTE.md")
+	runHTTPTestGit(t, remoteWork, "commit", "-m", "remote update")
+	runHTTPTestGit(t, remoteWork, "push", "origin", "main")
+
+	cfg := config.Config{
+		Address:                    ":0",
+		ServiceName:                "test-http-ready-git-remote-fetch",
+		ArtifactRoot:               t.TempDir(),
+		SandboxRoot:                t.TempDir(),
+		WorkspaceProvider:          "git",
+		WorkspaceGitRepoPath:       repoPath,
+		WorkspaceGitRemoteURL:      remotePath,
+		WorkspaceGitBaseRef:        "origin/main",
+		WorkspaceGitFetchBeforeUse: true,
+		RuntimeProvider:            "local",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSON(t, server.Client(), server.URL+"/ready")
+	assertContainsBody(t, body, `"status":"ready"`)
+	remoteRef := strings.TrimSpace(runHTTPTestGit(t, repoPath, "rev-parse", "origin/main"))
+	remoteMain := strings.TrimSpace(runHTTPTestGit(t, remoteWork, "rev-parse", "main"))
+	if remoteRef != remoteMain {
+		t.Fatalf("origin/main = %s, want %s", remoteRef, remoteMain)
+	}
+}
+
 func TestHTTPReadyReportsConfigFailure(t *testing.T) {
 	cfg := config.Config{
 		Address:         ":0",
@@ -1898,6 +1964,34 @@ func assertContainsBody(t *testing.T, body []byte, fragment string) {
 	if !strings.Contains(string(body), fragment) {
 		t.Fatalf("expected body to contain %s, got %s", fragment, string(body))
 	}
+}
+
+func initHTTPBareGitRemote(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	barePath := filepath.Join(t.TempDir(), "remote.git")
+	runHTTPTestGit(t, t.TempDir(), "init", "--bare", barePath)
+	workPath := cloneHTTPBareRemote(t, barePath)
+	if err := os.WriteFile(filepath.Join(workPath, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write base file: %v", err)
+	}
+	runHTTPTestGit(t, workPath, "add", "README.md")
+	runHTTPTestGit(t, workPath, "commit", "-m", "initial")
+	runHTTPTestGit(t, workPath, "branch", "-M", "main")
+	runHTTPTestGit(t, workPath, "push", "origin", "main")
+	runHTTPTestGit(t, barePath, "symbolic-ref", "HEAD", "refs/heads/main")
+	return barePath
+}
+
+func cloneHTTPBareRemote(t *testing.T, barePath string) string {
+	t.Helper()
+	workPath := filepath.Join(t.TempDir(), "work")
+	runHTTPTestGit(t, t.TempDir(), "clone", barePath, workPath)
+	runHTTPTestGit(t, workPath, "config", "user.name", "MultiAgentCom Test")
+	runHTTPTestGit(t, workPath, "config", "user.email", "multiagentcom-test@example.invalid")
+	return workPath
 }
 
 func initHTTPTempGitRepo(t *testing.T) string {

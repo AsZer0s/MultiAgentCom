@@ -1430,6 +1430,209 @@ func TestGitMergeSharedSandboxUsesGitMerge(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceProviderClonesRemoteWhenRepoMissing(t *testing.T) {
+	remotePath := initBareGitRemote(t)
+	repoPath := filepath.Join(t.TempDir(), "workspace-repo")
+	cfg := config.Config{
+		Address:                    ":0",
+		ServiceName:                "test-git-workspace-remote-clone",
+		ArtifactRoot:               t.TempDir(),
+		SandboxRoot:                t.TempDir(),
+		DefaultAgent:               "manager-agent",
+		WorkspaceProvider:          "git",
+		WorkspaceGitRepoPath:       repoPath,
+		WorkspaceGitRemoteURL:      remotePath,
+		WorkspaceGitBaseRef:        "origin/main",
+		RuntimeProvider:            "local",
+		RuntimeHTTPMaxAttempts:     1,
+		RuntimeHTTPRetryBaseDelay:  time.Millisecond,
+		WorkspaceGitFetchBeforeUse: true,
+		WorkspaceGitCleanupEnabled: false,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Remote Clone Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo", Content: "实现 Todo 交付包"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+
+	if out := runTestGit(t, repoPath, "rev-parse", "--is-inside-work-tree"); strings.TrimSpace(out) != "true" {
+		t.Fatalf("expected cloned repo, got %q", out)
+	}
+	sandboxView, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get run sandbox: %v", err)
+	}
+	if sandboxView.Sandbox.WorkspaceHeadRef == "" || sandboxView.Sandbox.WorkspaceBaseRef != "origin/main" {
+		t.Fatalf("expected remote git refs, got %+v", sandboxView.Sandbox)
+	}
+}
+
+func TestGitWorkspaceProviderFetchesBeforeCreatingWorktree(t *testing.T) {
+	remotePath := initBareGitRemote(t)
+	repoPath := filepath.Join(t.TempDir(), "workspace-repo")
+	runTestGit(t, t.TempDir(), "clone", remotePath, repoPath)
+	remoteWork := cloneBareRemote(t, remotePath)
+	if err := os.WriteFile(filepath.Join(remoteWork, "REMOTE.md"), []byte("new base\n"), 0o644); err != nil {
+		t.Fatalf("write remote file: %v", err)
+	}
+	runTestGit(t, remoteWork, "add", "REMOTE.md")
+	runTestGit(t, remoteWork, "commit", "-m", "remote update")
+	runTestGit(t, remoteWork, "push", "origin", "main")
+
+	cfg := config.Config{
+		Address:                    ":0",
+		ServiceName:                "test-git-workspace-remote-fetch",
+		ArtifactRoot:               t.TempDir(),
+		SandboxRoot:                t.TempDir(),
+		DefaultAgent:               "manager-agent",
+		WorkspaceProvider:          "git",
+		WorkspaceGitRepoPath:       repoPath,
+		WorkspaceGitRemoteURL:      remotePath,
+		WorkspaceGitBaseRef:        "origin/main",
+		WorkspaceGitFetchBeforeUse: true,
+		WorkspaceGitCleanupEnabled: false,
+		RuntimeProvider:            "local",
+		RuntimeHTTPMaxAttempts:     1,
+		RuntimeHTTPRetryBaseDelay:  time.Millisecond,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Remote Fetch Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo", Content: "实现 Todo 交付包"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+	sandboxView, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get run sandbox: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sandboxView.Sandbox.WorkspacePath, "REMOTE.md")); err != nil {
+		t.Fatalf("expected fetched base file in worktree: %v", err)
+	}
+}
+
+func TestGitWorkspaceProviderPushesPrivateBranch(t *testing.T) {
+	remotePath := initBareGitRemote(t)
+	repoPath := filepath.Join(t.TempDir(), "workspace-repo")
+	cfg := config.Config{
+		Address:                    ":0",
+		ServiceName:                "test-git-workspace-remote-push-private",
+		ArtifactRoot:               t.TempDir(),
+		SandboxRoot:                t.TempDir(),
+		DefaultAgent:               "manager-agent",
+		WorkspaceProvider:          "git",
+		WorkspaceGitRepoPath:       repoPath,
+		WorkspaceGitRemoteURL:      remotePath,
+		WorkspaceGitBaseRef:        "origin/main",
+		WorkspaceGitPushEnabled:    true,
+		WorkspaceGitCleanupEnabled: false,
+		RuntimeProvider:            "local",
+		RuntimeHTTPMaxAttempts:     1,
+		RuntimeHTTPRetryBaseDelay:  time.Millisecond,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Remote Push Private Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo", Content: "实现 Todo 交付包"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+	sandboxView, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get run sandbox: %v", err)
+	}
+	remoteHead := strings.TrimSpace(runTestGit(t, remotePath, "rev-parse", "refs/heads/"+sandboxView.Sandbox.WorkspaceBranch))
+	if remoteHead != sandboxView.Sandbox.WorkspaceHeadRef {
+		t.Fatalf("remote head = %s, want %s", remoteHead, sandboxView.Sandbox.WorkspaceHeadRef)
+	}
+}
+
+func TestGitWorkspaceProviderPushesSharedBranch(t *testing.T) {
+	remotePath := initBareGitRemote(t)
+	repoPath := filepath.Join(t.TempDir(), "workspace-repo")
+	cfg := config.Config{
+		Address:                           ":0",
+		ServiceName:                       "test-git-workspace-remote-push-shared",
+		ArtifactRoot:                      t.TempDir(),
+		SandboxRoot:                       t.TempDir(),
+		DefaultAgent:                      "manager-agent",
+		WorkspaceProvider:                 "git",
+		WorkspaceGitRepoPath:              repoPath,
+		WorkspaceGitRemoteURL:             remotePath,
+		WorkspaceGitBaseRef:               "origin/main",
+		WorkspaceGitPushEnabled:           true,
+		WorkspaceGitCleanupEnabled:        true,
+		WorkspaceGitCleanupDeleteBranches: false,
+		RuntimeProvider:                   "local",
+		RuntimeHTTPMaxAttempts:            1,
+		RuntimeHTTPRetryBaseDelay:         time.Millisecond,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	result, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	})
+	if err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	remoteHead := strings.TrimSpace(runTestGit(t, remotePath, "rev-parse", "refs/heads/"+result.Sandbox.WorkspaceBranch))
+	if remoteHead != result.Sandbox.WorkspaceHeadRef {
+		t.Fatalf("remote shared head = %s, want %s", remoteHead, result.Sandbox.WorkspaceHeadRef)
+	}
+}
+
+func TestGitErrorSanitizerRedactsAuthToken(t *testing.T) {
+	secret := "ghp_super_secret"
+	text := sanitizeGitError("fatal: authentication failed for "+secret, []string{secret})
+	if strings.Contains(text, secret) || !strings.Contains(text, "[REDACTED]") {
+		t.Fatalf("expected token redaction, got %q", text)
+	}
+}
+
 func TestGitWorkspaceCleanupKeepsBranchesWhenSafeDeleteIsRefused(t *testing.T) {
 	repoPath := initTempGitRepo(t)
 	cfg := config.Config{
@@ -2993,6 +3196,34 @@ func mustListSandboxes(t *testing.T, svc *Service, ctx context.Context, projectI
 		t.Fatalf("list sandboxes: %v", err)
 	}
 	return sandboxes
+}
+
+func initBareGitRemote(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	barePath := filepath.Join(t.TempDir(), "remote.git")
+	runTestGit(t, t.TempDir(), "init", "--bare", barePath)
+	workPath := cloneBareRemote(t, barePath)
+	if err := os.WriteFile(filepath.Join(workPath, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write base file: %v", err)
+	}
+	runTestGit(t, workPath, "add", "README.md")
+	runTestGit(t, workPath, "commit", "-m", "initial")
+	runTestGit(t, workPath, "branch", "-M", "main")
+	runTestGit(t, workPath, "push", "origin", "main")
+	runTestGit(t, barePath, "symbolic-ref", "HEAD", "refs/heads/main")
+	return barePath
+}
+
+func cloneBareRemote(t *testing.T, barePath string) string {
+	t.Helper()
+	workPath := filepath.Join(t.TempDir(), "work")
+	runTestGit(t, t.TempDir(), "clone", barePath, workPath)
+	runTestGit(t, workPath, "config", "user.name", "MultiAgentCom Test")
+	runTestGit(t, workPath, "config", "user.email", "multiagentcom-test@example.invalid")
+	return workPath
 }
 
 func initTempGitRepo(t *testing.T) string {

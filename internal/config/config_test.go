@@ -79,6 +79,45 @@ func TestLoadWorkspaceProviderOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadWorkspaceGitRemoteOverrides(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "git-token")
+	if err := os.WriteFile(tokenFile, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_REMOTE_URL", "file:///tmp/remote.git")
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_REMOTE_NAME", "upstream")
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_FETCH_BEFORE_USE", "true")
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_PUSH_ENABLED", "true")
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_AUTH_TOKEN_FILE", tokenFile)
+	t.Setenv("MULTI_AGENT_WORKSPACE_GIT_AUTH_USERNAME", "git-user")
+
+	cfg := Load()
+
+	if cfg.WorkspaceGitRemoteURL != "file:///tmp/remote.git" || cfg.WorkspaceGitRemoteName != "upstream" {
+		t.Fatalf("unexpected remote config: %+v", cfg)
+	}
+	if !cfg.WorkspaceGitFetchBeforeUse || !cfg.WorkspaceGitPushEnabled {
+		t.Fatalf("expected fetch/push enabled: %+v", cfg)
+	}
+	if cfg.WorkspaceGitAuthTokenFile != tokenFile || cfg.WorkspaceGitAuthUsername != "git-user" {
+		t.Fatalf("unexpected auth config: %+v", cfg)
+	}
+}
+
+func TestLoadWorkspaceGitRemoteDefaults(t *testing.T) {
+	cfg := Load()
+
+	if cfg.WorkspaceGitRemoteName != "origin" {
+		t.Fatalf("WorkspaceGitRemoteName = %q, want origin", cfg.WorkspaceGitRemoteName)
+	}
+	if cfg.WorkspaceGitAuthUsername != "x-access-token" {
+		t.Fatalf("WorkspaceGitAuthUsername = %q, want x-access-token", cfg.WorkspaceGitAuthUsername)
+	}
+	if cfg.WorkspaceGitFetchBeforeUse || cfg.WorkspaceGitPushEnabled {
+		t.Fatalf("expected remote fetch/push disabled by default: %+v", cfg)
+	}
+}
+
 func TestLoadWorkspaceGitCleanupDefaults(t *testing.T) {
 	cfg := Load()
 
@@ -250,6 +289,40 @@ func TestValidateRejectsGitWorkspaceProviderWithoutRepoPath(t *testing.T) {
 	issues := ValidationIssues(err)
 	if len(issues) != 1 || issues[0].Field != "WorkspaceGitRepoPath" {
 		t.Fatalf("expected WorkspaceGitRepoPath issue, got %v", issues)
+	}
+}
+
+func TestValidateRejectsWorkspaceGitRemoteURLWithCredentials(t *testing.T) {
+	err := Validate(Config{WorkspaceProvider: "git", WorkspaceGitRepoPath: t.TempDir(), WorkspaceGitRemoteURL: "https://token@example.com/repo.git"})
+	issues := ValidationIssues(err)
+	if len(issues) != 1 || issues[0].Field != "WorkspaceGitRemoteURL" {
+		t.Fatalf("expected WorkspaceGitRemoteURL issue, got %v", issues)
+	}
+}
+
+func TestValidateAcceptsWorkspaceGitFileRemote(t *testing.T) {
+	if err := Validate(Config{WorkspaceProvider: "git", WorkspaceGitRepoPath: t.TempDir(), WorkspaceGitRemoteURL: "file:///tmp/repo.git"}); err != nil {
+		t.Fatalf("Validate file remote: %v", err)
+	}
+}
+
+func TestValidateRejectsWorkspaceGitAuthTokenAndFileTogether(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	err := Validate(Config{WorkspaceGitAuthToken: "secret", WorkspaceGitAuthTokenFile: tokenFile})
+	issues := ValidationIssues(err)
+	if len(issues) != 1 || issues[0].Field != "WorkspaceGitAuthTokenFile" {
+		t.Fatalf("expected WorkspaceGitAuthTokenFile issue, got %v", issues)
+	}
+}
+
+func TestValidateRejectsMissingWorkspaceGitAuthTokenFile(t *testing.T) {
+	err := Validate(Config{WorkspaceGitAuthTokenFile: filepath.Join(t.TempDir(), "missing")})
+	issues := ValidationIssues(err)
+	if len(issues) != 1 || issues[0].Field != "WorkspaceGitAuthTokenFile" {
+		t.Fatalf("expected WorkspaceGitAuthTokenFile issue, got %v", issues)
 	}
 }
 

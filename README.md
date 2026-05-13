@@ -55,7 +55,7 @@
 - 通信日志当前支持**链路可视化与分页读取**：会记录任务派发、上下文注入、运行启动、人工接管、代码锁等内部消息，并可在 `/projects/{id}/communications` 或 `/status/panel` 中按 `taskId` 过滤和高亮查看；HTTP 列表支持 `limit`、`offset`、`since`、`until`。
 - 告警基线当前支持**失败通知与分页读取**：run 失败和共享沙盒关键失败会沉淀为 `/projects/{id}/alerts` 中的告警流，并在 `/status/panel` 里直接展示；告警与审计列表均支持分页和时间过滤。
 - Token 成本监控当前支持**真实 usage 优先与预算状态**：runtime provider 返回 token usage 时优先采用真实值，否则使用估算 fallback；单价和 warn/block 预算阈值可通过环境变量配置，可通过 `/projects/{id}/token-costs` 或 `/status/panel` 查看按任务的趋势条目。
-- 私有沙盒运行时当前支持**每个 run 独立工作区**：默认 `workspaceProvider=directory` 会为每次执行分配显式 `sandboxId`、独立 `rootPath`、`workspacePath` 并写入 `.multiagent/workspace-manifest.json`；也可通过 `MULTI_AGENT_WORKSPACE_PROVIDER=git`、`MULTI_AGENT_WORKSPACE_GIT_REPO_PATH` 和 `MULTI_AGENT_WORKSPACE_GIT_BASE_REF` 启用 local-only Git worktree provider，在本地已有 repo 上创建任务分支 worktree、提交任务产物并记录 `workspaceBranch` / `workspaceHeadRef`。单个沙盒失败会标记为 `FAILED`，不会影响其他并行任务继续产生产物。
+- 私有沙盒运行时当前支持**每个 run 独立工作区**：默认 `workspaceProvider=directory` 会为每次执行分配显式 `sandboxId`、独立 `rootPath`、`workspacePath` 并写入 `.multiagent/workspace-manifest.json`；也可通过 `MULTI_AGENT_WORKSPACE_PROVIDER=git`、`MULTI_AGENT_WORKSPACE_GIT_REPO_PATH` 和 `MULTI_AGENT_WORKSPACE_GIT_BASE_REF` 启用 Git worktree provider，在本地已有 repo 或通过 `MULTI_AGENT_WORKSPACE_GIT_REMOTE_URL` clone 的 repo 上创建任务分支 worktree、提交任务产物并记录 `workspaceBranch` / `workspaceHeadRef`；`MULTI_AGENT_WORKSPACE_GIT_FETCH_BEFORE_USE=true` 会在创建 worktree 前 fetch，`MULTI_AGENT_WORKSPACE_GIT_PUSH_ENABLED=true` 会非 force push task/shared 分支。单个沙盒失败会标记为 `FAILED`，不会影响其他并行任务继续产生产物。
 - HITL 当前支持**最小人工接管**：运行中的任务可通过 `POST /projects/{id}/overrides` 进入 `HUMAN_OVERRIDE`，执行器会在安全检查点应用指令并恢复执行，任务审计与运行摘要会记录这次接管。
 - 代码锁定当前支持**人工真值保护与 Go AST 级锁**：人类可通过 `POST /projects/{id}/locks` 注册包含 `LOCKED BY HUMAN` 标记的文件内容；默认 `file` 模式会在 bundle 生成末尾覆盖整文件，`go_symbol` 模式可锁定 Go `func`、`method`、`type`、`var`、`const` 并只替换对应声明，同时合并锁内容所需 imports、移除替换后不再使用的普通 imports，冲突会写入 `metadata/lock-conflicts.log`。
 - 共享沙盒当前支持**最小合并闸门**：只有 `DONE` 任务的成功产物才可进入 `SHARED` 沙盒；可在合并前执行契约校验并生成修复任务。directory provider 成功合并会把交付 ZIP materialize 到 `workspace/artifacts/<artifactId>/` 并写入共享 `.multiagent/workspace-manifest.json`；Git provider 会创建共享 worktree、对每个任务 head 执行 `git merge --no-ff`，并在成功后记录共享 `workspaceHeadRef`，随后可安全清理已合并的私有 worktree。
@@ -64,8 +64,8 @@
 - 安全基线当前支持**多 token scoped auth 与审计**：除 `MULTI_AGENT_API_TOKEN` 兼容模式外，可通过 `MULTI_AGENT_AUTH_TOKENS` 或 `MULTI_AGENT_AUTH_TOKENS_FILE` 配置带 actor、roles、project scope、disabled、expiry 的 token 记录；关键操作会写入 `/projects/{id}/audit-logs` 审计流。
 - 告警通知当前支持**最小 webhook 主动推送**：设置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，run 失败和回滚事件会异步推送结构化 alert 到外部接收端。
 - 状态面板当前支持**WebUI 运维总览**：同一页面可查看 readiness、任务拓扑、任务矩阵、失败告警、审计轨迹、通信日志、Token 成本趋势、沙盒和快照，更新机制为 SSE + 轮询兜底，并使用 DOM/SVG API 渲染接口数据以降低 XSS 风险。
-- 运维 readiness 当前支持 `GET /ready`：会检查配置有效性、auth token 配置、存储/数据目录、artifact/sandbox 根目录可写性、Git workspace provider 的本地 repo/base ref 可用性以及 runtime provider 配置；配置无效时服务启动会 fail fast。
-- Git workspace v2 当前为 local-only：支持本地已有 repo 的 worktree、任务分支 commit、shared sandbox Git merge、snapshot commit/ref 记录，以及已合并私有 worktree 的安全清理；`POST /projects/{id}/workspaces/cleanup` 支持 dry-run，分支删除默认关闭且只尝试非 force `git branch -d`，released shared branch/worktree 会保留以保护 snapshot refs。远程 clone/fetch/push、rebase 执行与纯 Git restore 仍是后续工作。
+- 运维 readiness 当前支持 `GET /ready`：会检查配置有效性、auth token 配置、存储/数据目录、artifact/sandbox 根目录可写性、Git workspace provider 的 repo/base ref 可用性以及 runtime provider 配置；配置 remote Git 后，readiness 可 clone 缺失 repo 并按需 fetch。
+- Git workspace v3 当前支持 remote MVP：在 v2 的 worktree、任务分支 commit、shared sandbox Git merge、snapshot commit/ref 和 cleanup lifecycle 基础上，支持 `MULTI_AGENT_WORKSPACE_GIT_REMOTE_URL` clone、本地 repo remote URL 校验、`MULTI_AGENT_WORKSPACE_GIT_FETCH_BEFORE_USE` opt-in fetch、`MULTI_AGENT_WORKSPACE_GIT_PUSH_ENABLED` opt-in 非 force push；HTTPS token 应通过 `MULTI_AGENT_WORKSPACE_GIT_AUTH_TOKEN_FILE` 或 env 注入，禁止写入 remote URL，SSH 认证依赖进程 SSH agent。rebase、remote branch 删除、force push、纯 Git restore 仍是后续工作。
 
 ## 本地运行
 

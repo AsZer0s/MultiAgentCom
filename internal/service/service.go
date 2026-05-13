@@ -2071,6 +2071,11 @@ func (s *Service) executeRun(runID string) {
 			s.failRun(runID, err)
 			return
 		}
+		if err := s.workspaceProvider.Publish(context.Background(), sandbox); err != nil {
+			s.logger.Error("workspace publish failed", "runId", run.ID, "taskId", task.ID, "sandboxId", sandbox.ID, "error", err)
+			s.failRun(runID, err)
+			return
+		}
 	}
 
 	now := time.Now().UTC()
@@ -3893,7 +3898,10 @@ func (s *Service) writeSharedSandboxManifest(sharedSandbox *domain.Sandbox, task
 			return err
 		}
 		sharedSandbox.WorkspaceHeadRef = head
-		return writeWorkspaceManifest(sharedSandbox, sharedSandbox.WorkspacePath, artifactRefs)
+		if err := writeWorkspaceManifest(sharedSandbox, sharedSandbox.WorkspacePath, artifactRefs); err != nil {
+			return err
+		}
+		return s.workspaceProvider.Publish(context.Background(), sharedSandbox)
 	}
 	return nil
 }

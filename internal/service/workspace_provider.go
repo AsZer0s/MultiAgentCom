@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"multiagentcom/internal/config"
@@ -21,6 +22,7 @@ type workspaceProvider interface {
 	BundleDir(sandbox *domain.Sandbox, task *domain.Task) string
 	FinalizePrivateRun(ctx context.Context, sandbox *domain.Sandbox, task *domain.Task, run *domain.AgentRun) error
 	MergeShared(ctx context.Context, sharedSandbox *domain.Sandbox, tasks []*domain.Task, artifacts []*domain.Artifact, sourceSandboxes []*domain.Sandbox) error
+	Publish(ctx context.Context, sandbox *domain.Sandbox) error
 	Cleanup(ctx context.Context, sandbox *domain.Sandbox, policy workspaceCleanupPolicy) (*workspaceCleanupResult, error)
 }
 
@@ -75,37 +77,82 @@ func (p directoryWorkspaceProvider) MergeShared(_ context.Context, sharedSandbox
 	return nil
 }
 
+func (p directoryWorkspaceProvider) Publish(_ context.Context, _ *domain.Sandbox) error {
+	return nil
+}
+
 func (p directoryWorkspaceProvider) Cleanup(_ context.Context, sandbox *domain.Sandbox, _ workspaceCleanupPolicy) (*workspaceCleanupResult, error) {
 	return &workspaceCleanupResult{SandboxID: sandbox.ID, Provider: p.Name(), Skipped: true, SkipReason: "directory workspace cleanup is not supported"}, nil
 }
 
 type gitWorkspaceProvider struct {
-	repoPath string
-	baseRef  string
+	repoPath       string
+	baseRef        string
+	remoteURL      string
+	remoteName     string
+	fetchBeforeUse bool
+	pushEnabled    bool
+	authToken      string
+	authTokenFile  string
+	authUsername   string
+	mu             sync.Mutex
 }
 
 func newWorkspaceProvider(cfg config.Config) workspaceProvider {
 	if strings.EqualFold(strings.TrimSpace(cfg.WorkspaceProvider), "git") {
-		baseRef := strings.TrimSpace(cfg.WorkspaceGitBaseRef)
-		if baseRef == "" {
-			baseRef = "HEAD"
-		}
-		return gitWorkspaceProvider{repoPath: strings.TrimSpace(cfg.WorkspaceGitRepoPath), baseRef: baseRef}
+		return newGitWorkspaceProvider(cfg)
 	}
 	return directoryWorkspaceProvider{}
 }
 
-func (p gitWorkspaceProvider) Name() string {
+func CheckGitWorkspace(ctx context.Context, cfg config.Config) error {
+	provider := newGitWorkspaceProvider(config.WithDefaults(cfg))
+	return provider.ensureRepoReady(ctx)
+}
+
+func newGitWorkspaceProvider(cfg config.Config) *gitWorkspaceProvider {
+	baseRef := strings.TrimSpace(cfg.WorkspaceGitBaseRef)
+	if baseRef == "" {
+		baseRef = "HEAD"
+	}
+	remoteName := strings.TrimSpace(cfg.WorkspaceGitRemoteName)
+	if remoteName == "" {
+		remoteName = "origin"
+	}
+	authUsername := strings.TrimSpace(cfg.WorkspaceGitAuthUsername)
+	if authUsername == "" {
+		authUsername = "x-access-token"
+	}
+	return &gitWorkspaceProvider{
+		repoPath:       strings.TrimSpace(cfg.WorkspaceGitRepoPath),
+		baseRef:        baseRef,
+		remoteURL:      strings.TrimSpace(cfg.WorkspaceGitRemoteURL),
+		remoteName:     remoteName,
+		fetchBeforeUse: cfg.WorkspaceGitFetchBeforeUse,
+		pushEnabled:    cfg.WorkspaceGitPushEnabled,
+		authToken:      strings.TrimSpace(cfg.WorkspaceGitAuthToken),
+		authTokenFile:  strings.TrimSpace(cfg.WorkspaceGitAuthTokenFile),
+		authUsername:   authUsername,
+	}
+}
+
+func (p *gitWorkspaceProvider) Name() string {
 	return "git"
 }
 
-func (p gitWorkspaceProvider) CreatePrivate(ctx context.Context, sandbox *domain.Sandbox, task *domain.Task) error {
+func (p *gitWorkspaceProvider) CreatePrivate(ctx context.Context, sandbox *domain.Sandbox, task *domain.Task) error {
+	if err := p.ensureRepoReady(ctx); err != nil {
+		return err
+	}
 	sandbox.WorkspaceBranch = gitBranchName("multiagent", sandbox.ProjectID, "task", task.ID, sandbox.ID)
 	sandbox.WorkspaceBaseRef = p.baseRef
 	return p.addWorktree(ctx, sandbox.WorkspacePath, sandbox.WorkspaceBranch, sandbox.WorkspaceBaseRef)
 }
 
-func (p gitWorkspaceProvider) CreateShared(ctx context.Context, sandbox *domain.Sandbox, _ []*domain.Task, baseRef string) error {
+func (p *gitWorkspaceProvider) CreateShared(ctx context.Context, sandbox *domain.Sandbox, _ []*domain.Task, baseRef string) error {
+	if err := p.ensureRepoReady(ctx); err != nil {
+		return err
+	}
 	sandbox.WorkspaceBranch = gitBranchName("multiagent", sandbox.ProjectID, "shared", sandbox.ID)
 	if strings.TrimSpace(baseRef) == "" {
 		baseRef = p.baseRef
@@ -114,11 +161,11 @@ func (p gitWorkspaceProvider) CreateShared(ctx context.Context, sandbox *domain.
 	return p.addWorktree(ctx, sandbox.WorkspacePath, sandbox.WorkspaceBranch, sandbox.WorkspaceBaseRef)
 }
 
-func (p gitWorkspaceProvider) BundleDir(sandbox *domain.Sandbox, task *domain.Task) string {
+func (p *gitWorkspaceProvider) BundleDir(sandbox *domain.Sandbox, task *domain.Task) string {
 	return filepath.Join(sandbox.WorkspacePath, "tasks", task.ID, "bundle")
 }
 
-func (p gitWorkspaceProvider) FinalizePrivateRun(ctx context.Context, sandbox *domain.Sandbox, task *domain.Task, run *domain.AgentRun) error {
+func (p *gitWorkspaceProvider) FinalizePrivateRun(ctx context.Context, sandbox *domain.Sandbox, task *domain.Task, run *domain.AgentRun) error {
 	message := fmt.Sprintf("multiagent: task %s run %s", task.ID, run.ID)
 	if err := commitGitWorkspaceChanges(ctx, sandbox.WorkspacePath, message); err != nil {
 		return err
@@ -131,7 +178,7 @@ func (p gitWorkspaceProvider) FinalizePrivateRun(ctx context.Context, sandbox *d
 	return nil
 }
 
-func (p gitWorkspaceProvider) MergeShared(ctx context.Context, sharedSandbox *domain.Sandbox, tasks []*domain.Task, _ []*domain.Artifact, sourceSandboxes []*domain.Sandbox) error {
+func (p *gitWorkspaceProvider) MergeShared(ctx context.Context, sharedSandbox *domain.Sandbox, tasks []*domain.Task, _ []*domain.Artifact, sourceSandboxes []*domain.Sandbox) error {
 	for idx, sourceSandbox := range sourceSandboxes {
 		if sourceSandbox == nil || strings.TrimSpace(sourceSandbox.WorkspaceHeadRef) == "" {
 			return fmt.Errorf("source sandbox missing git head ref")
@@ -147,7 +194,18 @@ func (p gitWorkspaceProvider) MergeShared(ctx context.Context, sharedSandbox *do
 	return nil
 }
 
-func (p gitWorkspaceProvider) Cleanup(ctx context.Context, sandbox *domain.Sandbox, policy workspaceCleanupPolicy) (*workspaceCleanupResult, error) {
+func (p *gitWorkspaceProvider) Publish(ctx context.Context, sandbox *domain.Sandbox) error {
+	if !p.pushEnabled || sandbox == nil || !strings.EqualFold(sandbox.WorkspaceProvider, "git") {
+		return nil
+	}
+	if strings.TrimSpace(sandbox.WorkspacePath) == "" || strings.TrimSpace(sandbox.WorkspaceBranch) == "" || strings.TrimSpace(sandbox.WorkspaceHeadRef) == "" {
+		return errors.New("git workspace metadata is incomplete for publish")
+	}
+	_, err := p.runGit(ctx, sandbox.WorkspacePath, "push", p.remoteName, sandbox.WorkspaceBranch+":refs/heads/"+sandbox.WorkspaceBranch)
+	return err
+}
+
+func (p *gitWorkspaceProvider) Cleanup(ctx context.Context, sandbox *domain.Sandbox, policy workspaceCleanupPolicy) (*workspaceCleanupResult, error) {
 	result := &workspaceCleanupResult{SandboxID: sandbox.ID, Provider: p.Name()}
 	if !strings.EqualFold(sandbox.WorkspaceProvider, "git") {
 		result.Skipped = true
@@ -265,15 +323,106 @@ func (p gitWorkspaceProvider) Cleanup(ctx context.Context, sandbox *domain.Sandb
 	return result, nil
 }
 
-func (p gitWorkspaceProvider) addWorktree(ctx context.Context, path, branch, baseRef string) error {
+func (p *gitWorkspaceProvider) addWorktree(ctx context.Context, path, branch, baseRef string) error {
 	if strings.TrimSpace(p.repoPath) == "" {
 		return errors.New("git workspace repo path is required")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	_, err := runGitInRepo(ctx, p.repoPath, "worktree", "add", "-b", branch, path, baseRef)
+	_, err := p.runGitInRepo(ctx, "worktree", "add", "-b", branch, path, baseRef)
 	return err
+}
+
+func (p *gitWorkspaceProvider) ensureRepoReady(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ensureRepoReadyLocked(ctx)
+}
+
+func (p *gitWorkspaceProvider) ensureRepoReadyLocked(ctx context.Context) error {
+	if strings.TrimSpace(p.repoPath) == "" {
+		return errors.New("git workspace repo path is required")
+	}
+	if p.isGitRepo(ctx) {
+		if err := p.ensureRemote(ctx); err != nil {
+			return err
+		}
+	} else {
+		if strings.TrimSpace(p.remoteURL) == "" {
+			return errors.New("git workspace repo path is not a git repository")
+		}
+		if err := p.cloneRepo(ctx); err != nil {
+			return err
+		}
+	}
+	if err := p.ensureCommitIdentity(ctx); err != nil {
+		return err
+	}
+	if p.fetchBeforeUse {
+		if err := p.fetch(ctx); err != nil {
+			return err
+		}
+	}
+	_, err := p.runGitInRepo(ctx, "rev-parse", "--verify", p.baseRef)
+	return err
+}
+
+func (p *gitWorkspaceProvider) isGitRepo(ctx context.Context) bool {
+	if strings.TrimSpace(p.repoPath) == "" {
+		return false
+	}
+	info, err := os.Stat(p.repoPath)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	_, err = p.runGitInRepo(ctx, "rev-parse", "--git-dir")
+	return err == nil
+}
+
+func (p *gitWorkspaceProvider) cloneRepo(ctx context.Context) error {
+	if err := os.MkdirAll(filepath.Dir(p.repoPath), 0o755); err != nil {
+		return err
+	}
+	_, err := p.runGitCommand(ctx, "clone", "--origin", p.remoteName, "--", p.remoteURL, p.repoPath)
+	return err
+}
+
+func (p *gitWorkspaceProvider) ensureRemote(ctx context.Context) error {
+	if strings.TrimSpace(p.remoteURL) == "" {
+		return nil
+	}
+	out, err := p.runGitInRepo(ctx, "remote", "get-url", p.remoteName)
+	if err != nil {
+		if strings.Contains(err.Error(), "No such remote") || strings.Contains(err.Error(), "No such remote") || strings.Contains(err.Error(), "exit status 2") {
+			_, addErr := p.runGitInRepo(ctx, "remote", "add", p.remoteName, p.remoteURL)
+			return addErr
+		}
+		return err
+	}
+	if strings.TrimSpace(out) != p.remoteURL {
+		return fmt.Errorf("git remote %s points to a different URL", p.remoteName)
+	}
+	return nil
+}
+
+func (p *gitWorkspaceProvider) fetch(ctx context.Context) error {
+	_, err := p.runGitInRepo(ctx, "fetch", p.remoteName, "--prune")
+	return err
+}
+
+func (p *gitWorkspaceProvider) ensureCommitIdentity(ctx context.Context) error {
+	if _, err := p.runGitInRepo(ctx, "config", "user.name"); err != nil {
+		if _, setErr := p.runGitInRepo(ctx, "config", "user.name", "MultiAgentCom"); setErr != nil {
+			return setErr
+		}
+	}
+	if _, err := p.runGitInRepo(ctx, "config", "user.email"); err != nil {
+		if _, setErr := p.runGitInRepo(ctx, "config", "user.email", "multiagentcom@example.invalid"); setErr != nil {
+			return setErr
+		}
+	}
+	return nil
 }
 
 func commitGitWorkspaceChanges(ctx context.Context, worktreePath, message string) error {
@@ -387,6 +536,51 @@ func gitHeadRetainedBy(ctx context.Context, repoPath, head string, retainedHeads
 	return "", false, nil
 }
 
+func (p *gitWorkspaceProvider) runGit(ctx context.Context, worktreePath string, args ...string) (string, error) {
+	fullArgs := append([]string{"-C", worktreePath}, args...)
+	return p.runGitCommand(ctx, fullArgs...)
+}
+
+func (p *gitWorkspaceProvider) runGitInRepo(ctx context.Context, args ...string) (string, error) {
+	fullArgs := append([]string{"-C", p.repoPath}, args...)
+	return p.runGitCommand(ctx, fullArgs...)
+}
+
+func (p *gitWorkspaceProvider) runGitCommand(ctx context.Context, args ...string) (string, error) {
+	env, secrets, err := p.remoteAuthEnv()
+	if err != nil {
+		return "", err
+	}
+	if len(secrets) > 0 {
+		args = append([]string{"-c", gitCredentialHelperArg()}, args...)
+	}
+	return runGitCommandWithOptions(ctx, gitCommandOptions{env: env, redactValues: secrets}, args...)
+}
+
+func (p *gitWorkspaceProvider) remoteAuthEnv() ([]string, []string, error) {
+	token := strings.TrimSpace(p.authToken)
+	if token == "" && strings.TrimSpace(p.authTokenFile) != "" {
+		payload, err := os.ReadFile(p.authTokenFile)
+		if err != nil {
+			return nil, nil, err
+		}
+		token = strings.TrimSpace(string(payload))
+	}
+	env := []string{"GIT_TERMINAL_PROMPT=0"}
+	if token == "" {
+		return env, nil, nil
+	}
+	env = append(env,
+		"MULTI_AGENT_WORKSPACE_GIT_AUTH_USERNAME="+p.authUsername,
+		"MULTI_AGENT_WORKSPACE_GIT_AUTH_TOKEN="+token,
+	)
+	return env, []string{token}, nil
+}
+
+func gitCredentialHelperArg() string {
+	return "credential.helper=!f() { echo username=$MULTI_AGENT_WORKSPACE_GIT_AUTH_USERNAME; echo password=$MULTI_AGENT_WORKSPACE_GIT_AUTH_TOKEN; }; f"
+}
+
 func runGit(ctx context.Context, worktreePath string, args ...string) (string, error) {
 	fullArgs := append([]string{"-C", worktreePath}, args...)
 	return runGitCommand(ctx, fullArgs...)
@@ -397,21 +591,45 @@ func runGitInRepo(ctx context.Context, repoPath string, args ...string) (string,
 	return runGitCommand(ctx, fullArgs...)
 }
 
+type gitCommandOptions struct {
+	env          []string
+	redactValues []string
+}
+
 func runGitCommand(ctx context.Context, args ...string) (string, error) {
+	return runGitCommandWithOptions(ctx, gitCommandOptions{}, args...)
+}
+
+func runGitCommandWithOptions(ctx context.Context, opts gitCommandOptions, args ...string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	cmdCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, "git", args...)
-	output, err := cmd.CombinedOutput()
+	if len(opts.env) > 0 {
+		cmd.Env = append(os.Environ(), opts.env...)
+	}
+	outputBytes, err := cmd.CombinedOutput()
+	output := sanitizeGitError(string(outputBytes), opts.redactValues)
+	joinedArgs := sanitizeGitError(strings.Join(args, " "), opts.redactValues)
 	if cmdCtx.Err() != nil {
-		return string(output), cmdCtx.Err()
+		return output, cmdCtx.Err()
 	}
 	if err != nil {
-		return string(output), fmt.Errorf("git %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+		return output, fmt.Errorf("git %s failed: %w: %s", joinedArgs, err, strings.TrimSpace(output))
 	}
-	return string(output), nil
+	return string(outputBytes), nil
+}
+
+func sanitizeGitError(text string, secrets []string) string {
+	for _, secret := range secrets {
+		secret = strings.TrimSpace(secret)
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "[REDACTED]")
+		}
+	}
+	return text
 }
 
 func gitBranchName(parts ...string) string {

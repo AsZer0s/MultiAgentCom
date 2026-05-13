@@ -302,6 +302,12 @@
 - **目标：** 减少 local Git provider 长期运行后的 worktree/branch 污染。
 - **DoD：** 已合并私有 worktree 可安全清理，cleanup API 支持 dry-run；分支删除保持显式 opt-in 且不使用 force。
 
+### BL-906 Remote Git 最小闭环
+- **优先级：** P1
+- **估时：** 1.5 PD
+- **目标：** 将 Git workspace 从 local-only 扩展到 remote-backed MVP。
+- **DoD：** 支持 remote clone、fetch-before-use、private/shared branch 非 force push；token 不写入 remote URL 且错误脱敏；rebase/force push/remote 删除保持 out of scope。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：
