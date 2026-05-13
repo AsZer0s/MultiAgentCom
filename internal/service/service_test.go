@@ -1625,6 +1625,195 @@ func TestGitWorkspaceProviderPushesSharedBranch(t *testing.T) {
 	}
 }
 
+func TestGitRollbackToSnapshotRestoresWorkspaceAtSnapshotCommit(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{Address: ":0", ServiceName: "test-git-rollback-restore", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", WorkspaceGitCleanupEnabled: true, WorkspaceGitCleanupDeleteBranches: false, RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	mergeResult, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{
+		TaskIDs:    []string{dispatched[0].ID, dispatched[1].ID},
+		ContractID: contract.ID,
+		Endpoints:  append([]domain.ContractEndpoint(nil), contract.Endpoints...),
+		Schemas:    append([]domain.ContractSchema(nil), contract.Schemas...),
+	})
+	if err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	snapshots, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	if len(snapshots) != 1 || snapshots[0].WorkspaceChecksum == "" {
+		t.Fatalf("expected git workspace snapshot, got %+v", snapshots)
+	}
+	originalSnapshot := snapshots[0]
+	originalSharedHead := strings.TrimSpace(runTestGit(t, mergeResult.Sandbox.WorkspacePath, "rev-parse", "HEAD"))
+
+	rollback, err := svc.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{SnapshotID: originalSnapshot.ID, Reason: "restore git workspace"})
+	if err != nil {
+		t.Fatalf("rollback snapshot: %v", err)
+	}
+	if rollback.Workspace == nil || !rollback.Workspace.Restored {
+		t.Fatalf("expected workspace restore result, got %+v", rollback)
+	}
+	if rollback.Workspace.Sandbox.Scope != "SHARED" || rollback.Workspace.Sandbox.Status != domain.SandboxStatusReleased {
+		t.Fatalf("expected released shared rollback sandbox, got %+v", rollback.Workspace.Sandbox)
+	}
+	restoredHead := strings.TrimSpace(runTestGit(t, rollback.Workspace.Sandbox.WorkspacePath, "rev-parse", "HEAD"))
+	if restoredHead != originalSnapshot.WorkspaceChecksum || rollback.Workspace.HeadRef != originalSnapshot.WorkspaceChecksum {
+		t.Fatalf("restored head = %s result=%s, want %s", restoredHead, rollback.Workspace.HeadRef, originalSnapshot.WorkspaceChecksum)
+	}
+	if strings.TrimSpace(runTestGit(t, mergeResult.Sandbox.WorkspacePath, "rev-parse", "HEAD")) != originalSharedHead {
+		t.Fatalf("original shared worktree head changed")
+	}
+	snapshots, err = svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots after rollback: %v", err)
+	}
+	latest := snapshots[len(snapshots)-1]
+	if latest.WorkspaceChecksum != originalSnapshot.WorkspaceChecksum || latest.WorkspaceStateRef != rollback.Workspace.StateRef {
+		t.Fatalf("expected rollback snapshot to record restored workspace ref, latest=%+v rollback=%+v", latest, rollback.Workspace)
+	}
+}
+
+func TestGitRollbackWorkspaceBecomesNextSharedBase(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{Address: ":0", ServiceName: "test-git-rollback-next-base", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", WorkspaceGitCleanupEnabled: true, WorkspaceGitCleanupDeleteBranches: false, RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	if _, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{TaskIDs: []string{dispatched[0].ID, dispatched[1].ID}, ContractID: contract.ID, Endpoints: append([]domain.ContractEndpoint(nil), contract.Endpoints...), Schemas: append([]domain.ContractSchema(nil), contract.Schemas...)}); err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	snapshots, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	rollback, err := svc.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{SnapshotID: snapshots[0].ID})
+	if err != nil {
+		t.Fatalf("rollback snapshot: %v", err)
+	}
+	if rollback.Workspace == nil {
+		t.Fatalf("expected workspace rollback result")
+	}
+	nextMerge, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{TaskIDs: []string{dispatched[0].ID, dispatched[1].ID}, ContractID: contract.ID, Endpoints: append([]domain.ContractEndpoint(nil), contract.Endpoints...), Schemas: append([]domain.ContractSchema(nil), contract.Schemas...)})
+	if err != nil {
+		t.Fatalf("merge after rollback: %v", err)
+	}
+	runTestGit(t, nextMerge.Sandbox.WorkspacePath, "merge-base", "--is-ancestor", rollback.Workspace.HeadRef, nextMerge.Sandbox.WorkspaceHeadRef)
+	snapshots, err = svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots after next merge: %v", err)
+	}
+	latest := snapshots[len(snapshots)-1]
+	if latest.Branch != rollback.ActiveBranch {
+		t.Fatalf("expected next snapshot branch %q, got %q", rollback.ActiveBranch, latest.Branch)
+	}
+}
+
+func TestGitRollbackRejectsWorkspaceChecksumMismatch(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{Address: ":0", ServiceName: "test-git-rollback-checksum", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", WorkspaceGitCleanupEnabled: false, RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, contract, dispatched := prepareSharedSandboxMergeScenario(t, svc, ctx)
+	if _, err := svc.MergeToSharedSandbox(ctx, project.ID, MergeSharedSandboxInput{TaskIDs: []string{dispatched[0].ID, dispatched[1].ID}, ContractID: contract.ID, Endpoints: append([]domain.ContractEndpoint(nil), contract.Endpoints...), Schemas: append([]domain.ContractSchema(nil), contract.Schemas...)}); err != nil {
+		t.Fatalf("merge shared sandbox: %v", err)
+	}
+	snapshots, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	svc.mu.Lock()
+	svc.snapshotIndex[snapshots[0].ID].WorkspaceChecksum = strings.TrimSpace(runTestGit(t, repoPath, "rev-parse", "main"))
+	svc.mu.Unlock()
+	before := len(snapshots)
+	if _, err := svc.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{SnapshotID: snapshots[0].ID}); err == nil {
+		t.Fatalf("expected checksum mismatch error")
+	}
+	after, err := svc.ListSnapshots(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list snapshots after failed rollback: %v", err)
+	}
+	if len(after) != before {
+		t.Fatalf("expected no rollback snapshot after failure, before=%d after=%d", before, len(after))
+	}
+}
+
+func TestGitRollbackRejectsMalformedWorkspaceStateRef(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{Address: ":0", ServiceName: "test-git-rollback-malformed", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Malformed Restore"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	snapshot, err := svc.recordSnapshotLocked(project.ID, "main", "baseline", true, "", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("record snapshot: %v", err)
+	}
+	cases := []string{"bad", "repo://remote/multiagent/x/shared/y@HEAD", "repo://local/multiagent/x/shared/y", "repo://local/@HEAD", "repo://local/topic@"}
+	for _, ref := range cases {
+		t.Run(ref, func(t *testing.T) {
+			svc.mu.Lock()
+			svc.snapshotIndex[snapshot.ID].WorkspaceStateRef = ref
+			svc.snapshotIndex[snapshot.ID].WorkspaceChecksum = strings.TrimSpace(runTestGit(t, repoPath, "rev-parse", "main"))
+			svc.mu.Unlock()
+			if _, err := svc.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{SnapshotID: snapshot.ID}); err == nil {
+				t.Fatalf("expected malformed ref %q to be rejected", ref)
+			}
+		})
+	}
+}
+
+func TestRollbackRejectsGitWorkspaceSnapshotWhenProviderIsDirectory(t *testing.T) {
+	svc := New(config.Config{Address: ":0", ServiceName: "test-directory-rollback-workspace", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Directory Restore"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	snapshot, err := svc.recordSnapshotLocked(project.ID, "main", "baseline", true, "", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("record snapshot: %v", err)
+	}
+	svc.mu.Lock()
+	svc.snapshotIndex[snapshot.ID].WorkspaceStateRef = "repo://local/multiagent/project/shared/sandbox@abcdef"
+	svc.snapshotIndex[snapshot.ID].WorkspaceChecksum = "abcdef"
+	svc.mu.Unlock()
+	if _, err := svc.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{SnapshotID: snapshot.ID}); err == nil {
+		t.Fatalf("expected directory provider to reject git workspace restore")
+	}
+}
+
+func TestRollbackRejectsRepoStateRefForServiceState(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	svc := New(config.Config{Address: ":0", ServiceName: "test-repo-state-ref", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Repo StateRef"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	snapshot, err := svc.recordSnapshotLocked(project.ID, "main", "baseline", true, "", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("record snapshot: %v", err)
+	}
+	svc.mu.Lock()
+	svc.snapshotIndex[snapshot.ID].StateRef = "repo://local/multiagent/project/shared/sandbox@abcdef"
+	delete(svc.snapshotState, snapshot.ID)
+	svc.mu.Unlock()
+	_, err = svc.RollbackToSnapshot(ctx, project.ID, RollbackSnapshotInput{SnapshotID: snapshot.ID})
+	if err == nil || !strings.Contains(err.Error(), "repo service-state restore is not implemented") {
+		t.Fatalf("expected repo service-state restore error, got %v", err)
+	}
+}
+
 func TestGitWorkspaceRebaseSucceedsForManagedCleanPrivateSandbox(t *testing.T) {
 	repoPath := initTempGitRepo(t)
 	cfg := config.Config{Address: ":0", ServiceName: "test-git-workspace-rebase", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}

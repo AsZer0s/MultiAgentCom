@@ -25,6 +25,7 @@ type workspaceProvider interface {
 	Publish(ctx context.Context, sandbox *domain.Sandbox) error
 	Cleanup(ctx context.Context, sandbox *domain.Sandbox, policy workspaceCleanupPolicy) (*workspaceCleanupResult, error)
 	Rebase(ctx context.Context, sandbox *domain.Sandbox, opts workspaceRebaseOptions) (*workspaceRebaseResult, error)
+	RestoreSharedSnapshot(ctx context.Context, sandbox *domain.Sandbox, branch string, commit string) error
 }
 
 type workspaceCleanupPolicy struct {
@@ -115,6 +116,10 @@ func (p directoryWorkspaceProvider) Cleanup(_ context.Context, sandbox *domain.S
 
 func (p directoryWorkspaceProvider) Rebase(_ context.Context, sandbox *domain.Sandbox, opts workspaceRebaseOptions) (*workspaceRebaseResult, error) {
 	return &workspaceRebaseResult{SandboxID: sandbox.ID, Provider: p.Name(), Status: "SKIPPED", Reason: "directory workspace rebase is not supported", TargetRef: strings.TrimSpace(opts.TargetRef)}, nil
+}
+
+func (p directoryWorkspaceProvider) RestoreSharedSnapshot(_ context.Context, _ *domain.Sandbox, _ string, _ string) error {
+	return errors.New("directory workspace snapshot restore is not supported")
 }
 
 type gitWorkspaceProvider struct {
@@ -235,6 +240,51 @@ func (p *gitWorkspaceProvider) Publish(ctx context.Context, sandbox *domain.Sand
 	}
 	_, err := p.runGit(ctx, sandbox.WorkspacePath, "push", p.remoteName, sandbox.WorkspaceBranch+":refs/heads/"+sandbox.WorkspaceBranch)
 	return err
+}
+
+func (p *gitWorkspaceProvider) RestoreSharedSnapshot(ctx context.Context, sandbox *domain.Sandbox, branch string, commit string) error {
+	if err := p.ensureRepoReady(ctx); err != nil {
+		return err
+	}
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return errors.New("git restore branch is required")
+	}
+	resolvedCommit, err := gitRevParse(ctx, p.repoPath, strings.TrimSpace(commit)+"^{commit}")
+	if err != nil {
+		return err
+	}
+	worktrees, err := gitWorktreeList(ctx, p.repoPath)
+	if err != nil {
+		return err
+	}
+	if _, registered := worktrees[normalizeGitWorktreePath(sandbox.WorkspacePath)]; registered {
+		return errors.New("restore workspace path is already a registered git worktree")
+	}
+	if hasContent, err := pathHasContent(sandbox.WorkspacePath); err != nil {
+		return err
+	} else if hasContent {
+		return errors.New("restore workspace path already contains files")
+	}
+	if _, exists, err := gitBranchHead(ctx, p.repoPath, branch); err != nil {
+		return err
+	} else if exists {
+		return errors.New("restore branch already exists")
+	}
+	sandbox.WorkspaceBranch = branch
+	sandbox.WorkspaceBaseRef = resolvedCommit
+	if err := p.addWorktree(ctx, sandbox.WorkspacePath, sandbox.WorkspaceBranch, resolvedCommit); err != nil {
+		return err
+	}
+	head, err := gitRevParse(ctx, sandbox.WorkspacePath, "HEAD")
+	if err != nil {
+		return err
+	}
+	if head != resolvedCommit {
+		return fmt.Errorf("restored worktree head %s does not match snapshot commit %s", head, resolvedCommit)
+	}
+	sandbox.WorkspaceHeadRef = head
+	return nil
 }
 
 func (p *gitWorkspaceProvider) Rebase(ctx context.Context, sandbox *domain.Sandbox, opts workspaceRebaseOptions) (*workspaceRebaseResult, error) {
@@ -698,6 +748,17 @@ func normalizeGitWorktreePath(path string) string {
 		return filepath.Clean(evaluated)
 	}
 	return path
+}
+
+func pathHasContent(path string) (bool, error) {
+	entries, err := os.ReadDir(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return len(entries) > 0, nil
 }
 
 func gitBranchHead(ctx context.Context, repoPath, branch string) (string, bool, error) {

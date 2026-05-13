@@ -1197,6 +1197,60 @@ func TestHTTPSharedSandboxFailureAutoRollback(t *testing.T) {
 	}
 }
 
+func TestHTTPRollbackSnapshotRestoresGitWorkspace(t *testing.T) {
+	repoPath := initHTTPTempGitRepo(t)
+	cfg := config.Config{Address: ":0", ServiceName: "test-http-snapshot-rollback-restore", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "http-manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", WorkspaceGitCleanupEnabled: true, WorkspaceGitCleanupDeleteBranches: false}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	project, contract, dispatched := prepareHTTPSharedSandboxMergeScenario(t, server)
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/shared-sandbox/merge", map[string]any{
+		"taskIds":    []string{dispatched[0].ID, dispatched[1].ID},
+		"contractId": contract.ID,
+		"endpoints":  contract.Endpoints,
+		"schemas":    contract.Schemas,
+	})
+
+	snapshotsBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/snapshots")
+	var snapshots struct {
+		Items []domain.Snapshot `json:"items"`
+		Count int               `json:"count"`
+	}
+	decodeResponse(t, snapshotsBody, &snapshots)
+	if snapshots.Count != 1 || snapshots.Items[0].WorkspaceChecksum == "" {
+		t.Fatalf("expected one git workspace snapshot, got %+v", snapshots)
+	}
+	originalHead := strings.TrimSpace(runHTTPTestGit(t, repoPath, "rev-parse", "HEAD"))
+
+	rollbackBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/snapshots/rollback", map[string]any{
+		"snapshotId": snapshots.Items[0].ID,
+		"reason":     "HTTP git restore",
+	})
+	var rollback service.RollbackResult
+	decodeResponse(t, rollbackBody, &rollback)
+	if rollback.Workspace == nil || !rollback.Workspace.Restored {
+		t.Fatalf("expected rollback workspace result, got %+v", rollback)
+	}
+	if rollback.Workspace.Sandbox.Scope != "SHARED" || rollback.Workspace.Sandbox.Status != domain.SandboxStatusReleased {
+		t.Fatalf("expected released shared sandbox, got %+v", rollback.Workspace.Sandbox)
+	}
+	if got := strings.TrimSpace(runHTTPTestGit(t, rollback.Workspace.Sandbox.WorkspacePath, "rev-parse", "HEAD")); got != snapshots.Items[0].WorkspaceChecksum {
+		t.Fatalf("expected restored head %s, got %s", snapshots.Items[0].WorkspaceChecksum, got)
+	}
+	if got := strings.TrimSpace(runHTTPTestGit(t, repoPath, "rev-parse", "HEAD")); got != originalHead {
+		t.Fatalf("expected original shared head %s to stay unchanged, got %s", originalHead, got)
+	}
+
+	snapshotsBody = getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/snapshots")
+	decodeResponse(t, snapshotsBody, &snapshots)
+	latest := snapshots.Items[len(snapshots.Items)-1]
+	if latest.WorkspaceChecksum != snapshots.Items[0].WorkspaceChecksum || latest.WorkspaceStateRef != rollback.Workspace.StateRef {
+		t.Fatalf("expected rollback snapshot to preserve git workspace metadata, got latest=%+v rollback=%+v", latest, rollback.Workspace)
+	}
+}
+
 func TestHTTPRollbackSnapshotCreatesParallelBranchTimeline(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",

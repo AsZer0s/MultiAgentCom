@@ -406,14 +406,30 @@ type RollbackSnapshotInput struct {
 	Reason     string `json:"reason"`
 }
 
+type RollbackWorkspaceResult struct {
+	Restored    bool           `json:"restored"`
+	Sandbox     domain.Sandbox `json:"sandbox"`
+	Branch      string         `json:"branch"`
+	HeadRef     string         `json:"headRef"`
+	StateRef    string         `json:"stateRef"`
+	OriginalRef string         `json:"originalRef"`
+}
+
 type RollbackResult struct {
-	Snapshot        domain.Snapshot `json:"snapshot"`
-	RestoredFrom    domain.Snapshot `json:"restoredFrom"`
-	PreviousBranch  string          `json:"previousBranch"`
-	ActiveBranch    string          `json:"activeBranch"`
-	ClearedContexts int             `json:"clearedContexts"`
-	RestoredTasks   int             `json:"restoredTasks"`
-	Message         string          `json:"message,omitempty"`
+	Snapshot        domain.Snapshot          `json:"snapshot"`
+	RestoredFrom    domain.Snapshot          `json:"restoredFrom"`
+	PreviousBranch  string                   `json:"previousBranch"`
+	ActiveBranch    string                   `json:"activeBranch"`
+	ClearedContexts int                      `json:"clearedContexts"`
+	RestoredTasks   int                      `json:"restoredTasks"`
+	Workspace       *RollbackWorkspaceResult `json:"workspace,omitempty"`
+	Message         string                   `json:"message,omitempty"`
+}
+
+type workspaceSnapshotRef struct {
+	Provider string
+	Branch   string
+	Commit   string
 }
 
 type projectSnapshotState struct {
@@ -4357,12 +4373,39 @@ func (s *Service) rollbackToSnapshotLocked(projectID, snapshotID, reason string,
 		return nil, err
 	}
 
+	if err := s.validateWorkspaceSnapshotLocked(context.Background(), snapshot); err != nil {
+		return nil, err
+	}
+
 	previousBranch := s.currentBranchLocked(projectID)
 	activeBranch := s.nextRollbackBranchLocked(projectID, snapshot.Branch)
 	s.restoreProjectFromSnapshotLocked(projectID, state)
 	clearedContexts := s.clearProjectContextsLocked(projectID)
 	if project := s.projects[projectID]; project != nil {
 		project.UpdatedAt = now
+	}
+
+	var workspaceResult *RollbackWorkspaceResult
+	if restoredSandbox, restoredResult, err := s.restoreWorkspaceSnapshotLocked(context.Background(), projectID, snapshot, activeBranch, now); err != nil {
+		return nil, err
+	} else {
+		workspaceResult = restoredResult
+		if restoredSandbox != nil {
+			rollbackSnapshot, err := s.recordSnapshotWithWorkspaceLocked(projectID, activeBranch, reason, snapshot.Stable, snapshot.ID, now, restoredSandbox)
+			if err != nil {
+				return nil, err
+			}
+			return &RollbackResult{
+				Snapshot:        *cloneSnapshot(rollbackSnapshot),
+				RestoredFrom:    *cloneSnapshot(snapshot),
+				PreviousBranch:  previousBranch,
+				ActiveBranch:    activeBranch,
+				ClearedContexts: clearedContexts,
+				RestoredTasks:   len(s.taskOrder[projectID]),
+				Workspace:       workspaceResult,
+				Message:         "project rolled back to snapshot " + snapshot.ID,
+			}, nil
+		}
 	}
 
 	rollbackSnapshot, err := s.recordSnapshotLocked(projectID, activeBranch, reason, snapshot.Stable, snapshot.ID, now)
@@ -4377,8 +4420,118 @@ func (s *Service) rollbackToSnapshotLocked(projectID, snapshotID, reason string,
 		ActiveBranch:    activeBranch,
 		ClearedContexts: clearedContexts,
 		RestoredTasks:   len(s.taskOrder[projectID]),
+		Workspace:       workspaceResult,
 		Message:         "project rolled back to snapshot " + snapshot.ID,
 	}, nil
+}
+
+func parseWorkspaceSnapshotRef(ref string) (workspaceSnapshotRef, error) {
+	ref = strings.TrimSpace(ref)
+	if !strings.HasPrefix(ref, "repo://") {
+		return workspaceSnapshotRef{}, newConflictError("unsupported workspace snapshot state ref")
+	}
+	body := strings.TrimPrefix(ref, "repo://")
+	provider, rest, ok := strings.Cut(body, "/")
+	if !ok || strings.TrimSpace(provider) == "" {
+		return workspaceSnapshotRef{}, newConflictError("workspace snapshot ref provider is required")
+	}
+	at := strings.LastIndex(rest, "@")
+	if at <= 0 || at == len(rest)-1 {
+		return workspaceSnapshotRef{}, newConflictError("workspace snapshot ref must include branch and commit")
+	}
+	branch := strings.TrimSpace(rest[:at])
+	commit := strings.TrimSpace(rest[at+1:])
+	if branch == "" || commit == "" {
+		return workspaceSnapshotRef{}, newConflictError("workspace snapshot ref must include branch and commit")
+	}
+	return workspaceSnapshotRef{Provider: provider, Branch: branch, Commit: commit}, nil
+}
+
+func (s *Service) validateWorkspaceSnapshotLocked(ctx context.Context, snapshot *domain.Snapshot) error {
+	_, _, _, err := s.resolveWorkspaceSnapshotRefLocked(ctx, snapshot)
+	return err
+}
+
+func (s *Service) resolveWorkspaceSnapshotRefLocked(ctx context.Context, snapshot *domain.Snapshot) (workspaceSnapshotRef, string, string, error) {
+	workspaceRef := strings.TrimSpace(snapshot.WorkspaceStateRef)
+	if workspaceRef == "" {
+		return workspaceSnapshotRef{}, "", "", nil
+	}
+	if !strings.EqualFold(s.workspaceProvider.Name(), "git") {
+		return workspaceSnapshotRef{}, "", "", newConflictError("git workspace snapshot restore requires git workspace provider")
+	}
+	parsed, err := parseWorkspaceSnapshotRef(workspaceRef)
+	if err != nil {
+		return workspaceSnapshotRef{}, "", "", err
+	}
+	if parsed.Provider != "local" {
+		return workspaceSnapshotRef{}, "", "", newConflictError("unsupported workspace snapshot provider")
+	}
+	if !strings.HasPrefix(parsed.Branch, "multiagent/") || !strings.Contains(parsed.Branch, "/shared/") {
+		return workspaceSnapshotRef{}, "", "", newConflictError("workspace snapshot branch is not a managed shared branch")
+	}
+	checksum := strings.TrimSpace(snapshot.WorkspaceChecksum)
+	if checksum == "" {
+		return workspaceSnapshotRef{}, "", "", newConflictError("workspace snapshot checksum is required")
+	}
+	resolvedCommit, err := gitRevParse(ctx, s.cfg.WorkspaceGitRepoPath, parsed.Commit+"^{commit}")
+	if err != nil {
+		return workspaceSnapshotRef{}, "", "", newConflictError("workspace snapshot commit is not available")
+	}
+	resolvedChecksum, err := gitRevParse(ctx, s.cfg.WorkspaceGitRepoPath, checksum+"^{commit}")
+	if err != nil {
+		return workspaceSnapshotRef{}, "", "", newConflictError("workspace snapshot checksum is not available")
+	}
+	if resolvedCommit != resolvedChecksum {
+		return workspaceSnapshotRef{}, "", "", newConflictError("workspace snapshot checksum mismatch")
+	}
+	return parsed, workspaceRef, resolvedCommit, nil
+}
+
+func (s *Service) restoreWorkspaceSnapshotLocked(ctx context.Context, projectID string, snapshot *domain.Snapshot, activeBranch string, now time.Time) (*domain.Sandbox, *RollbackWorkspaceResult, error) {
+	_, workspaceRef, resolvedCommit, err := s.resolveWorkspaceSnapshotRefLocked(ctx, snapshot)
+	if err != nil {
+		return nil, nil, err
+	}
+	if workspaceRef == "" {
+		return nil, nil, nil
+	}
+
+	sandbox := &domain.Sandbox{
+		ID:                   nextID("sandbox"),
+		ProjectID:            projectID,
+		AgentType:            "snapshot-rollback",
+		Scope:                "SHARED",
+		Status:               domain.SandboxStatusActive,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+		WorkspaceProvider:    "git",
+		WorkspaceBaseRef:     resolvedCommit,
+		WorkspaceManifestRef: "file://" + filepath.Join(s.cfg.SandboxRoot, "shared", projectID, "workspace-manifest-pending"),
+	}
+	sandbox.RootPath = filepath.Join(s.cfg.SandboxRoot, "shared", projectID, sandbox.ID)
+	sandbox.WorkspacePath = filepath.Join(sandbox.RootPath, "workspace")
+	sandbox.WorkspaceManifestRef = "file://" + filepath.Join(sandbox.WorkspacePath, ".multiagent", "workspace-manifest.json")
+	branch := gitBranchName("multiagent", projectID, "rollback", activeBranch, sandbox.ID)
+	if err := s.workspaceProvider.RestoreSharedSnapshot(ctx, sandbox, branch, resolvedCommit); err != nil {
+		return nil, nil, err
+	}
+	if err := writeWorkspaceManifest(sandbox, sandbox.WorkspacePath, nil); err != nil {
+		return nil, nil, err
+	}
+	sandbox.Status = domain.SandboxStatusReleased
+	sandbox.UpdatedAt = now
+	s.sandboxIndex[sandbox.ID] = sandbox
+	s.sandboxes[projectID] = append(s.sandboxes[projectID], sandbox)
+	result := &RollbackWorkspaceResult{
+		Restored:    true,
+		Sandbox:     *cloneSandbox(sandbox),
+		Branch:      sandbox.WorkspaceBranch,
+		HeadRef:     sandbox.WorkspaceHeadRef,
+		StateRef:    fmt.Sprintf("repo://local/%s@%s", sandbox.WorkspaceBranch, sandbox.WorkspaceHeadRef),
+		OriginalRef: workspaceRef,
+	}
+	return sandbox, result, nil
 }
 
 func (s *Service) resolveSnapshotStateLocked(snapshot *domain.Snapshot) (*projectSnapshotState, error) {
@@ -4418,7 +4571,7 @@ func (s *Service) resolveSnapshotStateLocked(snapshot *domain.Snapshot) (*projec
 		return &state, nil
 	}
 	if strings.HasPrefix(stateRef, "repo://") {
-		return nil, newConflictError("repo snapshot restore is not implemented")
+		return nil, newConflictError("repo service-state restore is not implemented; Git workspace restore uses workspaceStateRef")
 	}
 	return nil, newNotFoundError("unsupported snapshot state ref")
 }

@@ -314,6 +314,12 @@
 - **目标：** 为已生成的受管 private task workspace 提供显式、可审计的 rebase 能力。
 - **DoD：** rebase API 要求显式 `targetRef` 与 sandbox 选择；支持 dry-run ahead/behind；dirty content worktree 被拒绝；冲突自动 abort 且保留原 head；可选 publish 仅使用非 force push。
 
+### BL-908 Pure Git snapshot restore
+- **优先级：** P1
+- **估时：** 1.5 PD
+- **目标：** 将 Git workspace snapshot 从“仅记录 ref”扩展为可安全恢复的 rollback worktree。
+- **DoD：** rollback 到 Git snapshot 会创建新的受管 shared rollback worktree；checksum/ref mismatch 被拒绝；不覆盖已有 worktree；后续 shared merge 以 restored head 为 base；service/HTTP 测试覆盖成功与安全失败。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：
