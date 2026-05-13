@@ -24,6 +24,7 @@ type workspaceProvider interface {
 	MergeShared(ctx context.Context, sharedSandbox *domain.Sandbox, tasks []*domain.Task, artifacts []*domain.Artifact, sourceSandboxes []*domain.Sandbox) error
 	Publish(ctx context.Context, sandbox *domain.Sandbox) error
 	Cleanup(ctx context.Context, sandbox *domain.Sandbox, policy workspaceCleanupPolicy) (*workspaceCleanupResult, error)
+	Rebase(ctx context.Context, sandbox *domain.Sandbox, opts workspaceRebaseOptions) (*workspaceRebaseResult, error)
 }
 
 type workspaceCleanupPolicy struct {
@@ -43,6 +44,33 @@ type workspaceCleanupResult struct {
 	BranchDeleted   bool
 	RetainedRef     string
 	Error           string
+}
+
+type workspaceRebaseOptions struct {
+	DryRun    bool
+	TargetRef string
+	Fetch     bool
+	Publish   bool
+	Now       time.Time
+}
+
+type workspaceRebaseResult struct {
+	SandboxID      string
+	Provider       string
+	Status         string
+	Reason         string
+	Branch         string
+	TargetRef      string
+	OldHeadRef     string
+	NewHeadRef     string
+	Ahead          int
+	Behind         int
+	Fetched        bool
+	RebaseAborted  bool
+	Published      bool
+	ConflictLog    string
+	ConflictLogRef string
+	Error          string
 }
 
 type directoryWorkspaceProvider struct{}
@@ -83,6 +111,10 @@ func (p directoryWorkspaceProvider) Publish(_ context.Context, _ *domain.Sandbox
 
 func (p directoryWorkspaceProvider) Cleanup(_ context.Context, sandbox *domain.Sandbox, _ workspaceCleanupPolicy) (*workspaceCleanupResult, error) {
 	return &workspaceCleanupResult{SandboxID: sandbox.ID, Provider: p.Name(), Skipped: true, SkipReason: "directory workspace cleanup is not supported"}, nil
+}
+
+func (p directoryWorkspaceProvider) Rebase(_ context.Context, sandbox *domain.Sandbox, opts workspaceRebaseOptions) (*workspaceRebaseResult, error) {
+	return &workspaceRebaseResult{SandboxID: sandbox.ID, Provider: p.Name(), Status: "SKIPPED", Reason: "directory workspace rebase is not supported", TargetRef: strings.TrimSpace(opts.TargetRef)}, nil
 }
 
 type gitWorkspaceProvider struct {
@@ -203,6 +235,168 @@ func (p *gitWorkspaceProvider) Publish(ctx context.Context, sandbox *domain.Sand
 	}
 	_, err := p.runGit(ctx, sandbox.WorkspacePath, "push", p.remoteName, sandbox.WorkspaceBranch+":refs/heads/"+sandbox.WorkspaceBranch)
 	return err
+}
+
+func (p *gitWorkspaceProvider) Rebase(ctx context.Context, sandbox *domain.Sandbox, opts workspaceRebaseOptions) (*workspaceRebaseResult, error) {
+	result := &workspaceRebaseResult{SandboxID: sandbox.ID, Provider: p.Name(), Branch: sandbox.WorkspaceBranch, TargetRef: strings.TrimSpace(opts.TargetRef), OldHeadRef: strings.TrimSpace(sandbox.WorkspaceHeadRef)}
+	if err := p.ensureRepoReady(ctx); err != nil {
+		result.Status = "FAILED"
+		result.Error = err.Error()
+		return result, nil
+	}
+	if opts.Fetch {
+		if strings.TrimSpace(p.remoteURL) == "" {
+			result.Status = "SKIPPED"
+			result.Reason = "git remote is not configured"
+			return result, nil
+		}
+		if err := p.fetch(ctx); err != nil {
+			result.Status = "FAILED"
+			result.Error = err.Error()
+			return result, nil
+		}
+		result.Fetched = true
+	}
+	if !strings.EqualFold(sandbox.WorkspaceProvider, "git") {
+		result.Status = "SKIPPED"
+		result.Reason = "sandbox is not a git workspace"
+		return result, nil
+	}
+	if sandbox.Scope != "PRIVATE" {
+		result.Status = "SKIPPED"
+		result.Reason = "only private workspaces are rebased"
+		return result, nil
+	}
+	if sandbox.Status != domain.SandboxStatusReleased {
+		result.Status = "SKIPPED"
+		result.Reason = "sandbox is not released"
+		return result, nil
+	}
+	if strings.TrimSpace(sandbox.WorkspacePath) == "" || strings.TrimSpace(sandbox.WorkspaceBranch) == "" || strings.TrimSpace(sandbox.WorkspaceHeadRef) == "" {
+		result.Status = "SKIPPED"
+		result.Reason = "git workspace metadata is incomplete"
+		return result, nil
+	}
+	if !strings.HasPrefix(sandbox.WorkspaceBranch, "multiagent/") || !strings.Contains(sandbox.WorkspaceBranch, "/task/") {
+		result.Status = "SKIPPED"
+		result.Reason = "workspace branch is not a managed private task branch"
+		return result, nil
+	}
+	worktrees, err := gitWorktreeList(ctx, p.repoPath)
+	if err != nil {
+		result.Status = "FAILED"
+		result.Error = err.Error()
+		return result, nil
+	}
+	registeredBranch, registered := worktrees[normalizeGitWorktreePath(sandbox.WorkspacePath)]
+	if !registered {
+		result.Status = "SKIPPED"
+		result.Reason = "workspace path is not a registered git worktree"
+		return result, nil
+	}
+	if registeredBranch != "" && registeredBranch != sandbox.WorkspaceBranch {
+		result.Status = "SKIPPED"
+		result.Reason = "registered worktree branch does not match sandbox metadata"
+		return result, nil
+	}
+	head, err := gitRevParse(ctx, sandbox.WorkspacePath, "HEAD")
+	if err != nil {
+		result.Status = "FAILED"
+		result.Error = err.Error()
+		return result, nil
+	}
+	if head != strings.TrimSpace(sandbox.WorkspaceHeadRef) {
+		result.Status = "SKIPPED"
+		result.Reason = "workspace head moved after sandbox metadata was recorded"
+		return result, nil
+	}
+	if dirty, err := gitWorktreeDirty(ctx, sandbox.WorkspacePath); err != nil {
+		result.Status = "FAILED"
+		result.Error = err.Error()
+		return result, nil
+	} else if dirty {
+		metadataOnly, err := gitWorktreeDirtyOnlyWorkspaceManifest(ctx, sandbox.WorkspacePath)
+		if err != nil {
+			result.Status = "FAILED"
+			result.Error = err.Error()
+			return result, nil
+		}
+		if !metadataOnly {
+			result.Status = "SKIPPED"
+			result.Reason = "workspace has uncommitted changes"
+			return result, nil
+		}
+		if !opts.DryRun {
+			if err := os.RemoveAll(filepath.Join(sandbox.WorkspacePath, ".multiagent")); err != nil && !os.IsNotExist(err) {
+				result.Status = "FAILED"
+				result.Error = err.Error()
+				return result, nil
+			}
+		}
+	}
+	targetCommit, err := gitRevParse(ctx, sandbox.WorkspacePath, result.TargetRef+"^{commit}")
+	if err != nil {
+		result.Status = "FAILED"
+		result.Error = err.Error()
+		return result, nil
+	}
+	result.TargetRef = targetCommit
+	behind, ahead, err := gitRevListLeftRightCount(ctx, sandbox.WorkspacePath, targetCommit, "HEAD")
+	if err != nil {
+		result.Status = "FAILED"
+		result.Error = err.Error()
+		return result, nil
+	}
+	result.Behind = behind
+	result.Ahead = ahead
+	upToDate, err := gitIsAncestor(ctx, sandbox.WorkspacePath, targetCommit, "HEAD")
+	if err != nil {
+		result.Status = "FAILED"
+		result.Error = err.Error()
+		return result, nil
+	}
+	if upToDate {
+		result.Status = "UP_TO_DATE"
+		result.NewHeadRef = head
+		return result, nil
+	}
+	if opts.DryRun {
+		result.Status = "DRY_RUN"
+		result.NewHeadRef = head
+		return result, nil
+	}
+	if _, err := p.runGit(ctx, sandbox.WorkspacePath, "rebase", targetCommit); err != nil {
+		conflictLog, conflictLogRef := writeRebaseConflictLog(sandbox, err.Error())
+		_, _ = p.runGit(ctx, sandbox.WorkspacePath, "rebase", "--abort")
+		afterAbortHead, _ := gitRevParse(ctx, sandbox.WorkspacePath, "HEAD")
+		result.Status = "FAILED"
+		result.Error = err.Error()
+		result.RebaseAborted = true
+		result.ConflictLog = conflictLog
+		result.ConflictLogRef = conflictLogRef
+		result.NewHeadRef = afterAbortHead
+		return result, nil
+	}
+	newHead, err := gitRevParse(ctx, sandbox.WorkspacePath, "HEAD")
+	if err != nil {
+		result.Status = "FAILED"
+		result.Error = err.Error()
+		return result, nil
+	}
+	result.Status = "REBASED"
+	result.NewHeadRef = newHead
+	if opts.Publish {
+		publishSandbox := *sandbox
+		publishSandbox.WorkspaceBaseRef = targetCommit
+		publishSandbox.WorkspaceHeadRef = newHead
+		if err := p.Publish(ctx, &publishSandbox); err != nil {
+			result.Status = "REBASED_PUBLISH_FAILED"
+			result.Error = err.Error()
+			return result, nil
+		}
+		result.Published = true
+	}
+	return result, nil
 }
 
 func (p *gitWorkspaceProvider) Cleanup(ctx context.Context, sandbox *domain.Sandbox, policy workspaceCleanupPolicy) (*workspaceCleanupResult, error) {
@@ -534,6 +728,61 @@ func gitHeadRetainedBy(ctx context.Context, repoPath, head string, retainedHeads
 		}
 	}
 	return "", false, nil
+}
+
+func gitRevListLeftRightCount(ctx context.Context, worktreePath, leftRef, rightRef string) (int, int, error) {
+	out, err := runGit(ctx, worktreePath, "rev-list", "--left-right", "--count", leftRef+"..."+rightRef)
+	if err != nil {
+		return 0, 0, err
+	}
+	fields := strings.Fields(out)
+	if len(fields) != 2 {
+		return 0, 0, fmt.Errorf("unexpected rev-list count output: %s", strings.TrimSpace(out))
+	}
+	behind, err := parseGitCount(fields[0])
+	if err != nil {
+		return 0, 0, err
+	}
+	ahead, err := parseGitCount(fields[1])
+	if err != nil {
+		return 0, 0, err
+	}
+	return behind, ahead, nil
+}
+
+func parseGitCount(value string) (int, error) {
+	var count int
+	if _, err := fmt.Sscanf(value, "%d", &count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func gitIsAncestor(ctx context.Context, worktreePath, ancestor, descendant string) (bool, error) {
+	_, err := runGit(ctx, worktreePath, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err == nil {
+		return true, nil
+	}
+	if strings.Contains(err.Error(), "exit status 1") {
+		return false, nil
+	}
+	return false, err
+}
+
+func writeRebaseConflictLog(sandbox *domain.Sandbox, rebaseError string) (string, string) {
+	logPath := filepath.Join(sandbox.RootPath, "rebase-conflicts.log")
+	parts := []string{"rebase error:", strings.TrimSpace(rebaseError), ""}
+	if status, err := runGit(context.Background(), sandbox.WorkspacePath, "status", "--porcelain"); err == nil {
+		parts = append(parts, "status --porcelain:", strings.TrimSpace(status), "")
+	}
+	if status, err := runGit(context.Background(), sandbox.WorkspacePath, "status", "--short", "--untracked-files=all"); err == nil {
+		parts = append(parts, "status --short --untracked-files=all:", strings.TrimSpace(status), "")
+	}
+	if unmerged, err := runGit(context.Background(), sandbox.WorkspacePath, "diff", "--name-only", "--diff-filter=U"); err == nil {
+		parts = append(parts, "unmerged paths:", strings.TrimSpace(unmerged), "")
+	}
+	_ = writeFile(logPath, []byte(strings.Join(parts, "\n")+"\n"))
+	return logPath, "file://" + logPath
 }
 
 func (p *gitWorkspaceProvider) runGit(ctx context.Context, worktreePath string, args ...string) (string, error) {

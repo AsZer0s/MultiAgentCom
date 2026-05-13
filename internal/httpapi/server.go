@@ -61,6 +61,7 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("POST /projects/{id}/locks", server.handleApplyCodeLock)
 	mux.HandleFunc("POST /projects/{id}/shared-sandbox/merge", server.handleMergeSharedSandbox)
 	mux.HandleFunc("POST /projects/{id}/workspaces/cleanup", server.handleCleanupWorkspaces)
+	mux.HandleFunc("POST /projects/{id}/workspaces/rebase", server.handleRebaseWorkspaces)
 	mux.HandleFunc("GET /projects/{id}/snapshots", server.handleListSnapshots)
 	mux.HandleFunc("POST /projects/{id}/snapshots/rollback", server.handleRollbackSnapshot)
 	mux.HandleFunc("POST /projects/{id}/preview/start", server.handleStartPreview)
@@ -502,6 +503,25 @@ func (s *Server) handleCleanupWorkspaces(w http.ResponseWriter, r *http.Request)
 	}
 
 	result, err := s.svc.CleanupWorkspaces(r.Context(), r.PathValue("id"), input)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleRebaseWorkspaces(w http.ResponseWriter, r *http.Request) {
+	if !authorizeRequest(w, r, r.PathValue("id"), "operator") {
+		return
+	}
+	var input service.RebaseWorkspacesInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	result, err := s.svc.RebaseWorkspaces(r.Context(), r.PathValue("id"), input)
 	if err != nil {
 		writeServiceError(w, err)
 		return

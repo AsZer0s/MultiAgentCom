@@ -359,6 +359,48 @@ type CleanupWorkspacesResult struct {
 	Failed           int                      `json:"failed"`
 }
 
+type RebaseWorkspacesInput struct {
+	DryRun     bool     `json:"dryRun"`
+	All        bool     `json:"all,omitempty"`
+	SandboxIDs []string `json:"sandboxIds,omitempty"`
+	Scope      string   `json:"scope,omitempty"`
+	TargetRef  string   `json:"targetRef"`
+	Fetch      bool     `json:"fetch,omitempty"`
+	Publish    bool     `json:"publish,omitempty"`
+}
+
+type WorkspaceRebaseResult struct {
+	SandboxID      string `json:"sandboxId"`
+	Scope          string `json:"scope"`
+	Provider       string `json:"provider"`
+	Status         string `json:"status"`
+	Reason         string `json:"reason,omitempty"`
+	Branch         string `json:"branch,omitempty"`
+	TargetRef      string `json:"targetRef,omitempty"`
+	OldHeadRef     string `json:"oldHeadRef,omitempty"`
+	NewHeadRef     string `json:"newHeadRef,omitempty"`
+	Ahead          int    `json:"ahead,omitempty"`
+	Behind         int    `json:"behind,omitempty"`
+	Fetched        bool   `json:"fetched,omitempty"`
+	RebaseAborted  bool   `json:"rebaseAborted,omitempty"`
+	Published      bool   `json:"published,omitempty"`
+	ConflictLog    string `json:"conflictLog,omitempty"`
+	ConflictLogRef string `json:"conflictLogRef,omitempty"`
+	Error          string `json:"error,omitempty"`
+}
+
+type RebaseWorkspacesResult struct {
+	ProjectID       string                  `json:"projectId"`
+	DryRun          bool                    `json:"dryRun"`
+	TargetRef       string                  `json:"targetRef"`
+	Results         []WorkspaceRebaseResult `json:"results"`
+	Rebased         int                     `json:"rebased"`
+	AlreadyUpToDate int                     `json:"alreadyUpToDate"`
+	Skipped         int                     `json:"skipped"`
+	Failed          int                     `json:"failed"`
+	Published       int                     `json:"published"`
+}
+
 type RollbackSnapshotInput struct {
 	SnapshotID string `json:"snapshotId"`
 	Reason     string `json:"reason"`
@@ -1654,6 +1696,84 @@ func (s *Service) CleanupWorkspaces(ctx context.Context, projectID string, input
 		return nil, newNotFoundError("project not found")
 	}
 	return s.cleanupWorkspacesLocked(ctx, projectID, input, now), nil
+}
+
+func (s *Service) RebaseWorkspaces(ctx context.Context, projectID string, input RebaseWorkspacesInput) (*RebaseWorkspacesResult, error) {
+	now := time.Now().UTC()
+	targetRef := strings.TrimSpace(input.TargetRef)
+	if targetRef == "" {
+		return nil, newValidationError("targetRef is required for workspace rebase")
+	}
+	selectedIDs := cleanIDSet(input.SandboxIDs)
+	if input.All == (len(selectedIDs) > 0) {
+		return nil, newValidationError("workspace rebase requires exactly one of sandboxIds or all=true")
+	}
+	scope := strings.ToUpper(strings.TrimSpace(input.Scope))
+	if scope == "" {
+		scope = "PRIVATE"
+	}
+	if scope != "PRIVATE" {
+		return nil, newValidationError("workspace rebase only supports PRIVATE scope")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+	result := &RebaseWorkspacesResult{ProjectID: projectID, DryRun: input.DryRun, TargetRef: targetRef, Results: make([]WorkspaceRebaseResult, 0)}
+	for _, sandbox := range s.sandboxes[projectID] {
+		if sandbox == nil {
+			continue
+		}
+		if len(selectedIDs) > 0 {
+			if _, ok := selectedIDs[sandbox.ID]; !ok {
+				continue
+			}
+		} else if sandbox.Scope != scope {
+			continue
+		}
+		if sandbox.Scope != "PRIVATE" || !strings.EqualFold(sandbox.WorkspaceProvider, "git") || sandbox.Status != domain.SandboxStatusReleased || sandbox.WorkspaceWorktreeGone {
+			item := WorkspaceRebaseResult{SandboxID: sandbox.ID, Scope: sandbox.Scope, Provider: sandbox.WorkspaceProvider, Status: "SKIPPED", Reason: "sandbox is not an eligible released private git workspace", Branch: sandbox.WorkspaceBranch, TargetRef: targetRef, OldHeadRef: sandbox.WorkspaceHeadRef}
+			result.Results = append(result.Results, item)
+			result.Skipped++
+			if !input.DryRun {
+				s.recordAuditLocked(ctx, projectID, "WORKSPACE_REBASE_SKIPPED", "sandbox", sandbox.ID, item.Reason, now)
+			}
+			continue
+		}
+		providerResult, err := s.workspaceProvider.Rebase(ctx, sandbox, workspaceRebaseOptions{DryRun: input.DryRun, TargetRef: targetRef, Fetch: input.Fetch, Publish: input.Publish, Now: now})
+		if providerResult == nil {
+			providerResult = &workspaceRebaseResult{SandboxID: sandbox.ID, Provider: sandbox.WorkspaceProvider, Status: "FAILED"}
+		}
+		if err != nil {
+			providerResult.Status = "FAILED"
+			providerResult.Error = err.Error()
+		}
+		item := s.applyWorkspaceRebaseResultLocked(ctx, projectID, sandbox, providerResult, input.DryRun, now)
+		result.Results = append(result.Results, item)
+		switch item.Status {
+		case "REBASED":
+			result.Rebased++
+		case "UP_TO_DATE":
+			result.AlreadyUpToDate++
+		case "REBASED_PUBLISH_FAILED":
+			result.Rebased++
+			result.Failed++
+		case "FAILED":
+			result.Failed++
+		case "SKIPPED", "DRY_RUN":
+			result.Skipped++
+		}
+		if item.Published {
+			result.Published++
+		}
+	}
+	if !input.DryRun {
+		s.persistLocked()
+	}
+	return result, nil
 }
 
 func (s *Service) RollbackToSnapshot(ctx context.Context, projectID string, input RollbackSnapshotInput) (*RollbackResult, error) {
@@ -3911,13 +4031,7 @@ func (s *Service) cleanupWorkspacesLocked(ctx context.Context, projectID string,
 	if scope == "" {
 		scope = "PRIVATE"
 	}
-	selectedIDs := map[string]struct{}{}
-	for _, id := range input.SandboxIDs {
-		id = strings.TrimSpace(id)
-		if id != "" {
-			selectedIDs[id] = struct{}{}
-		}
-	}
+	selectedIDs := cleanIDSet(input.SandboxIDs)
 	result := &CleanupWorkspacesResult{ProjectID: projectID, DryRun: input.DryRun, Results: make([]WorkspaceCleanupResult, 0)}
 	retainedHeads := s.retainedWorkspaceHeadsLocked(projectID)
 	for _, sandbox := range s.sandboxes[projectID] {
@@ -3972,6 +4086,79 @@ func (s *Service) cleanupWorkspacesLocked(ctx context.Context, projectID string,
 	return result
 }
 
+func (s *Service) applyWorkspaceRebaseResultLocked(ctx context.Context, projectID string, sandbox *domain.Sandbox, providerResult *workspaceRebaseResult, dryRun bool, now time.Time) WorkspaceRebaseResult {
+	status := strings.TrimSpace(providerResult.Status)
+	if status == "" {
+		if providerResult.Error != "" {
+			status = "FAILED"
+		} else {
+			status = "SKIPPED"
+		}
+	}
+	reason := strings.TrimSpace(providerResult.Reason)
+	if reason == "" && providerResult.Error != "" {
+		reason = providerResult.Error
+	}
+	if !dryRun {
+		switch status {
+		case "REBASED", "REBASED_PUBLISH_FAILED", "UP_TO_DATE":
+			if strings.TrimSpace(providerResult.NewHeadRef) != "" {
+				sandbox.WorkspaceHeadRef = providerResult.NewHeadRef
+			}
+			if strings.TrimSpace(providerResult.TargetRef) != "" {
+				sandbox.WorkspaceBaseRef = providerResult.TargetRef
+			}
+			sandbox.UpdatedAt = now
+			_ = writeWorkspaceManifest(sandbox, sandbox.WorkspacePath, nil)
+		}
+		action := "WORKSPACE_REBASE_SKIPPED"
+		summary := reason
+		switch status {
+		case "REBASED":
+			action = "WORKSPACE_REBASE"
+			summary = "workspace rebased"
+		case "UP_TO_DATE":
+			action = "WORKSPACE_REBASE_UP_TO_DATE"
+			summary = "workspace already contains target ref"
+		case "FAILED":
+			action = "WORKSPACE_REBASE_FAILED"
+		case "REBASED_PUBLISH_FAILED":
+			action = "WORKSPACE_REBASE_PUBLISH_FAILED"
+			summary = "workspace rebased but publish failed"
+		}
+		if summary == "" {
+			summary = status
+		}
+		s.recordAuditLocked(ctx, projectID, action, "sandbox", sandbox.ID, summary, now)
+		if status == "FAILED" || status == "REBASED_PUBLISH_FAILED" {
+			alertType := "WORKSPACE_REBASE_FAILED"
+			if providerResult.RebaseAborted {
+				alertType = "WORKSPACE_REBASE_CONFLICT"
+			}
+			s.recordAlertLocked(projectID, "ERROR", alertType, sandbox.ID, summary, now)
+		}
+	}
+	return WorkspaceRebaseResult{
+		SandboxID:      sandbox.ID,
+		Scope:          sandbox.Scope,
+		Provider:       providerResult.Provider,
+		Status:         status,
+		Reason:         reason,
+		Branch:         providerResult.Branch,
+		TargetRef:      providerResult.TargetRef,
+		OldHeadRef:     providerResult.OldHeadRef,
+		NewHeadRef:     providerResult.NewHeadRef,
+		Ahead:          providerResult.Ahead,
+		Behind:         providerResult.Behind,
+		Fetched:        providerResult.Fetched,
+		RebaseAborted:  providerResult.RebaseAborted,
+		Published:      providerResult.Published,
+		ConflictLog:    providerResult.ConflictLog,
+		ConflictLogRef: providerResult.ConflictLogRef,
+		Error:          providerResult.Error,
+	}
+}
+
 func (s *Service) applyWorkspaceCleanupResultLocked(ctx context.Context, projectID string, sandbox *domain.Sandbox, providerResult *workspaceCleanupResult, dryRun bool, now time.Time) WorkspaceCleanupResult {
 	status := "CLEANED"
 	reason := strings.TrimSpace(providerResult.SkipReason)
@@ -4023,6 +4210,17 @@ func (s *Service) applyWorkspaceCleanupResultLocked(ctx context.Context, project
 		BranchDeleted:   providerResult.BranchDeleted,
 		RetainedRef:     providerResult.RetainedRef,
 	}
+}
+
+func cleanIDSet(ids []string) map[string]struct{} {
+	selected := map[string]struct{}{}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			selected[id] = struct{}{}
+		}
+	}
+	return selected
 }
 
 func (s *Service) sourceSandboxIDsForArtifactsLocked(artifactIDs []string) []string {

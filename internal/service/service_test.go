@@ -1625,6 +1625,287 @@ func TestGitWorkspaceProviderPushesSharedBranch(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceRebaseSucceedsForManagedCleanPrivateSandbox(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{Address: ":0", ServiceName: "test-git-workspace-rebase", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Rebase Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo", Content: "实现 Todo 交付包"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+	sandboxView, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get run sandbox: %v", err)
+	}
+	oldHead := sandboxView.Sandbox.WorkspaceHeadRef
+	if err := os.WriteFile(filepath.Join(repoPath, "BASE.md"), []byte("new base\n"), 0o644); err != nil {
+		t.Fatalf("write base file: %v", err)
+	}
+	runTestGit(t, repoPath, "add", "BASE.md")
+	runTestGit(t, repoPath, "commit", "-m", "advance base")
+
+	result, err := svc.RebaseWorkspaces(ctx, project.ID, RebaseWorkspacesInput{SandboxIDs: []string{sandboxView.Sandbox.ID}, TargetRef: "main"})
+	if err != nil {
+		t.Fatalf("rebase workspaces: %v", err)
+	}
+	if result.Rebased != 1 || len(result.Results) != 1 || result.Results[0].Status != "REBASED" {
+		t.Fatalf("expected one rebased workspace, got %+v", result)
+	}
+	updated, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get updated sandbox: %v", err)
+	}
+	if updated.Sandbox.WorkspaceHeadRef == oldHead || updated.Sandbox.WorkspaceHeadRef != result.Results[0].NewHeadRef {
+		t.Fatalf("expected updated head, old=%s result=%+v sandbox=%+v", oldHead, result.Results[0], updated.Sandbox)
+	}
+	runTestGit(t, updated.Sandbox.WorkspacePath, "merge-base", "--is-ancestor", "main", updated.Sandbox.WorkspaceHeadRef)
+	runTestGit(t, updated.Sandbox.WorkspacePath, "cat-file", "-e", updated.Sandbox.WorkspaceHeadRef+":tasks/"+planResult.Task.ID+"/bundle/metadata/manifest.json")
+	logs, err := svc.ListAuditLogs(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list audit logs: %v", err)
+	}
+	if !auditContainsAction(logs, "WORKSPACE_REBASE") {
+		t.Fatalf("expected WORKSPACE_REBASE audit, got %+v", logs)
+	}
+}
+
+func TestGitWorkspaceRebaseConflictAbortsAndKeepsOriginalHead(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{Address: ":0", ServiceName: "test-git-workspace-rebase-conflict", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Rebase Conflict Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo", Content: "实现 Todo 交付包"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+	sandboxView, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get run sandbox: %v", err)
+	}
+	oldHead := sandboxView.Sandbox.WorkspaceHeadRef
+	conflictPath := filepath.Join(repoPath, "tasks", planResult.Task.ID, "bundle", "README.md")
+	if err := os.MkdirAll(filepath.Dir(conflictPath), 0o755); err != nil {
+		t.Fatalf("mkdir conflict path: %v", err)
+	}
+	if err := os.WriteFile(conflictPath, []byte("base conflict\n"), 0o644); err != nil {
+		t.Fatalf("write conflict file: %v", err)
+	}
+	runTestGit(t, repoPath, "add", filepath.ToSlash(filepath.Join("tasks", planResult.Task.ID, "bundle", "README.md")))
+	runTestGit(t, repoPath, "commit", "-m", "conflicting base")
+
+	result, err := svc.RebaseWorkspaces(ctx, project.ID, RebaseWorkspacesInput{SandboxIDs: []string{sandboxView.Sandbox.ID}, TargetRef: "main"})
+	if err != nil {
+		t.Fatalf("rebase workspaces: %v", err)
+	}
+	if result.Failed != 1 || len(result.Results) != 1 || result.Results[0].Status != "FAILED" || !result.Results[0].RebaseAborted {
+		t.Fatalf("expected aborted conflict, got %+v", result)
+	}
+	if _, err := os.Stat(result.Results[0].ConflictLog); err != nil {
+		t.Fatalf("expected conflict log: %v", err)
+	}
+	currentHead := strings.TrimSpace(runTestGit(t, sandboxView.Sandbox.WorkspacePath, "rev-parse", "HEAD"))
+	if currentHead != oldHead {
+		t.Fatalf("expected old head %s after abort, got %s", oldHead, currentHead)
+	}
+	updated, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get updated sandbox: %v", err)
+	}
+	if updated.Sandbox.WorkspaceHeadRef != oldHead {
+		t.Fatalf("expected sandbox metadata to keep old head %s, got %s", oldHead, updated.Sandbox.WorkspaceHeadRef)
+	}
+	alerts, err := svc.ListAlerts(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list alerts: %v", err)
+	}
+	if !alertContainsType(alerts, "WORKSPACE_REBASE_CONFLICT") {
+		t.Fatalf("expected conflict alert, got %+v", alerts)
+	}
+}
+
+func TestGitWorkspaceRebaseRejectsDirtyContentWorktree(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{Address: ":0", ServiceName: "test-git-workspace-rebase-dirty", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Rebase Dirty Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo", Content: "实现 Todo 交付包"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+	sandboxView, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get run sandbox: %v", err)
+	}
+	oldHead := sandboxView.Sandbox.WorkspaceHeadRef
+	if err := os.WriteFile(filepath.Join(repoPath, "BASE.md"), []byte("new base\n"), 0o644); err != nil {
+		t.Fatalf("write base file: %v", err)
+	}
+	runTestGit(t, repoPath, "add", "BASE.md")
+	runTestGit(t, repoPath, "commit", "-m", "advance base")
+	if err := os.WriteFile(filepath.Join(sandboxView.Sandbox.WorkspacePath, "DIRTY.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+
+	result, err := svc.RebaseWorkspaces(ctx, project.ID, RebaseWorkspacesInput{SandboxIDs: []string{sandboxView.Sandbox.ID}, TargetRef: "main"})
+	if err != nil {
+		t.Fatalf("rebase workspaces: %v", err)
+	}
+	if result.Skipped != 1 || result.Results[0].Status != "SKIPPED" || !strings.Contains(result.Results[0].Reason, "uncommitted changes") {
+		t.Fatalf("expected dirty skip, got %+v", result)
+	}
+	currentHead := strings.TrimSpace(runTestGit(t, sandboxView.Sandbox.WorkspacePath, "rev-parse", "HEAD"))
+	if currentHead != oldHead {
+		t.Fatalf("expected old head %s, got %s", oldHead, currentHead)
+	}
+}
+
+func TestGitWorkspaceRebaseDryRunReportsAheadBehindWithoutChangingHead(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	cfg := config.Config{Address: ":0", ServiceName: "test-git-workspace-rebase-dry-run", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main", RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Rebase Dry Run Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo", Content: "实现 Todo 交付包"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+	sandboxView, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get run sandbox: %v", err)
+	}
+	oldHead := sandboxView.Sandbox.WorkspaceHeadRef
+	if err := os.WriteFile(filepath.Join(repoPath, "BASE.md"), []byte("new base\n"), 0o644); err != nil {
+		t.Fatalf("write base file: %v", err)
+	}
+	runTestGit(t, repoPath, "add", "BASE.md")
+	runTestGit(t, repoPath, "commit", "-m", "advance base")
+
+	result, err := svc.RebaseWorkspaces(ctx, project.ID, RebaseWorkspacesInput{DryRun: true, SandboxIDs: []string{sandboxView.Sandbox.ID}, TargetRef: "main"})
+	if err != nil {
+		t.Fatalf("rebase dry run: %v", err)
+	}
+	if len(result.Results) != 1 || result.Results[0].Status != "DRY_RUN" || result.Results[0].Ahead == 0 || result.Results[0].Behind == 0 {
+		t.Fatalf("expected dry-run ahead/behind, got %+v", result)
+	}
+	currentHead := strings.TrimSpace(runTestGit(t, sandboxView.Sandbox.WorkspacePath, "rev-parse", "HEAD"))
+	if currentHead != oldHead {
+		t.Fatalf("expected dry-run to keep head %s, got %s", oldHead, currentHead)
+	}
+}
+
+func TestGitWorkspaceRebasePublishUsesNonForcePushAndKeepsRemoteOnRejection(t *testing.T) {
+	remotePath := initBareGitRemote(t)
+	repoPath := filepath.Join(t.TempDir(), "workspace-repo")
+	cfg := config.Config{Address: ":0", ServiceName: "test-git-workspace-rebase-publish", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitRemoteURL: remotePath, WorkspaceGitBaseRef: "origin/main", WorkspaceGitPushEnabled: true, RuntimeProvider: "local", RuntimeHTTPMaxAttempts: 1, RuntimeHTTPRetryBaseDelay: time.Millisecond}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Rebase Publish Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "实现 Todo", Content: "实现 Todo 交付包"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, runEnvelope.Run.ID)
+	sandboxView, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get run sandbox: %v", err)
+	}
+	remoteOldHead := strings.TrimSpace(runTestGit(t, remotePath, "rev-parse", "refs/heads/"+sandboxView.Sandbox.WorkspaceBranch))
+	remoteWork := cloneBareRemote(t, remotePath)
+	if err := os.WriteFile(filepath.Join(remoteWork, "BASE.md"), []byte("new base\n"), 0o644); err != nil {
+		t.Fatalf("write remote base: %v", err)
+	}
+	runTestGit(t, remoteWork, "add", "BASE.md")
+	runTestGit(t, remoteWork, "commit", "-m", "advance remote base")
+	runTestGit(t, remoteWork, "push", "origin", "main")
+	otherWork := cloneBareRemote(t, remotePath)
+	runTestGit(t, otherWork, "checkout", sandboxView.Sandbox.WorkspaceBranch)
+	if err := os.WriteFile(filepath.Join(otherWork, "REMOTE-BRANCH.md"), []byte("remote branch moved\n"), 0o644); err != nil {
+		t.Fatalf("write remote branch move: %v", err)
+	}
+	runTestGit(t, otherWork, "add", "REMOTE-BRANCH.md")
+	runTestGit(t, otherWork, "commit", "-m", "move remote task branch")
+	runTestGit(t, otherWork, "push", "origin", sandboxView.Sandbox.WorkspaceBranch)
+	remoteMovedHead := strings.TrimSpace(runTestGit(t, remotePath, "rev-parse", "refs/heads/"+sandboxView.Sandbox.WorkspaceBranch))
+	if remoteMovedHead == remoteOldHead {
+		t.Fatalf("expected remote task branch to move")
+	}
+
+	result, err := svc.RebaseWorkspaces(ctx, project.ID, RebaseWorkspacesInput{SandboxIDs: []string{sandboxView.Sandbox.ID}, TargetRef: "origin/main", Fetch: true, Publish: true})
+	if err != nil {
+		t.Fatalf("rebase publish: %v", err)
+	}
+	if len(result.Results) != 1 || result.Results[0].Status != "REBASED_PUBLISH_FAILED" || result.Rebased != 1 || result.Failed != 1 {
+		t.Fatalf("expected publish failure after local rebase, got %+v", result)
+	}
+	remoteAfter := strings.TrimSpace(runTestGit(t, remotePath, "rev-parse", "refs/heads/"+sandboxView.Sandbox.WorkspaceBranch))
+	if remoteAfter != remoteMovedHead {
+		t.Fatalf("expected non-force publish to keep remote head %s, got %s", remoteMovedHead, remoteAfter)
+	}
+}
+
 func TestGitErrorSanitizerRedactsAuthToken(t *testing.T) {
 	secret := "ghp_super_secret"
 	text := sanitizeGitError("fatal: authentication failed for "+secret, []string{secret})
@@ -3215,6 +3496,24 @@ func initBareGitRemote(t *testing.T) string {
 	runTestGit(t, workPath, "push", "origin", "main")
 	runTestGit(t, barePath, "symbolic-ref", "HEAD", "refs/heads/main")
 	return barePath
+}
+
+func auditContainsAction(logs []domain.AuditLog, action string) bool {
+	for _, item := range logs {
+		if item.Action == action {
+			return true
+		}
+	}
+	return false
+}
+
+func alertContainsType(alerts []domain.Alert, alertType string) bool {
+	for _, item := range alerts {
+		if item.Type == alertType {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneBareRemote(t *testing.T, barePath string) string {

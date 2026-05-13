@@ -87,6 +87,7 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - Git provider 的共享沙盒成功合并后，私有任务 head 是共享 `workspaceHeadRef` 的 ancestor，快照包含 `workspaceStateRef` 与 `workspaceChecksum`
 - Git provider 成功合并后，已合并私有 worktree 会被安全清理或记录跳过原因；released shared worktree/branch 保留
 - `POST /projects/{id}/workspaces/cleanup` dry-run 返回计划清理结果且不移除 worktree；`deleteBranches=true` 只尝试非 force 删除已合并私有分支
+- `POST /projects/{id}/workspaces/rebase` 必须显式传入 `targetRef` 且指定 `sandboxIds` 或 `all=true`；只处理受管 Git private task workspace，dirty content worktree 被拒绝，冲突会 abort 并保持原 head；`publish=true` 只执行非 force push，远端 non-fast-forward 拒绝时远端分支保持不变
 - 文件存储模式下，快照 rollback 可从 `file://` StateRef 恢复；checksum 被篡改时应拒绝回滚
 - `POST /projects/{id}/locks` 可提交 `lockMode=go_symbol`、`language=go`、`symbolKind=func|method|type|var|const` 和 `symbolName`，并只替换对应 Go 声明，同时合并锁内容所需 imports、移除替换后不再使用的普通 imports
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回 `runtime.http.v1` success 时可执行成功并采用嵌套 `usage`

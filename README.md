@@ -65,7 +65,7 @@
 - 告警通知当前支持**最小 webhook 主动推送**：设置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，run 失败和回滚事件会异步推送结构化 alert 到外部接收端。
 - 状态面板当前支持**WebUI 运维总览**：同一页面可查看 readiness、任务拓扑、任务矩阵、失败告警、审计轨迹、通信日志、Token 成本趋势、沙盒和快照，更新机制为 SSE + 轮询兜底，并使用 DOM/SVG API 渲染接口数据以降低 XSS 风险。
 - 运维 readiness 当前支持 `GET /ready`：会检查配置有效性、auth token 配置、存储/数据目录、artifact/sandbox 根目录可写性、Git workspace provider 的 repo/base ref 可用性以及 runtime provider 配置；配置 remote Git 后，readiness 可 clone 缺失 repo 并按需 fetch。
-- Git workspace v3 当前支持 remote MVP：在 v2 的 worktree、任务分支 commit、shared sandbox Git merge、snapshot commit/ref 和 cleanup lifecycle 基础上，支持 `MULTI_AGENT_WORKSPACE_GIT_REMOTE_URL` clone、本地 repo remote URL 校验、`MULTI_AGENT_WORKSPACE_GIT_FETCH_BEFORE_USE` opt-in fetch、`MULTI_AGENT_WORKSPACE_GIT_PUSH_ENABLED` opt-in 非 force push；HTTPS token 应通过 `MULTI_AGENT_WORKSPACE_GIT_AUTH_TOKEN_FILE` 或 env 注入，禁止写入 remote URL，SSH 认证依赖进程 SSH agent。rebase、remote branch 删除、force push、纯 Git restore 仍是后续工作。
+- Git workspace v4 当前支持 manual rebase MVP：在 v3 的 remote clone/fetch/push/auth、worktree、任务分支 commit、shared sandbox Git merge、snapshot commit/ref 和 cleanup lifecycle 基础上，新增 `POST /projects/{id}/workspaces/rebase` 显式触发 private task workspace rebase；请求必须指定 `targetRef` 且指定 `sandboxIds` 或 `all=true`，支持 `dryRun` ahead/behind 预检、`fetch` opt-in 和 `publish` opt-in 非 force push。rebase 只作用于受管且已 release 的 private Git task workspace，dirty content worktree 会被拒绝，冲突会自动 `git rebase --abort` 并保留原 head；shared branch rebase、force push、remote branch 删除、纯 Git restore 仍是后续工作。
 
 ## 本地运行
 

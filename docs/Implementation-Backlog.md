@@ -306,7 +306,13 @@
 - **优先级：** P1
 - **估时：** 1.5 PD
 - **目标：** 将 Git workspace 从 local-only 扩展到 remote-backed MVP。
-- **DoD：** 支持 remote clone、fetch-before-use、private/shared branch 非 force push；token 不写入 remote URL 且错误脱敏；rebase/force push/remote 删除保持 out of scope。
+- **DoD：** 支持 remote clone、fetch-before-use、private/shared branch 非 force push；token 不写入 remote URL 且错误脱敏；force push/remote 删除保持 out of scope。
+
+### BL-907 Git rebase 安全最小闭环
+- **优先级：** P1
+- **估时：** 1.5 PD
+- **目标：** 为已生成的受管 private task workspace 提供显式、可审计的 rebase 能力。
+- **DoD：** rebase API 要求显式 `targetRef` 与 sandbox 选择；支持 dry-run ahead/behind；dirty content worktree 被拒绝；冲突自动 abort 且保留原 head；可选 publish 仅使用非 force push。
 
 ## 8. 依赖总览（关键路径）
 

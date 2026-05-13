@@ -1093,6 +1093,58 @@ func TestHTTPWorkspaceCleanupDryRun(t *testing.T) {
 	}
 }
 
+func TestHTTPWorkspaceRebaseDryRun(t *testing.T) {
+	repoPath := initHTTPTempGitRepo(t)
+	cfg := config.Config{Address: ":0", ServiceName: "test-http-workspace-rebase", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "http-manager-agent", WorkspaceProvider: "git", WorkspaceGitRepoPath: repoPath, WorkspaceGitBaseRef: "main"}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{"name": "HTTP Rebase Demo"})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{"title": "实现 Todo", "content": "实现 Todo 交付包"})
+	planBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{})
+	var planResult service.PlanResult
+	decodeResponse(t, planBody, &planResult)
+	runBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/run", map[string]any{"taskId": planResult.Task.ID})
+	var runEnvelope service.RunEnvelope
+	decodeResponse(t, runBody, &runEnvelope)
+	waitForHTTPRun(t, server, project.ID, runEnvelope.Run.ID)
+	sandboxBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/runs/"+runEnvelope.Run.ID+"/sandbox")
+	var sandbox service.SandboxView
+	decodeResponse(t, sandboxBody, &sandbox)
+	if err := os.WriteFile(filepath.Join(repoPath, "BASE.md"), []byte("new base\n"), 0o644); err != nil {
+		t.Fatalf("write base file: %v", err)
+	}
+	runHTTPTestGit(t, repoPath, "add", "BASE.md")
+	runHTTPTestGit(t, repoPath, "commit", "-m", "advance base")
+
+	body := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/workspaces/rebase", map[string]any{"dryRun": true, "sandboxIds": []string{sandbox.Sandbox.ID}, "targetRef": "main"})
+	var rebase service.RebaseWorkspacesResult
+	decodeResponse(t, body, &rebase)
+	if !rebase.DryRun || len(rebase.Results) != 1 || rebase.Results[0].SandboxID != sandbox.Sandbox.ID || rebase.Results[0].Status != "DRY_RUN" {
+		t.Fatalf("expected HTTP rebase dry-run result, got %+v", rebase)
+	}
+}
+
+func TestHTTPWorkspaceRebaseValidation(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-http-workspace-rebase-validation", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir()}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{"name": "HTTP Rebase Validation"})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	missingTarget := requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/workspaces/rebase", map[string]any{"all": true}, http.StatusBadRequest)
+	assertContainsBody(t, missingTarget, "targetRef")
+	missingSelection := requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/workspaces/rebase", map[string]any{"targetRef": "main"}, http.StatusBadRequest)
+	assertContainsBody(t, missingSelection, "sandboxIds")
+}
+
 func TestHTTPSharedSandboxFailureAutoRollback(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",
