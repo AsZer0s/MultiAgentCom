@@ -1431,6 +1431,29 @@ func TestHTTPApplyCodeLock(t *testing.T) {
 	}
 }
 
+func TestHTTPApplyCodeLockRejectsMarkerOutsideSelectedSymbol(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-http-code-lock-marker", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "http-manager-agent"}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{"name": "Invalid Code Lock"})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+
+	body := requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/locks", map[string]any{
+		"path":       "generated-app/main.go",
+		"content":    "package main\n\n// LOCKED BY HUMAN\n\nfunc main() {\n\tprintln(\"not locked\")\n}\n",
+		"lockMode":   "go_symbol",
+		"language":   "go",
+		"symbolKind": "func",
+		"symbolName": "main",
+		"createdBy":  "reviewer",
+	}, http.StatusBadRequest)
+	assertContainsBody(t, body, "marker must be inside selected Go symbol")
+}
+
 func TestHTTPListCommunicationLogs(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",

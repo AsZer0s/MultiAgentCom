@@ -3194,8 +3194,12 @@ func validateCodeLock(path, content, lockMode, language, symbolKind, symbolName 
 	if symbolName == "" {
 		return newValidationError("symbolName is required for go_symbol locks")
 	}
-	if _, _, err := findGoSymbol([]byte(content), symbolKind, symbolName); err != nil {
+	start, end, err := findGoSymbol([]byte(content), symbolKind, symbolName)
+	if err != nil {
 		return newValidationError(err.Error())
+	}
+	if !strings.Contains(content[start:end], "LOCKED BY HUMAN") {
+		return newValidationError("go_symbol lock marker must be inside selected Go symbol")
 	}
 	return nil
 }
@@ -3212,7 +3216,7 @@ func applyGoSymbolLock(targetPath string, lock *domain.CodeLock) (bool, string, 
 	}
 	lockedSymbol := locked[lockedStart:lockedEnd]
 	if len(target) == 0 {
-		merged, err := reconcileGoImports(appendNewline(lockedSymbol), locked)
+		merged, err := goLockedSymbolFile(locked, lock.SymbolKind, lock.SymbolName)
 		if err != nil {
 			return false, "", err
 		}
@@ -3464,7 +3468,7 @@ func goDeclSymbolRange(fileSet *token.FileSet, decl ast.Decl, symbolKind, symbol
 			return 0, 0, false
 		}
 		if symbolKind == "func" && typedDecl.Recv == nil || symbolKind == "method" && typedDecl.Recv != nil {
-			return fileSet.Position(typedDecl.Pos()).Offset, fileSet.Position(typedDecl.End()).Offset, true
+			return goNodeStartOffset(fileSet, typedDecl.Doc, typedDecl.Pos()), fileSet.Position(typedDecl.End()).Offset, true
 		}
 	case *ast.GenDecl:
 		if typedDecl.Tok == token.TYPE && symbolKind != "type" || typedDecl.Tok == token.VAR && symbolKind != "var" || typedDecl.Tok == token.CONST && symbolKind != "const" {
@@ -3472,11 +3476,45 @@ func goDeclSymbolRange(fileSet *token.FileSet, decl ast.Decl, symbolKind, symbol
 		}
 		for _, spec := range typedDecl.Specs {
 			if goSpecName(spec) == symbolName {
-				return fileSet.Position(typedDecl.Pos()).Offset, fileSet.Position(typedDecl.End()).Offset, true
+				return goNodeStartOffset(fileSet, typedDecl.Doc, typedDecl.Pos()), fileSet.Position(typedDecl.End()).Offset, true
 			}
 		}
 	}
 	return 0, 0, false
+}
+
+func goNodeStartOffset(fileSet *token.FileSet, doc *ast.CommentGroup, fallback token.Pos) int {
+	if doc != nil {
+		return fileSet.Position(doc.Pos()).Offset
+	}
+	return fileSet.Position(fallback).Offset
+}
+
+func goLockedSymbolFile(source []byte, symbolKind, symbolName string) ([]byte, error) {
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "lock.go", source, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("go_symbol lock content must be parseable Go: %w", err)
+	}
+	start, end, err := findGoSymbol(source, symbolKind, symbolName)
+	if err != nil {
+		return nil, err
+	}
+	imports, err := goImportSpecs(source)
+	if err != nil {
+		return nil, err
+	}
+	var builder strings.Builder
+	builder.WriteString("package ")
+	builder.WriteString(file.Name.Name)
+	builder.WriteByte('\n')
+	if len(imports) > 0 {
+		builder.Write(renderGoImportBlock(imports, false))
+		builder.WriteByte('\n')
+	}
+	builder.WriteByte('\n')
+	builder.Write(appendNewline(source[start:end]))
+	return reconcileGoImports([]byte(builder.String()), source)
 }
 
 func goSpecName(spec ast.Spec) string {

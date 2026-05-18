@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -3489,6 +3491,139 @@ func main() {
 		if strings.Contains(source, fragment) {
 			t.Fatalf("expected unused import %s to be removed, got:\n%s", fragment, source)
 		}
+	}
+}
+
+func TestGoSymbolCodeLockRequiresMarkerInsideSelectedSymbol(t *testing.T) {
+	svc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Marker Scope Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	_, err = svc.ApplyCodeLock(ctx, project.ID, ApplyCodeLockInput{
+		Path: "generated-app/main.go",
+		Content: `package main
+
+// LOCKED BY HUMAN
+
+func main() {
+	println("not actually locked")
+}
+`,
+		LockMode:   "go_symbol",
+		Language:   "go",
+		SymbolKind: "func",
+		SymbolName: "main",
+		CreatedBy:  "reviewer",
+	})
+	if err == nil || !strings.Contains(err.Error(), "marker must be inside selected Go symbol") {
+		t.Fatalf("expected marker scope validation error, got %v", err)
+	}
+}
+
+func TestGoSymbolCodeLockPreservesDocCommentMarker(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-code-lock-doc-marker", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Doc Marker Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Todo", Content: "Implement todo app."}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	lockedSource := `package main
+
+// LOCKED BY HUMAN
+// human owned entrypoint
+func main() {
+	println("doc marker lock")
+}
+`
+	if _, err := svc.ApplyCodeLock(ctx, project.ID, ApplyCodeLockInput{TaskID: planResult.Task.ID, Path: "generated-app/main.go", Content: lockedSource, LockMode: "go_symbol", Language: "go", SymbolKind: "func", SymbolName: "main", CreatedBy: "reviewer"}); err != nil {
+		t.Fatalf("apply go symbol lock: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s", status.Run.Status)
+	}
+	sandbox, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(sandbox.Sandbox.WorkspacePath, "bundle", "generated-app", "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	source := string(data)
+	if !strings.Contains(source, "// LOCKED BY HUMAN") || !strings.Contains(source, `println("doc marker lock")`) || !strings.Contains(source, "type todo struct") {
+		t.Fatalf("expected doc marker lock and generated declarations, got:\n%s", source)
+	}
+}
+
+func TestGoSymbolCodeLockCreatesMissingGoFileWithPackageAndImports(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-code-lock-missing-go", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Missing Go Lock Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Todo", Content: "Implement todo app."}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	lockedSource := `package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+// LOCKED BY HUMAN
+func lockedHelper() string {
+	return fmt.Sprint(strings.TrimSpace(" helper "))
+}
+`
+	if _, err := svc.ApplyCodeLock(ctx, project.ID, ApplyCodeLockInput{TaskID: planResult.Task.ID, Path: "generated-app/locked_helper.go", Content: lockedSource, LockMode: "go_symbol", Language: "go", SymbolKind: "func", SymbolName: "lockedHelper", CreatedBy: "reviewer"}); err != nil {
+		t.Fatalf("apply go symbol lock: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, runEnvelope.Run.ID)
+	if status.Run.Status != domain.RunStatusSucceeded {
+		t.Fatalf("expected run success, got %s", status.Run.Status)
+	}
+	sandbox, err := svc.GetRunSandbox(ctx, project.ID, runEnvelope.Run.ID)
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(sandbox.Sandbox.WorkspacePath, "bundle", "generated-app", "locked_helper.go"))
+	if err != nil {
+		t.Fatalf("read locked helper: %v", err)
+	}
+	source := string(data)
+	for _, fragment := range []string{"package main", `"fmt"`, `"strings"`, "// LOCKED BY HUMAN", "func lockedHelper() string", "fmt.Sprint(strings.TrimSpace"} {
+		if !strings.Contains(source, fragment) {
+			t.Fatalf("expected missing Go file to contain %s, got:\n%s", fragment, source)
+		}
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "locked_helper.go", data, parser.ParseComments); err != nil {
+		t.Fatalf("expected generated helper to parse: %v\n%s", err, source)
 	}
 }
 

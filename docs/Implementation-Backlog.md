@@ -320,6 +320,12 @@
 - **目标：** 将 Git workspace snapshot 从“仅记录 ref”扩展为可安全恢复的 rollback worktree。
 - **DoD：** rollback 到 Git snapshot 会创建新的受管 shared rollback worktree；checksum/ref mismatch 被拒绝；不覆盖已有 worktree；后续 shared merge 以 restored head 为 base；service/HTTP 测试覆盖成功与安全失败。
 
+### BL-909 Go AST lock hardening
+- **优先级：** P1
+- **估时：** 1 PD
+- **目标：** 补强 Go symbol lock 的 marker 归属校验与缺失目标文件创建能力。
+- **DoD：** `LOCKED BY HUMAN` 必须位于被锁定 symbol/doc comment 内；缺失 Go 文件可由 locked content 的 package/import 上下文创建；service/HTTP 测试覆盖 marker 拒绝、doc comment 保留和缺失文件创建。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：
