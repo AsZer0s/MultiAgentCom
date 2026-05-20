@@ -381,10 +381,15 @@ func TestHTTPRunnerRunMalformedSuccess(t *testing.T) {
 func TestHTTPRunnerRunTimeout(t *testing.T) {
 	t.Parallel()
 
+	unblock := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
+		select {
+		case <-r.Context().Done():
+		case <-unblock:
+		}
 	}))
 	defer server.Close()
+	defer close(unblock)
 
 	runner, err := NewHTTPRunner(server.URL, server.Client())
 	if err != nil {
