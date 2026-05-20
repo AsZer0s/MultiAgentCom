@@ -2587,14 +2587,19 @@ func TestApplyHumanOverrideAtSafetyCheckpoint(t *testing.T) {
 	}
 	waitForTaskStatus(t, svc, project.ID, runEnvelope.Run.ID, domain.TaskStatusInProgress)
 
-	overrideResult, err := svc.ApplyHumanOverride(ctx, project.ID, ApplyHumanOverrideInput{
+	overrideResult, err := svc.ApplyHumanOverride(WithActor(ctx, "reviewer"), project.ID, ApplyHumanOverrideInput{
 		TaskID:      planResult.Task.ID,
-		Operator:    "reviewer",
 		Instruction: "请优先保留 README 说明并按人工要求继续执行",
 		LockScope:   "TASK",
 	})
 	if err != nil {
 		t.Fatalf("apply human override: %v", err)
+	}
+	if overrideResult.Override.Owner != "reviewer" {
+		t.Fatalf("expected override owner reviewer, got %s", overrideResult.Override.Owner)
+	}
+	if overrideResult.Override.ExpiresAt.IsZero() {
+		t.Fatal("expected override lease expiry")
 	}
 	if overrideResult.Task.Status != domain.TaskStatusHumanOverride {
 		t.Fatalf("expected task to enter HUMAN_OVERRIDE, got %s", overrideResult.Task.Status)
@@ -2622,6 +2627,96 @@ func TestApplyHumanOverrideAtSafetyCheckpoint(t *testing.T) {
 	}
 	if !foundOverrideTransition {
 		t.Fatal("expected task audit to include HUMAN_OVERRIDE transition")
+	}
+}
+
+func TestHumanOverrideLeaseConflictQueuesEntry(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-human-override-conflict", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Override Conflict Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Todo", Content: "Support human override leases."}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	runEnvelope, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForTaskStatus(t, svc, project.ID, runEnvelope.Run.ID, domain.TaskStatusInProgress)
+
+	first, err := svc.ApplyHumanOverride(WithActor(ctx, "reviewer-a"), project.ID, ApplyHumanOverrideInput{TaskID: planResult.Task.ID, Instruction: "first", LockScope: "TASK", TTLSeconds: 3600})
+	if err != nil {
+		t.Fatalf("first override: %v", err)
+	}
+	if first.Conflict != nil {
+		t.Fatalf("unexpected conflict on first override: %+v", first.Conflict)
+	}
+
+	second, err := svc.ApplyHumanOverride(WithActor(ctx, "reviewer-b"), project.ID, ApplyHumanOverrideInput{TaskID: planResult.Task.ID, Instruction: "second", LockScope: "TASK", TTLSeconds: 3600})
+	if err == nil {
+		t.Fatal("expected override conflict error")
+	}
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != "CONFLICT" {
+		t.Fatalf("expected conflict app error, got %v", err)
+	}
+	if second == nil || second.Conflict == nil {
+		t.Fatalf("expected conflict result, got %+v", second)
+	}
+
+	conflicts, err := svc.ListConflictQueue(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list conflicts: %v", err)
+	}
+	if len(conflicts) != 1 || conflicts[0].Kind != "human_override" || conflicts[0].Status != "OPEN" {
+		t.Fatalf("expected open human override conflict, got %+v", conflicts)
+	}
+}
+
+func TestExpiredHumanOverrideLeaseCanBeReclaimed(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-human-override-expiry", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Override Expiry Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Todo", Content: "Support override lease expiry."}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	planResult, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if _, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: planResult.Task.ID}); err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	if _, err := svc.ApplyHumanOverride(WithActor(ctx, "reviewer-a"), project.ID, ApplyHumanOverrideInput{TaskID: planResult.Task.ID, Instruction: "first", LockScope: "TASK", TTLSeconds: 1}); err != nil {
+		t.Fatalf("apply first override: %v", err)
+	}
+	svc.mu.Lock()
+	for _, item := range svc.overrides[project.ID] {
+		item.ExpiresAt = time.Now().UTC().Add(-time.Second)
+	}
+	svc.mu.Unlock()
+
+	second, err := svc.ApplyHumanOverride(WithActor(ctx, "reviewer-b"), project.ID, ApplyHumanOverrideInput{TaskID: planResult.Task.ID, Instruction: "reclaim", LockScope: "TASK", TTLSeconds: 3600})
+	if err != nil {
+		t.Fatalf("reclaim expired override: %v", err)
+	}
+	if second.Conflict != nil {
+		t.Fatalf("expected no conflict reclaiming expired override, got %+v", second.Conflict)
 	}
 }
 
@@ -3306,6 +3401,118 @@ func main() {
 	conflictLog := filepath.Join(sandbox.Sandbox.RootPath, "workspace", "bundle", "metadata", "lock-conflicts.log")
 	if _, err := os.Stat(conflictLog); err != nil {
 		t.Fatalf("expected lock conflict log: %v", err)
+	}
+}
+
+func TestCodeLockLeaseConflictQueuesEntry(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-code-lock-conflict", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Code Lock Conflict Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	lockedSource := "package main\n\nfunc main() {\n\t// LOCKED BY HUMAN\n\tprintln(\"first\")\n}\n"
+	first, err := svc.ApplyCodeLock(WithActor(ctx, "reviewer-a"), project.ID, ApplyCodeLockInput{Path: "generated-app/main.go", Content: lockedSource, LockMode: "go_symbol", Language: "go", SymbolKind: "func", SymbolName: "main", TTLSeconds: 3600})
+	if err != nil {
+		t.Fatalf("first code lock: %v", err)
+	}
+	if first.Lock.Owner != "reviewer-a" {
+		t.Fatalf("expected owner reviewer-a, got %s", first.Lock.Owner)
+	}
+	if first.Lock.ExpiresAt.IsZero() {
+		t.Fatal("expected lock lease expiry")
+	}
+
+	secondSource := "package main\n\nfunc main() {\n\t// LOCKED BY HUMAN\n\tprintln(\"second\")\n}\n"
+	second, err := svc.ApplyCodeLock(WithActor(ctx, "reviewer-b"), project.ID, ApplyCodeLockInput{Path: "generated-app/main.go", Content: secondSource, LockMode: "go_symbol", Language: "go", SymbolKind: "func", SymbolName: "main", TTLSeconds: 3600})
+	if err == nil {
+		t.Fatal("expected code lock conflict error")
+	}
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != "CONFLICT" {
+		t.Fatalf("expected conflict app error, got %v", err)
+	}
+	if second == nil || second.Conflict == nil {
+		t.Fatalf("expected conflict result, got %+v", second)
+	}
+
+	conflicts, err := svc.ListConflictQueue(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list conflicts: %v", err)
+	}
+	if len(conflicts) != 1 || conflicts[0].Kind != "code_lock" || conflicts[0].Status != "OPEN" {
+		t.Fatalf("expected open code lock conflict, got %+v", conflicts)
+	}
+}
+
+func TestResolveConflictQueueEntryAuditsResolution(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-conflict-resolve", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(cfg, logger)
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Resolve Conflict Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.ApplyCodeLock(WithActor(ctx, "reviewer-a"), project.ID, ApplyCodeLockInput{Path: "README.md", Content: "# LOCKED BY HUMAN\nfirst\n", TTLSeconds: 3600}); err != nil {
+		t.Fatalf("first code lock: %v", err)
+	}
+	if _, err := svc.ApplyCodeLock(WithActor(ctx, "reviewer-b"), project.ID, ApplyCodeLockInput{Path: "README.md", Content: "# LOCKED BY HUMAN\nsecond\n", TTLSeconds: 3600}); err == nil {
+		t.Fatal("expected code lock conflict")
+	}
+	conflicts, err := svc.ListConflictQueue(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list conflicts: %v", err)
+	}
+	resolved, err := svc.ResolveConflictQueueEntry(WithActor(ctx, "lead"), project.ID, conflicts[0].ID, ResolveConflictInput{ResolutionNote: "manual resolution"})
+	if err != nil {
+		t.Fatalf("resolve conflict: %v", err)
+	}
+	if resolved.Status != "RESOLVED" || resolved.ResolvedBy != "lead" || resolved.ResolvedAt.IsZero() {
+		t.Fatalf("expected resolved conflict by lead, got %+v", resolved)
+	}
+	audits, err := svc.ListAuditLogs(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list audits: %v", err)
+	}
+	found := false
+	for _, item := range audits {
+		if item.Action == "HITL_CONFLICT_RESOLVED" && item.ResourceID == resolved.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected conflict resolved audit, got %+v", audits)
+	}
+}
+
+func TestConflictQueuePersistsAcrossFileStoreRestart(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-conflict-persist", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "file", DataRoot: t.TempDir(), DefaultAgent: "manager-agent"}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	ctx := context.Background()
+	svc := New(cfg, logger)
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Conflict Persist Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.ApplyCodeLock(WithActor(ctx, "reviewer-a"), project.ID, ApplyCodeLockInput{Path: "README.md", Content: "# LOCKED BY HUMAN\nfirst\n", TTLSeconds: 3600}); err != nil {
+		t.Fatalf("first code lock: %v", err)
+	}
+	if _, err := svc.ApplyCodeLock(WithActor(ctx, "reviewer-b"), project.ID, ApplyCodeLockInput{Path: "README.md", Content: "# LOCKED BY HUMAN\nsecond\n", TTLSeconds: 3600}); err == nil {
+		t.Fatal("expected code lock conflict")
+	}
+
+	restarted := New(cfg, logger)
+	conflicts, err := restarted.ListConflictQueue(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list conflicts after restart: %v", err)
+	}
+	if len(conflicts) != 1 || conflicts[0].Status != "OPEN" || conflicts[0].Kind != "code_lock" {
+		t.Fatalf("expected persisted open conflict, got %+v", conflicts)
 	}
 }
 

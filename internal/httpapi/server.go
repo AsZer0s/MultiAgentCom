@@ -59,6 +59,8 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("POST /projects/{id}/tasks/{taskId}/sandbox/fail", server.handleInjectSandboxFailure)
 	mux.HandleFunc("POST /projects/{id}/overrides", server.handleApplyHumanOverride)
 	mux.HandleFunc("POST /projects/{id}/locks", server.handleApplyCodeLock)
+	mux.HandleFunc("GET /projects/{id}/conflicts", server.handleListConflicts)
+	mux.HandleFunc("POST /projects/{id}/conflicts/{conflictId}/resolve", server.handleResolveConflict)
 	mux.HandleFunc("POST /projects/{id}/shared-sandbox/merge", server.handleMergeSharedSandbox)
 	mux.HandleFunc("POST /projects/{id}/workspaces/cleanup", server.handleCleanupWorkspaces)
 	mux.HandleFunc("POST /projects/{id}/workspaces/rebase", server.handleRebaseWorkspaces)
@@ -443,6 +445,10 @@ func (s *Server) handleApplyHumanOverride(w http.ResponseWriter, r *http.Request
 
 	result, err := s.svc.ApplyHumanOverride(r.Context(), r.PathValue("id"), input)
 	if err != nil {
+		if result != nil && result.Conflict != nil {
+			writeJSON(w, http.StatusConflict, result)
+			return
+		}
 		writeServiceError(w, err)
 		return
 	}
@@ -462,11 +468,50 @@ func (s *Server) handleApplyCodeLock(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.svc.ApplyCodeLock(r.Context(), r.PathValue("id"), input)
 	if err != nil {
+		if result != nil && result.Conflict != nil {
+			writeJSON(w, http.StatusConflict, result)
+			return
+		}
 		writeServiceError(w, err)
 		return
 	}
 
 	writeJSON(w, http.StatusCreated, result)
+}
+
+func (s *Server) handleListConflicts(w http.ResponseWriter, r *http.Request) {
+	if !authorizeRequest(w, r, r.PathValue("id"), "operator") {
+		return
+	}
+	items, err := s.svc.ListConflictQueue(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": items,
+		"count": len(items),
+	})
+}
+
+func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request) {
+	if !authorizeRequest(w, r, r.PathValue("id"), "operator") {
+		return
+	}
+	var input service.ResolveConflictInput
+	if err := decodeJSONAllowEmpty(r, &input); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	result, err := s.svc.ResolveConflictQueueEntry(r.Context(), r.PathValue("id"), r.PathValue("conflictId"), input)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleMergeSharedSandbox(w http.ResponseWriter, r *http.Request) {

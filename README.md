@@ -25,8 +25,10 @@
 - `GET /projects/{id}/alerts`：查看项目关键失败告警流，支持分页与时间过滤
 - `GET /projects/{id}/token-costs`：查看按任务聚合的 Token、成本和预算状态趋势，支持 `taskId` 过滤
 - `POST /projects/{id}/tasks/{taskId}/sandbox/fail`：为指定任务注入一次性私有沙盒失败
-- `POST /projects/{id}/overrides`：为运行中的任务注入人工高优指令，在安全检查点进入并恢复 `HUMAN_OVERRIDE`
-- `POST /projects/{id}/locks`：注册带 `LOCKED BY HUMAN` 标记的人工代码片段，后续自动产物生成时保留为真值
+- `POST /projects/{id}/overrides`：为运行中的任务注入带 owner/TTL lease 的人工高优指令，在安全检查点进入并恢复 `HUMAN_OVERRIDE`
+- `POST /projects/{id}/locks`：注册带 owner/TTL lease 与 `LOCKED BY HUMAN` 标记的人工代码片段，后续自动产物生成时保留为真值
+- `GET /projects/{id}/conflicts`：查看 HITL override / code lock 的 owner lease 冲突队列
+- `POST /projects/{id}/conflicts/{conflictId}/resolve`：人工标记 HITL 冲突已处理并写入审计
 - `POST /projects/{id}/shared-sandbox/merge`：将多个已完成任务的产物送入共享沙盒并执行合并闸门
 - `GET /projects/{id}/snapshots`：查看项目时间线快照与分支
 - `POST /projects/{id}/snapshots/rollback`：回滚到指定快照并创建新的平行时间线分支
@@ -56,8 +58,8 @@
 - 告警基线当前支持**失败通知与分页读取**：run 失败和共享沙盒关键失败会沉淀为 `/projects/{id}/alerts` 中的告警流，并在 `/status/panel` 里直接展示；告警与审计列表均支持分页和时间过滤。
 - Token 成本监控当前支持**真实 usage 优先与预算状态**：runtime provider 返回 token usage 时优先采用真实值，否则使用估算 fallback；单价和 warn/block 预算阈值可通过环境变量配置，可通过 `/projects/{id}/token-costs` 或 `/status/panel` 查看按任务的趋势条目。
 - 私有沙盒运行时当前支持**每个 run 独立工作区**：默认 `workspaceProvider=directory` 会为每次执行分配显式 `sandboxId`、独立 `rootPath`、`workspacePath` 并写入 `.multiagent/workspace-manifest.json`；也可通过 `MULTI_AGENT_WORKSPACE_PROVIDER=git`、`MULTI_AGENT_WORKSPACE_GIT_REPO_PATH` 和 `MULTI_AGENT_WORKSPACE_GIT_BASE_REF` 启用 Git worktree provider，在本地已有 repo 或通过 `MULTI_AGENT_WORKSPACE_GIT_REMOTE_URL` clone 的 repo 上创建任务分支 worktree、提交任务产物并记录 `workspaceBranch` / `workspaceHeadRef`；`MULTI_AGENT_WORKSPACE_GIT_FETCH_BEFORE_USE=true` 会在创建 worktree 前 fetch，`MULTI_AGENT_WORKSPACE_GIT_PUSH_ENABLED=true` 会非 force push task/shared 分支。单个沙盒失败会标记为 `FAILED`，不会影响其他并行任务继续产生产物。
-- HITL 当前支持**最小人工接管**：运行中的任务可通过 `POST /projects/{id}/overrides` 进入 `HUMAN_OVERRIDE`，执行器会在安全检查点应用指令并恢复执行，任务审计与运行摘要会记录这次接管。
-- 代码锁定当前支持**人工真值保护与 Go AST 级锁**：人类可通过 `POST /projects/{id}/locks` 注册包含 `LOCKED BY HUMAN` 标记的文件内容；默认 `file` 模式会在 bundle 生成末尾覆盖整文件，`go_symbol` 模式可锁定 Go `func`、`method`、`type`、`var`、`const` 并只替换对应声明，method 可用 `symbolName=Receiver.Method` 精确区分同名接收者，grouped `type/var/const` 声明只替换命中的目标 spec，要求 marker 位于被锁定 symbol 或其 doc comment 内；同时支持用 locked content 的 package/import 上下文创建缺失 Go 文件、合并锁内容所需 imports、移除替换后不再使用的普通 imports，冲突会写入 `metadata/lock-conflicts.log`。
+- HITL 当前支持**最小人工接管治理**：运行中的任务可通过 `POST /projects/{id}/overrides` 进入 `HUMAN_OVERRIDE`，override 带 owner/TTL lease；同任务同 scope 的未过期 lease 若 owner 不同会返回 `409` 并进入 `/projects/{id}/conflicts` 队列，执行器只在安全检查点应用未过期 override。
+- 代码锁定当前支持**人工真值保护与 Go AST 级锁**：人类可通过 `POST /projects/{id}/locks` 注册包含 `LOCKED BY HUMAN` 标记且带 owner/TTL lease 的文件内容；默认 `file` 模式会在 bundle 生成末尾覆盖整文件，`go_symbol` 模式可锁定 Go `func`、`method`、`type`、`var`、`const` 并只替换对应声明，method 可用 `symbolName=Receiver.Method` 精确区分同名接收者，grouped `type/var/const` 声明只替换命中的目标 spec，要求 marker 位于被锁定 symbol 或其 doc comment 内；同 scope 未过期 lease owner 不同时进入 conflict queue，同时支持用 locked content 的 package/import 上下文创建缺失 Go 文件、合并锁内容所需 imports、移除替换后不再使用的普通 imports，冲突会写入 `metadata/lock-conflicts.log`。
 - 共享沙盒当前支持**最小合并闸门**：只有 `DONE` 任务的成功产物才可进入 `SHARED` 沙盒；可在合并前执行契约校验并生成修复任务。directory provider 成功合并会把交付 ZIP materialize 到 `workspace/artifacts/<artifactId>/` 并写入共享 `.multiagent/workspace-manifest.json`；Git provider 会创建共享 worktree、对每个任务 head 执行 `git merge --no-ff`，并在成功后记录共享 `workspaceHeadRef`，随后可安全清理已合并的私有 worktree。
 - Timeline 当前支持**快照与回滚**：共享沙盒成功合并后会自动生成稳定快照；文件存储模式下快照会落盘 `state.json` 与 `manifest.json` 并记录 checksum，回滚可从 `file://` StateRef 解析状态并校验 checksum；Git provider 合并成功后会额外在快照中记录 `workspaceStateRef=repo://local/<branch>@<commit>` 与 `workspaceChecksum`，回滚到 Git workspace snapshot 时会校验 ref/checksum 并创建新的受管 shared rollback worktree/branch 指向 snapshot commit，不 reset、不覆盖原 shared worktree；共享沙盒集成失败时会自动回滚到最近稳定快照，并创建新的 branch 保留原时间线。
 - Preview Service 当前支持**最小可验收预览**：共享沙盒合并完成后可启动带 revision 检查的 Todo 预览页，便于验收演示。

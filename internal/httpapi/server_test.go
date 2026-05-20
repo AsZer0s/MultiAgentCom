@@ -1431,6 +1431,69 @@ func TestHTTPApplyCodeLock(t *testing.T) {
 	}
 }
 
+func TestHTTPApplyHumanOverrideLeaseConflict(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-http-human-override-conflict", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "http-manager-agent"}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{"name": "Override Conflict"})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/requirements", map[string]any{"title": "Todo", "content": "Support override conflicts."})
+	planBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/plan", map[string]any{})
+	var planResult service.PlanResult
+	decodeResponse(t, planBody, &planResult)
+	runBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/tasks/run", map[string]any{"taskId": planResult.Task.ID})
+	var runEnvelope service.RunEnvelope
+	decodeResponse(t, runBody, &runEnvelope)
+	waitForHTTPTaskStatus(t, server, project.ID, runEnvelope.Run.ID, domain.TaskStatusInProgress)
+
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/overrides", map[string]any{"taskId": planResult.Task.ID, "owner": "reviewer-a", "instruction": "first", "lockScope": "TASK", "ttlSeconds": 3600})
+	body := requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/overrides", map[string]any{"taskId": planResult.Task.ID, "owner": "reviewer-b", "instruction": "second", "lockScope": "TASK", "ttlSeconds": 3600}, http.StatusConflict)
+	var result service.HumanOverrideResult
+	decodeResponse(t, body, &result)
+	if result.Conflict == nil || result.Conflict.Kind != "human_override" || result.Conflict.Status != "OPEN" {
+		t.Fatalf("expected human override conflict result, got %+v", result)
+	}
+}
+
+func TestHTTPApplyCodeLockLeaseConflictAndResolve(t *testing.T) {
+	cfg := config.Config{Address: ":0", ServiceName: "test-http-code-lock-conflict", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "http-manager-agent"}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	projectBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects", map[string]any{"name": "Code Lock Conflict"})
+	var project domain.Project
+	decodeResponse(t, projectBody, &project)
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/locks", map[string]any{"path": "README.md", "content": "# LOCKED BY HUMAN\nfirst\n", "owner": "reviewer-a", "ttlSeconds": 3600})
+	body := requestJSONExpectStatus(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/locks", map[string]any{"path": "README.md", "content": "# LOCKED BY HUMAN\nsecond\n", "owner": "reviewer-b", "ttlSeconds": 3600}, http.StatusConflict)
+	var lockResult service.CodeLockResult
+	decodeResponse(t, body, &lockResult)
+	if lockResult.Conflict == nil || lockResult.Conflict.Kind != "code_lock" {
+		t.Fatalf("expected code lock conflict result, got %+v", lockResult)
+	}
+
+	listBody := getJSON(t, server.Client(), server.URL+"/projects/"+project.ID+"/conflicts")
+	var list struct {
+		Items []domain.ConflictQueueEntry `json:"items"`
+		Count int                         `json:"count"`
+	}
+	decodeResponse(t, listBody, &list)
+	if list.Count != 1 || list.Items[0].Status != "OPEN" {
+		t.Fatalf("expected one open conflict, got %+v", list)
+	}
+	resolveBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/projects/"+project.ID+"/conflicts/"+list.Items[0].ID+"/resolve", map[string]any{"resolvedBy": "lead", "resolutionNote": "accepted reviewer-a"})
+	var resolved domain.ConflictQueueEntry
+	decodeResponse(t, resolveBody, &resolved)
+	if resolved.Status != "RESOLVED" || resolved.ResolvedBy != "lead" {
+		t.Fatalf("expected resolved conflict by lead, got %+v", resolved)
+	}
+}
+
 func TestHTTPApplyCodeLockRejectsMarkerOutsideSelectedSymbol(t *testing.T) {
 	cfg := config.Config{Address: ":0", ServiceName: "test-http-code-lock-marker", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "http-manager-agent"}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

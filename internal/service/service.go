@@ -80,6 +80,8 @@ type Service struct {
 	overrides      map[string][]*domain.HumanOverride
 	lockIndex      map[string]*domain.CodeLock
 	locks          map[string][]*domain.CodeLock
+	conflictIndex  map[string]*domain.ConflictQueueEntry
+	conflicts      map[string][]*domain.ConflictQueueEntry
 	previewIndex   map[string]*domain.Preview
 	previews       map[string][]*domain.Preview
 	communications map[string][]*domain.CommunicationLog
@@ -277,15 +279,18 @@ type InjectSandboxFailureInput struct {
 type ApplyHumanOverrideInput struct {
 	TaskID      string `json:"taskId"`
 	Operator    string `json:"operator"`
+	Owner       string `json:"owner"`
 	Instruction string `json:"instruction"`
 	LockScope   string `json:"lockScope"`
+	TTLSeconds  int    `json:"ttlSeconds"`
 }
 
 type HumanOverrideResult struct {
-	Override domain.HumanOverride `json:"override"`
-	Task     domain.Task          `json:"task"`
-	Run      *domain.AgentRun     `json:"run,omitempty"`
-	Message  string               `json:"message,omitempty"`
+	Override domain.HumanOverride       `json:"override"`
+	Conflict *domain.ConflictQueueEntry `json:"conflict,omitempty"`
+	Task     domain.Task                `json:"task"`
+	Run      *domain.AgentRun           `json:"run,omitempty"`
+	Message  string                     `json:"message,omitempty"`
 }
 
 type ApplyCodeLockInput struct {
@@ -297,11 +302,19 @@ type ApplyCodeLockInput struct {
 	SymbolKind string `json:"symbolKind"`
 	SymbolName string `json:"symbolName"`
 	CreatedBy  string `json:"createdBy"`
+	Owner      string `json:"owner"`
+	TTLSeconds int    `json:"ttlSeconds"`
 }
 
 type CodeLockResult struct {
-	Lock    domain.CodeLock `json:"lock"`
-	Message string          `json:"message,omitempty"`
+	Lock     domain.CodeLock            `json:"lock"`
+	Conflict *domain.ConflictQueueEntry `json:"conflict,omitempty"`
+	Message  string                     `json:"message,omitempty"`
+}
+
+type ResolveConflictInput struct {
+	ResolvedBy     string `json:"resolvedBy"`
+	ResolutionNote string `json:"resolutionNote"`
 }
 
 type PreviewStartResult struct {
@@ -463,31 +476,32 @@ type snapshotManifest struct {
 }
 
 type persistedServiceState struct {
-	Version        int                                   `json:"version"`
-	Projects       map[string]*domain.Project            `json:"projects,omitempty"`
-	Requirements   map[string][]*domain.Requirement      `json:"requirements,omitempty"`
-	Plans          map[string][]*domain.Plan             `json:"plans,omitempty"`
-	Contracts      map[string][]*domain.Contract         `json:"contracts,omitempty"`
-	Contexts       map[string][]*domain.ContextInjection `json:"contexts,omitempty"`
-	Overrides      map[string][]*domain.HumanOverride    `json:"overrides,omitempty"`
-	Locks          map[string][]*domain.CodeLock         `json:"locks,omitempty"`
-	Previews       map[string][]*domain.Preview          `json:"previews,omitempty"`
-	Communications map[string][]*domain.CommunicationLog `json:"communications,omitempty"`
-	AuditLogs      map[string][]*domain.AuditLog         `json:"auditLogs,omitempty"`
-	Alerts         map[string][]*domain.Alert            `json:"alerts,omitempty"`
-	Sandboxes      map[string][]*domain.Sandbox          `json:"sandboxes,omitempty"`
-	SandboxFaults  map[string]string                     `json:"sandboxFaults,omitempty"`
-	Snapshots      map[string][]*domain.Snapshot         `json:"snapshots,omitempty"`
-	SnapshotState  map[string]*projectSnapshotState      `json:"snapshotState,omitempty"`
-	ProjectBranch  map[string]string                     `json:"projectBranch,omitempty"`
-	StableBranch   map[string]string                     `json:"stableBranch,omitempty"`
-	BranchSeq      map[string]int                        `json:"branchSeq,omitempty"`
-	Tasks          map[string]*domain.Task               `json:"tasks,omitempty"`
-	TaskOrder      map[string][]string                   `json:"taskOrder,omitempty"`
-	Runs           map[string]*domain.AgentRun           `json:"runs,omitempty"`
-	RunOrder       map[string][]string                   `json:"runOrder,omitempty"`
-	Artifacts      map[string]*domain.Artifact           `json:"artifacts,omitempty"`
-	ArtifactOrder  map[string][]string                   `json:"artifactOrder,omitempty"`
+	Version        int                                     `json:"version"`
+	Projects       map[string]*domain.Project              `json:"projects,omitempty"`
+	Requirements   map[string][]*domain.Requirement        `json:"requirements,omitempty"`
+	Plans          map[string][]*domain.Plan               `json:"plans,omitempty"`
+	Contracts      map[string][]*domain.Contract           `json:"contracts,omitempty"`
+	Contexts       map[string][]*domain.ContextInjection   `json:"contexts,omitempty"`
+	Overrides      map[string][]*domain.HumanOverride      `json:"overrides,omitempty"`
+	Locks          map[string][]*domain.CodeLock           `json:"locks,omitempty"`
+	Conflicts      map[string][]*domain.ConflictQueueEntry `json:"conflicts,omitempty"`
+	Previews       map[string][]*domain.Preview            `json:"previews,omitempty"`
+	Communications map[string][]*domain.CommunicationLog   `json:"communications,omitempty"`
+	AuditLogs      map[string][]*domain.AuditLog           `json:"auditLogs,omitempty"`
+	Alerts         map[string][]*domain.Alert              `json:"alerts,omitempty"`
+	Sandboxes      map[string][]*domain.Sandbox            `json:"sandboxes,omitempty"`
+	SandboxFaults  map[string]string                       `json:"sandboxFaults,omitempty"`
+	Snapshots      map[string][]*domain.Snapshot           `json:"snapshots,omitempty"`
+	SnapshotState  map[string]*projectSnapshotState        `json:"snapshotState,omitempty"`
+	ProjectBranch  map[string]string                       `json:"projectBranch,omitempty"`
+	StableBranch   map[string]string                       `json:"stableBranch,omitempty"`
+	BranchSeq      map[string]int                          `json:"branchSeq,omitempty"`
+	Tasks          map[string]*domain.Task                 `json:"tasks,omitempty"`
+	TaskOrder      map[string][]string                     `json:"taskOrder,omitempty"`
+	Runs           map[string]*domain.AgentRun             `json:"runs,omitempty"`
+	RunOrder       map[string][]string                     `json:"runOrder,omitempty"`
+	Artifacts      map[string]*domain.Artifact             `json:"artifacts,omitempty"`
+	ArtifactOrder  map[string][]string                     `json:"artifactOrder,omitempty"`
 }
 
 func New(cfg config.Config, logger *slog.Logger) *Service {
@@ -598,6 +612,8 @@ func (s *Service) resetStateLocked() {
 	s.overrides = make(map[string][]*domain.HumanOverride)
 	s.lockIndex = make(map[string]*domain.CodeLock)
 	s.locks = make(map[string][]*domain.CodeLock)
+	s.conflictIndex = make(map[string]*domain.ConflictQueueEntry)
+	s.conflicts = make(map[string][]*domain.ConflictQueueEntry)
 	s.previewIndex = make(map[string]*domain.Preview)
 	s.previews = make(map[string][]*domain.Preview)
 	s.communications = make(map[string][]*domain.CommunicationLog)
@@ -673,6 +689,7 @@ func (s *Service) capturePersistedStateLocked() *persistedServiceState {
 		Contexts:       cloneContextMap(s.contexts),
 		Overrides:      cloneOverrideMap(s.overrides),
 		Locks:          cloneLockMap(s.locks),
+		Conflicts:      cloneConflictQueueMap(s.conflicts),
 		Previews:       clonePreviewMap(s.previews),
 		Communications: cloneCommunicationMap(s.communications),
 		AuditLogs:      cloneAuditMap(s.auditLogs),
@@ -703,6 +720,7 @@ func (s *Service) restorePersistedStateLocked(state *persistedServiceState) {
 	s.contexts = cloneContextMap(state.Contexts)
 	s.overrides = cloneOverrideMap(state.Overrides)
 	s.locks = cloneLockMap(state.Locks)
+	s.conflicts = cloneConflictQueueMap(state.Conflicts)
 	s.previews = clonePreviewMap(state.Previews)
 	s.communications = cloneCommunicationMap(state.Communications)
 	s.auditLogs = cloneAuditMap(state.AuditLogs)
@@ -756,6 +774,13 @@ func (s *Service) rebuildIndexesLocked() {
 		for _, lock := range items {
 			if lock != nil {
 				s.lockIndex[lock.ID] = lock
+			}
+		}
+	}
+	for _, items := range s.conflicts {
+		for _, conflict := range items {
+			if conflict != nil {
+				s.conflictIndex[conflict.ID] = conflict
 			}
 		}
 	}
@@ -984,6 +1009,64 @@ func (s *Service) ListAlerts(_ context.Context, projectID string) ([]domain.Aler
 	}
 
 	return result, nil
+}
+
+func (s *Service) ListConflictQueue(_ context.Context, projectID string) ([]domain.ConflictQueueEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	items := s.conflicts[projectID]
+	result := make([]domain.ConflictQueueEntry, 0, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		result = append(result, *cloneConflictQueueEntry(item))
+	}
+
+	return result, nil
+}
+
+func (s *Service) ResolveConflictQueueEntry(ctx context.Context, projectID, conflictID string, input ResolveConflictInput) (*domain.ConflictQueueEntry, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	project, ok := s.projects[projectID]
+	if !ok {
+		return nil, newNotFoundError("project not found")
+	}
+
+	conflict, ok := s.conflictIndex[strings.TrimSpace(conflictID)]
+	if !ok || conflict.ProjectID != projectID {
+		return nil, newNotFoundError("conflict not found")
+	}
+	if conflict.Status != "OPEN" {
+		return nil, newConflictError("conflict is already resolved")
+	}
+
+	resolvedBy := strings.TrimSpace(input.ResolvedBy)
+	if resolvedBy == "" {
+		resolvedBy = ActorFromContext(ctx)
+	}
+	if resolvedBy == "" {
+		resolvedBy = "human-operator"
+	}
+
+	conflict.Status = "RESOLVED"
+	conflict.ResolvedAt = now
+	conflict.ResolvedBy = resolvedBy
+	conflict.ResolutionNote = strings.TrimSpace(input.ResolutionNote)
+	project.UpdatedAt = now
+	s.recordAuditLocked(ctx, projectID, "HITL_CONFLICT_RESOLVED", "conflict", conflict.ID, "HITL conflict resolved for "+conflict.Scope, now)
+	s.persistLocked()
+
+	return cloneConflictQueueEntry(conflict), nil
 }
 
 func (s *Service) GetTokenCostTrend(_ context.Context, projectID, taskID string) (*TokenCostTrend, error) {
@@ -1312,17 +1395,35 @@ func (s *Service) ApplyHumanOverride(ctx context.Context, projectID string, inpu
 		return nil, newConflictError("only in-progress tasks can receive human override")
 	}
 
+	operator := strings.TrimSpace(input.Operator)
+	owner := hitlOwner(ctx, input.Owner, operator)
+	expiresAt, err := hitlExpiresAt(now, input.TTLSeconds)
+	if err != nil {
+		return nil, err
+	}
+	lockScope := strings.TrimSpace(input.LockScope)
+	if lockScope == "" {
+		lockScope = "TASK"
+	}
+	if conflict := s.findActiveOverrideConflictLocked(ctx, projectID, task.ID, lockScope, owner, now); conflict != nil {
+		project.UpdatedAt = now
+		s.persistLocked()
+		result := &HumanOverrideResult{Conflict: cloneConflictQueueEntry(conflict), Message: "human override lease conflict queued"}
+		return result, newConflictError("human override lease conflict queued")
+	}
 	override := &domain.HumanOverride{
 		ID:          nextID("override"),
 		ProjectID:   projectID,
 		TaskID:      task.ID,
-		Operator:    strings.TrimSpace(input.Operator),
+		Operator:    operator,
+		Owner:       owner,
 		Instruction: strings.TrimSpace(input.Instruction),
-		LockScope:   strings.TrimSpace(input.LockScope),
+		LockScope:   lockScope,
+		ExpiresAt:   expiresAt,
 		CreatedAt:   now,
 	}
 	if override.Operator == "" {
-		override.Operator = "human-operator"
+		override.Operator = owner
 	}
 
 	if task.Status == domain.TaskStatusInProgress {
@@ -1391,6 +1492,13 @@ func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input App
 		}
 	}
 
+	createdBy := strings.TrimSpace(input.CreatedBy)
+	owner := hitlOwner(ctx, input.Owner, createdBy)
+	expiresAt, err := hitlExpiresAt(now, input.TTLSeconds)
+	if err != nil {
+		return nil, err
+	}
+
 	lock := &domain.CodeLock{
 		ID:         nextID("lock"),
 		ProjectID:  projectID,
@@ -1401,11 +1509,18 @@ func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input App
 		Language:   language,
 		SymbolKind: symbolKind,
 		SymbolName: symbolName,
-		CreatedBy:  strings.TrimSpace(input.CreatedBy),
+		CreatedBy:  createdBy,
+		Owner:      owner,
+		ExpiresAt:  expiresAt,
 		CreatedAt:  now,
 	}
 	if lock.CreatedBy == "" {
-		lock.CreatedBy = "human-operator"
+		lock.CreatedBy = owner
+	}
+	if conflict := s.findActiveCodeLockConflictLocked(ctx, projectID, lock, now); conflict != nil {
+		project.UpdatedAt = now
+		s.persistLocked()
+		return &CodeLockResult{Conflict: cloneConflictQueueEntry(conflict), Message: "code lock lease conflict queued"}, newConflictError("code lock lease conflict queued")
 	}
 
 	s.lockIndex[lock.ID] = lock
@@ -3104,7 +3219,7 @@ func (s *Service) applyPendingHumanOverrideLocked(runID string) (*domain.HumanOv
 
 	for idx := len(s.overrides[run.ProjectID]) - 1; idx >= 0; idx-- {
 		override := s.overrides[run.ProjectID][idx]
-		if override.TaskID != task.ID || !override.AppliedAt.IsZero() {
+		if override.TaskID != task.ID || !override.AppliedAt.IsZero() || !hitlLeaseActive(now, override.ExpiresAt) {
 			continue
 		}
 
@@ -3122,19 +3237,34 @@ func (s *Service) applyPendingHumanOverrideLocked(runID string) (*domain.HumanOv
 }
 
 func (s *Service) applyProjectLocksToBundle(projectID, taskID, bundleDir string) error {
+	now := time.Now().UTC()
 	s.mu.RLock()
 	locks := append([]*domain.CodeLock(nil), s.locks[projectID]...)
 	s.mu.RUnlock()
 
 	conflicts := make([]string, 0)
+	activeScopes := make(map[string]*domain.CodeLock)
 	for _, lock := range locks {
-		if lock == nil {
+		if lock == nil || !hitlLeaseActive(now, lock.ExpiresAt) {
 			continue
 		}
 		if lock.TaskID != "" && lock.TaskID != taskID {
 			continue
 		}
+		if existing := activeScopes[codeLockScope(lock)]; existing != nil && hitlLockOwner(existing) != hitlLockOwner(lock) {
+			conflicts = append(conflicts, fmt.Sprintf("conflicting active code locks for %s between %s and %s; latest lock %s takes precedence", lock.Path, hitlLockOwner(existing), hitlLockOwner(lock), lock.ID))
+			s.recordCodeLockApplyConflict(projectID, taskID, existing, lock)
+		}
+		activeScopes[codeLockScope(lock)] = lock
+	}
 
+	scopes := make([]string, 0, len(activeScopes))
+	for scope := range activeScopes {
+		scopes = append(scopes, scope)
+	}
+	sort.Strings(scopes)
+	for _, scope := range scopes {
+		lock := activeScopes[scope]
 		targetPath := filepath.Join(bundleDir, filepath.FromSlash(lock.Path))
 		switch normalizeLockMode(lock.LockMode) {
 		case "file":
@@ -3162,6 +3292,18 @@ func (s *Service) applyProjectLocksToBundle(projectID, taskID, bundleDir string)
 	}
 
 	return nil
+}
+
+func (s *Service) recordCodeLockApplyConflict(projectID, taskID string, existing, requested *domain.CodeLock) {
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	conflict := s.enqueueConflictLocked(context.Background(), projectID, taskID, "code_lock_apply", codeLockScope(requested), requested.ID, hitlLockOwner(requested), hitlLockOwner(existing), "active code locks with different owners matched the same scope", now)
+	if project := s.projects[projectID]; project != nil {
+		project.UpdatedAt = now
+	}
+	s.persistLocked()
+	_ = conflict
 }
 
 func normalizeLockMode(mode string) string {
@@ -3650,6 +3792,123 @@ func (s *Service) resolveLatestReleasedSharedSandboxLocked(projectID string) (*d
 		}
 	}
 	return nil, newConflictError("no released shared sandbox available for preview")
+}
+
+func hitlOwner(ctx context.Context, explicit, fallback string) string {
+	for _, candidate := range []string{explicit, ActorFromContext(ctx), fallback, "human-operator"} {
+		if owner := strings.TrimSpace(candidate); owner != "" {
+			return owner
+		}
+	}
+	return "human-operator"
+}
+
+func hitlExpiresAt(now time.Time, ttlSeconds int) (time.Time, error) {
+	if ttlSeconds < 0 {
+		return time.Time{}, newValidationError("ttlSeconds must be non-negative")
+	}
+	if ttlSeconds == 0 {
+		ttlSeconds = 3600
+	}
+	return now.Add(time.Duration(ttlSeconds) * time.Second), nil
+}
+
+func hitlLeaseActive(now, expiresAt time.Time) bool {
+	return expiresAt.IsZero() || now.Before(expiresAt)
+}
+
+func overrideScope(taskID, lockScope string) string {
+	lockScope = strings.TrimSpace(lockScope)
+	if lockScope == "" {
+		lockScope = "TASK"
+	}
+	return "task:" + strings.TrimSpace(taskID) + ":" + strings.ToLower(lockScope)
+}
+
+func codeLockScope(lock *domain.CodeLock) string {
+	if lock == nil {
+		return ""
+	}
+	lockMode := normalizeLockMode(lock.LockMode)
+	if lockMode == "go_symbol" {
+		return strings.Join([]string{"go_symbol", filepath.ToSlash(lock.Path), strings.ToLower(strings.TrimSpace(lock.SymbolKind)), strings.TrimSpace(lock.SymbolName)}, ":")
+	}
+	return "file:" + filepath.ToSlash(strings.TrimSpace(lock.Path))
+}
+
+func hitlOverrideOwner(override *domain.HumanOverride) string {
+	if override == nil {
+		return ""
+	}
+	if owner := strings.TrimSpace(override.Owner); owner != "" {
+		return owner
+	}
+	if operator := strings.TrimSpace(override.Operator); operator != "" {
+		return operator
+	}
+	return "human-operator"
+}
+
+func hitlLockOwner(lock *domain.CodeLock) string {
+	if lock == nil {
+		return ""
+	}
+	if owner := strings.TrimSpace(lock.Owner); owner != "" {
+		return owner
+	}
+	if createdBy := strings.TrimSpace(lock.CreatedBy); createdBy != "" {
+		return createdBy
+	}
+	return "human-operator"
+}
+
+func (s *Service) findActiveOverrideConflictLocked(ctx context.Context, projectID, taskID, lockScope, requestedOwner string, now time.Time) *domain.ConflictQueueEntry {
+	scope := overrideScope(taskID, lockScope)
+	for _, override := range s.overrides[projectID] {
+		if override == nil || override.TaskID != taskID || !override.AppliedAt.IsZero() || !hitlLeaseActive(now, override.ExpiresAt) {
+			continue
+		}
+		currentOwner := hitlOverrideOwner(override)
+		if currentOwner != requestedOwner && overrideScope(override.TaskID, override.LockScope) == scope {
+			return s.enqueueConflictLocked(ctx, projectID, taskID, "human_override", scope, override.ID, requestedOwner, currentOwner, "active human override lease is owned by another operator", now)
+		}
+	}
+	return nil
+}
+
+func (s *Service) findActiveCodeLockConflictLocked(ctx context.Context, projectID string, requested *domain.CodeLock, now time.Time) *domain.ConflictQueueEntry {
+	requestedScope := codeLockScope(requested)
+	requestedOwner := hitlLockOwner(requested)
+	for _, lock := range s.locks[projectID] {
+		if lock == nil || !hitlLeaseActive(now, lock.ExpiresAt) || codeLockScope(lock) != requestedScope {
+			continue
+		}
+		currentOwner := hitlLockOwner(lock)
+		if currentOwner != requestedOwner {
+			return s.enqueueConflictLocked(ctx, projectID, requested.TaskID, "code_lock", requestedScope, lock.ID, requestedOwner, currentOwner, "active code lock lease is owned by another operator", now)
+		}
+	}
+	return nil
+}
+
+func (s *Service) enqueueConflictLocked(ctx context.Context, projectID, taskID, kind, scope, resourceID, requestedOwner, currentOwner, reason string, now time.Time) *domain.ConflictQueueEntry {
+	conflict := &domain.ConflictQueueEntry{
+		ID:             nextID("conflict"),
+		ProjectID:      projectID,
+		TaskID:         strings.TrimSpace(taskID),
+		Kind:           strings.TrimSpace(kind),
+		Scope:          strings.TrimSpace(scope),
+		ResourceID:     strings.TrimSpace(resourceID),
+		RequestedOwner: strings.TrimSpace(requestedOwner),
+		CurrentOwner:   strings.TrimSpace(currentOwner),
+		Reason:         strings.TrimSpace(reason),
+		Status:         "OPEN",
+		CreatedAt:      now,
+	}
+	s.conflictIndex[conflict.ID] = conflict
+	s.conflicts[projectID] = append(s.conflicts[projectID], conflict)
+	s.recordAuditLocked(ctx, projectID, "HITL_CONFLICT_QUEUED", "conflict", conflict.ID, conflict.Reason, now)
+	return conflict
 }
 
 func (s *Service) recordCommunicationLocked(projectID, from, to, messageType, taskID, payloadRef string, now time.Time) {
@@ -5886,6 +6145,14 @@ func cloneCodeLock(lock *domain.CodeLock) *domain.CodeLock {
 	return &copy
 }
 
+func cloneConflictQueueEntry(conflict *domain.ConflictQueueEntry) *domain.ConflictQueueEntry {
+	if conflict == nil {
+		return nil
+	}
+	copy := *conflict
+	return &copy
+}
+
 func clonePreview(preview *domain.Preview) *domain.Preview {
 	if preview == nil {
 		return nil
@@ -5975,6 +6242,17 @@ func cloneLockMap(items map[string][]*domain.CodeLock) map[string][]*domain.Code
 		result[key] = make([]*domain.CodeLock, 0, len(history))
 		for _, item := range history {
 			result[key] = append(result[key], cloneCodeLock(item))
+		}
+	}
+	return result
+}
+
+func cloneConflictQueueMap(items map[string][]*domain.ConflictQueueEntry) map[string][]*domain.ConflictQueueEntry {
+	result := make(map[string][]*domain.ConflictQueueEntry, len(items))
+	for key, history := range items {
+		result[key] = make([]*domain.ConflictQueueEntry, 0, len(history))
+		for _, item := range history {
+			result[key] = append(result[key], cloneConflictQueueEntry(item))
 		}
 	}
 	return result

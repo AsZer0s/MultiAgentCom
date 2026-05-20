@@ -147,8 +147,10 @@ type HumanOverride struct {
 	ProjectID   string    `json:"projectId"`
 	TaskID      string    `json:"taskId"`
 	Operator    string    `json:"operator"`
+	Owner       string    `json:"owner,omitempty"`
 	Instruction string    `json:"instruction"`
 	LockScope   string    `json:"lockScope,omitempty"`
+	ExpiresAt   time.Time `json:"expiresAt,omitempty"`
 	CreatedAt   time.Time `json:"createdAt"`
 	AppliedAt   time.Time `json:"appliedAt,omitempty"`
 }
@@ -164,7 +166,26 @@ type CodeLock struct {
 	SymbolKind string    `json:"symbolKind,omitempty"`
 	SymbolName string    `json:"symbolName,omitempty"`
 	CreatedBy  string    `json:"createdBy"`
+	Owner      string    `json:"owner,omitempty"`
+	ExpiresAt  time.Time `json:"expiresAt,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
+}
+
+type ConflictQueueEntry struct {
+	ID             string    `json:"id"`
+	ProjectID      string    `json:"projectId"`
+	TaskID         string    `json:"taskId,omitempty"`
+	Kind           string    `json:"kind"`
+	Scope          string    `json:"scope"`
+	ResourceID     string    `json:"resourceId,omitempty"`
+	RequestedOwner string    `json:"requestedOwner,omitempty"`
+	CurrentOwner   string    `json:"currentOwner,omitempty"`
+	Reason         string    `json:"reason"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"createdAt"`
+	ResolvedAt     time.Time `json:"resolvedAt,omitempty"`
+	ResolvedBy     string    `json:"resolvedBy,omitempty"`
+	ResolutionNote string    `json:"resolutionNote,omitempty"`
 }
 
 type Preview struct {

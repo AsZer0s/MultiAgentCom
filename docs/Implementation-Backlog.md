@@ -326,6 +326,12 @@
 - **目标：** 补强 Go symbol lock 的 marker 归属校验与缺失目标文件创建能力。
 - **DoD：** `LOCKED BY HUMAN` 必须位于被锁定 symbol/doc comment 内；method 支持 `Receiver.Method` 精确区分同名 receiver；grouped `type/var/const` 只替换命中的目标 spec；缺失 Go 文件可由 locked content 的 package/import 上下文创建；service/HTTP 测试覆盖 marker 拒绝、doc comment 保留、receiver 区分、grouped spec 精确替换和缺失文件创建。
 
+### BL-910 HITL lock lease and conflict queue
+- **优先级：** P1
+- **估时：** 1.5 PD
+- **目标：** 将 HITL override / code lock 升级为带 owner lease 的本地治理流程。
+- **DoD：** override/lock 支持 `owner` 与 `ttlSeconds`；同 scope 未过期 lease owner 不同时进入 `OPEN` conflict queue；conflict 可查询与 resolve；file-store 持久化与 audit 覆盖通过。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：
