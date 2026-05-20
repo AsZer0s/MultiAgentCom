@@ -3738,6 +3738,133 @@ const maxTodos = 99
 	}
 }
 
+func TestGoSymbolCodeLockDisambiguatesMethodReceiver(t *testing.T) {
+	targetPath := filepath.Join(t.TempDir(), "generated-app", "main.go")
+	targetSource := []byte(`package main
+
+type todo struct{}
+
+type user struct{}
+
+func (t todo) label() string {
+	return "todo-generated"
+}
+
+func (u user) label() string {
+	return "user-generated"
+}
+`)
+	if err := writeFile(targetPath, targetSource); err != nil {
+		t.Fatalf("write target source: %v", err)
+	}
+	lock := &domain.CodeLock{
+		Path: "generated-app/main.go",
+		Content: `package main
+
+func (u user) label() string {
+	// LOCKED BY HUMAN
+	return "user-human"
+}
+`,
+		LockMode:   "go_symbol",
+		Language:   "go",
+		SymbolKind: "method",
+		SymbolName: "user.label",
+		CreatedBy:  "reviewer",
+	}
+	changed, _, err := applyGoSymbolLock(targetPath, lock)
+	if err != nil {
+		t.Fatalf("apply go symbol lock: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected lock to change target source")
+	}
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("read target source: %v", err)
+	}
+	source := string(data)
+	if !strings.Contains(source, `return "todo-generated"`) || !strings.Contains(source, `return "user-human"`) || strings.Contains(source, `return "user-generated"`) {
+		t.Fatalf("expected only user.label to be replaced, got:\n%s", source)
+	}
+}
+
+func TestGoSymbolCodeLockDisambiguatesPointerAndGenericMethodReceiver(t *testing.T) {
+	targetPath := filepath.Join(t.TempDir(), "generated-app", "main.go")
+	targetSource := []byte(`package main
+
+type box[T any] struct{}
+
+type todo struct{}
+
+func (b *box[T]) label() string {
+	return "box-generated"
+}
+
+func (t todo) label() string {
+	return "todo-generated"
+}
+`)
+	if err := writeFile(targetPath, targetSource); err != nil {
+		t.Fatalf("write target source: %v", err)
+	}
+	lock := &domain.CodeLock{
+		Path: "generated-app/main.go",
+		Content: `package main
+
+func (b *box[T]) label() string {
+	// LOCKED BY HUMAN
+	return "box-human"
+}
+`,
+		LockMode:   "go_symbol",
+		Language:   "go",
+		SymbolKind: "method",
+		SymbolName: "box.label",
+		CreatedBy:  "reviewer",
+	}
+	if _, _, err := applyGoSymbolLock(targetPath, lock); err != nil {
+		t.Fatalf("apply go symbol lock: %v", err)
+	}
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("read target source: %v", err)
+	}
+	source := string(data)
+	if !strings.Contains(source, `return "box-human"`) || !strings.Contains(source, `return "todo-generated"`) {
+		t.Fatalf("expected only box.label to be replaced, got:\n%s", source)
+	}
+}
+
+func TestGoSymbolCodeLockRejectsUnknownMethodReceiver(t *testing.T) {
+	svc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	ctx := context.Background()
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Unknown Receiver Lock Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	_, err = svc.ApplyCodeLock(ctx, project.ID, ApplyCodeLockInput{
+		Path: "generated-app/main.go",
+		Content: `package main
+
+type user struct{}
+
+func (u user) label() string {
+	// LOCKED BY HUMAN
+	return "user"
+}
+`,
+		LockMode:   "go_symbol",
+		Language:   "go",
+		SymbolKind: "method",
+		SymbolName: "todo.label",
+		CreatedBy:  "reviewer",
+	})
+	if err == nil || !strings.Contains(err.Error(), "method todo.label") {
+		t.Fatalf("expected unknown method receiver validation error, got %v", err)
+	}
+}
+
 func TestGoSymbolCodeLockRejectsInvalidInput(t *testing.T) {
 	svc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	ctx := context.Background()

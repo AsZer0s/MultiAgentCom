@@ -324,7 +324,7 @@
 - **优先级：** P1
 - **估时：** 1 PD
 - **目标：** 补强 Go symbol lock 的 marker 归属校验与缺失目标文件创建能力。
-- **DoD：** `LOCKED BY HUMAN` 必须位于被锁定 symbol/doc comment 内；缺失 Go 文件可由 locked content 的 package/import 上下文创建；service/HTTP 测试覆盖 marker 拒绝、doc comment 保留和缺失文件创建。
+- **DoD：** `LOCKED BY HUMAN` 必须位于被锁定 symbol/doc comment 内；method 支持 `Receiver.Method` 精确区分同名 receiver；缺失 Go 文件可由 locked content 的 package/import 上下文创建；service/HTTP 测试覆盖 marker 拒绝、doc comment 保留、receiver 区分和缺失文件创建。
 
 ## 8. 依赖总览（关键路径）
 

@@ -3194,7 +3194,8 @@ func validateCodeLock(path, content, lockMode, language, symbolKind, symbolName 
 	if symbolName == "" {
 		return newValidationError("symbolName is required for go_symbol locks")
 	}
-	start, end, err := findGoSymbol([]byte(content), symbolKind, symbolName)
+	symbolSelector := parseGoSymbolSelector(symbolKind, symbolName)
+	start, end, err := findGoSymbol([]byte(content), symbolKind, symbolSelector)
 	if err != nil {
 		return newValidationError(err.Error())
 	}
@@ -3210,19 +3211,20 @@ func applyGoSymbolLock(targetPath string, lock *domain.CodeLock) (bool, string, 
 		return false, "", err
 	}
 	locked := []byte(lock.Content)
-	lockedStart, lockedEnd, err := findGoSymbol(locked, lock.SymbolKind, lock.SymbolName)
+	symbolSelector := parseGoSymbolSelector(lock.SymbolKind, lock.SymbolName)
+	lockedStart, lockedEnd, err := findGoSymbol(locked, lock.SymbolKind, symbolSelector)
 	if err != nil {
 		return false, "", err
 	}
 	lockedSymbol := locked[lockedStart:lockedEnd]
 	if len(target) == 0 {
-		merged, err := goLockedSymbolFile(locked, lock.SymbolKind, lock.SymbolName)
+		merged, err := goLockedSymbolFile(locked, lock.SymbolKind, symbolSelector)
 		if err != nil {
 			return false, "", err
 		}
 		return true, fmt.Sprintf("created %s with locked Go %s %s from %s", lock.Path, lock.SymbolKind, lock.SymbolName, lock.CreatedBy), writeFile(targetPath, merged)
 	}
-	targetStart, targetEnd, err := findGoSymbol(target, lock.SymbolKind, lock.SymbolName)
+	targetStart, targetEnd, err := findGoSymbol(target, lock.SymbolKind, symbolSelector)
 	if err != nil {
 		if _, parseErr := parser.ParseFile(token.NewFileSet(), targetPath, target, parser.ParseComments); parseErr != nil {
 			return false, "", fmt.Errorf("parse generated Go target %s: %w", lock.Path, parseErr)
@@ -3446,7 +3448,23 @@ func isSupportedGoSymbolKind(kind string) bool {
 	}
 }
 
-func findGoSymbol(source []byte, symbolKind, symbolName string) (int, int, error) {
+type goSymbolSelector struct {
+	Name     string
+	Receiver string
+}
+
+func parseGoSymbolSelector(symbolKind, symbolName string) goSymbolSelector {
+	selector := goSymbolSelector{Name: strings.TrimSpace(symbolName)}
+	if strings.EqualFold(strings.TrimSpace(symbolKind), "method") {
+		if receiver, name, ok := strings.Cut(selector.Name, "."); ok {
+			selector.Receiver = strings.TrimSpace(receiver)
+			selector.Name = strings.TrimSpace(name)
+		}
+	}
+	return selector
+}
+
+func findGoSymbol(source []byte, symbolKind string, selector goSymbolSelector) (int, int, error) {
 	fileSet := token.NewFileSet()
 	file, err := parser.ParseFile(fileSet, "lock.go", source, parser.ParseComments)
 	if err != nil {
@@ -3454,20 +3472,27 @@ func findGoSymbol(source []byte, symbolKind, symbolName string) (int, int, error
 	}
 	symbolKind = strings.ToLower(strings.TrimSpace(symbolKind))
 	for _, decl := range file.Decls {
-		if start, end, ok := goDeclSymbolRange(fileSet, decl, symbolKind, symbolName); ok {
+		if start, end, ok := goDeclSymbolRange(fileSet, decl, symbolKind, selector); ok {
 			return start, end, nil
 		}
 	}
-	return 0, 0, fmt.Errorf("go_symbol lock content must contain Go %s %s", symbolKind, symbolName)
+	return 0, 0, fmt.Errorf("go_symbol lock content must contain Go %s %s", symbolKind, selector.DisplayName())
 }
 
-func goDeclSymbolRange(fileSet *token.FileSet, decl ast.Decl, symbolKind, symbolName string) (int, int, bool) {
+func (s goSymbolSelector) DisplayName() string {
+	if s.Receiver != "" {
+		return s.Receiver + "." + s.Name
+	}
+	return s.Name
+}
+
+func goDeclSymbolRange(fileSet *token.FileSet, decl ast.Decl, symbolKind string, selector goSymbolSelector) (int, int, bool) {
 	switch typedDecl := decl.(type) {
 	case *ast.FuncDecl:
-		if typedDecl.Name == nil || typedDecl.Name.Name != symbolName {
+		if typedDecl.Name == nil || typedDecl.Name.Name != selector.Name {
 			return 0, 0, false
 		}
-		if symbolKind == "func" && typedDecl.Recv == nil || symbolKind == "method" && typedDecl.Recv != nil {
+		if symbolKind == "func" && typedDecl.Recv == nil || symbolKind == "method" && goMethodReceiverMatches(typedDecl, selector.Receiver) {
 			return goNodeStartOffset(fileSet, typedDecl.Doc, typedDecl.Pos()), fileSet.Position(typedDecl.End()).Offset, true
 		}
 	case *ast.GenDecl:
@@ -3475,12 +3500,41 @@ func goDeclSymbolRange(fileSet *token.FileSet, decl ast.Decl, symbolKind, symbol
 			return 0, 0, false
 		}
 		for _, spec := range typedDecl.Specs {
-			if goSpecName(spec) == symbolName {
+			if goSpecName(spec) == selector.Name {
 				return goNodeStartOffset(fileSet, typedDecl.Doc, typedDecl.Pos()), fileSet.Position(typedDecl.End()).Offset, true
 			}
 		}
 	}
 	return 0, 0, false
+}
+
+func goMethodReceiverMatches(decl *ast.FuncDecl, receiver string) bool {
+	if decl.Recv == nil {
+		return false
+	}
+	if receiver == "" {
+		return true
+	}
+	for _, field := range decl.Recv.List {
+		if goReceiverTypeName(field.Type) == receiver {
+			return true
+		}
+	}
+	return false
+}
+
+func goReceiverTypeName(expr ast.Expr) string {
+	switch typedExpr := expr.(type) {
+	case *ast.Ident:
+		return typedExpr.Name
+	case *ast.StarExpr:
+		return goReceiverTypeName(typedExpr.X)
+	case *ast.IndexExpr:
+		return goReceiverTypeName(typedExpr.X)
+	case *ast.IndexListExpr:
+		return goReceiverTypeName(typedExpr.X)
+	}
+	return ""
 }
 
 func goNodeStartOffset(fileSet *token.FileSet, doc *ast.CommentGroup, fallback token.Pos) int {
@@ -3490,13 +3544,13 @@ func goNodeStartOffset(fileSet *token.FileSet, doc *ast.CommentGroup, fallback t
 	return fileSet.Position(fallback).Offset
 }
 
-func goLockedSymbolFile(source []byte, symbolKind, symbolName string) ([]byte, error) {
+func goLockedSymbolFile(source []byte, symbolKind string, selector goSymbolSelector) ([]byte, error) {
 	fileSet := token.NewFileSet()
 	file, err := parser.ParseFile(fileSet, "lock.go", source, parser.ParseComments)
 	if err != nil {
 		return nil, fmt.Errorf("go_symbol lock content must be parseable Go: %w", err)
 	}
-	start, end, err := findGoSymbol(source, symbolKind, symbolName)
+	start, end, err := findGoSymbol(source, symbolKind, selector)
 	if err != nil {
 		return nil, err
 	}
