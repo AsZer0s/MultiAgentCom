@@ -3738,6 +3738,123 @@ const maxTodos = 99
 	}
 }
 
+func TestGoSymbolCodeLockReplacesOnlyGroupedValueSpec(t *testing.T) {
+	cases := []struct {
+		name       string
+		symbolKind string
+		symbolName string
+		target     string
+		locked     string
+		want       []string
+		wantAbsent []string
+	}{
+		{
+			name:       "var",
+			symbolKind: "var",
+			symbolName: "defaultTitle",
+			target: `package main
+
+var (
+	defaultTitle = "generated"
+	maxTitle     = "keep"
+)
+`,
+			locked: `package main
+
+var (
+	// LOCKED BY HUMAN
+	defaultTitle = "human"
+	ignoredTitle = "should-not-copy"
+)
+`,
+			want:       []string{`defaultTitle`, `"human"`, `maxTitle`, `"keep"`},
+			wantAbsent: []string{`ignoredTitle`, `defaultTitle = "generated"`},
+		},
+		{
+			name:       "const",
+			symbolKind: "const",
+			symbolName: "maxTodos",
+			target: `package main
+
+const (
+	minTodos = 1
+	maxTodos = 10
+)
+`,
+			locked: `package main
+
+const (
+	// LOCKED BY HUMAN
+	maxTodos = 99
+	ignoredTodos = 100
+)
+`,
+			want:       []string{`minTodos = 1`, `maxTodos = 99`},
+			wantAbsent: []string{`ignoredTodos`, `maxTodos = 10`},
+		},
+		{
+			name:       "type",
+			symbolKind: "type",
+			symbolName: "todo",
+			target: `package main
+
+type (
+	todo struct {
+		ID string
+	}
+	user struct {
+		Name string
+	}
+)
+`,
+			locked: `package main
+
+type (
+	// LOCKED BY HUMAN
+	todo struct {
+		ID string
+		Title string
+	}
+	ignored struct{}
+)
+`,
+			want:       []string{`Title string`, `user struct`},
+			wantAbsent: []string{`ignored struct`},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			targetPath := filepath.Join(t.TempDir(), "generated-app", "main.go")
+			if err := writeFile(targetPath, []byte(tc.target)); err != nil {
+				t.Fatalf("write target source: %v", err)
+			}
+			lock := &domain.CodeLock{Path: "generated-app/main.go", Content: tc.locked, LockMode: "go_symbol", Language: "go", SymbolKind: tc.symbolKind, SymbolName: tc.symbolName, CreatedBy: "reviewer"}
+			if _, _, err := applyGoSymbolLock(targetPath, lock); err != nil {
+				t.Fatalf("apply go symbol lock: %v", err)
+			}
+			data, err := os.ReadFile(targetPath)
+			if err != nil {
+				t.Fatalf("read target source: %v", err)
+			}
+			source := string(data)
+			for _, fragment := range tc.want {
+				if !strings.Contains(source, fragment) {
+					t.Fatalf("expected grouped %s lock to preserve %s, got:\n%s", tc.symbolKind, fragment, source)
+				}
+			}
+			for _, fragment := range tc.wantAbsent {
+				if strings.Contains(source, fragment) {
+					t.Fatalf("expected grouped %s lock to exclude %s, got:\n%s", tc.symbolKind, fragment, source)
+				}
+			}
+			if _, err := parser.ParseFile(token.NewFileSet(), targetPath, data, parser.ParseComments); err != nil {
+				t.Fatalf("expected rewritten source to parse: %v\n%s", err, source)
+			}
+		})
+	}
+}
+
 func TestGoSymbolCodeLockDisambiguatesMethodReceiver(t *testing.T) {
 	targetPath := filepath.Join(t.TempDir(), "generated-app", "main.go")
 	targetSource := []byte(`package main

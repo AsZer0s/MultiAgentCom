@@ -3212,11 +3212,10 @@ func applyGoSymbolLock(targetPath string, lock *domain.CodeLock) (bool, string, 
 	}
 	locked := []byte(lock.Content)
 	symbolSelector := parseGoSymbolSelector(lock.SymbolKind, lock.SymbolName)
-	lockedStart, lockedEnd, err := findGoSymbol(locked, lock.SymbolKind, symbolSelector)
+	lockedMatch, err := findGoSymbolMatch(locked, lock.SymbolKind, symbolSelector)
 	if err != nil {
 		return false, "", err
 	}
-	lockedSymbol := locked[lockedStart:lockedEnd]
 	if len(target) == 0 {
 		merged, err := goLockedSymbolFile(locked, lock.SymbolKind, symbolSelector)
 		if err != nil {
@@ -3224,21 +3223,23 @@ func applyGoSymbolLock(targetPath string, lock *domain.CodeLock) (bool, string, 
 		}
 		return true, fmt.Sprintf("created %s with locked Go %s %s from %s", lock.Path, lock.SymbolKind, lock.SymbolName, lock.CreatedBy), writeFile(targetPath, merged)
 	}
-	targetStart, targetEnd, err := findGoSymbol(target, lock.SymbolKind, symbolSelector)
+	targetMatch, err := findGoSymbolMatch(target, lock.SymbolKind, symbolSelector)
 	if err != nil {
 		if _, parseErr := parser.ParseFile(token.NewFileSet(), targetPath, target, parser.ParseComments); parseErr != nil {
 			return false, "", fmt.Errorf("parse generated Go target %s: %w", lock.Path, parseErr)
 		}
-		merged, err := reconcileGoImports(append(appendNewline(target), appendNewline(lockedSymbol)...), locked)
+		lockedDecl := goSymbolTopLevelDeclaration(locked, lockedMatch)
+		merged, err := reconcileGoImports(append(appendNewline(target), appendNewline(lockedDecl)...), locked)
 		if err != nil {
 			return false, "", err
 		}
 		return true, fmt.Sprintf("appended locked Go %s %s to %s because generated target was missing it", lock.SymbolKind, lock.SymbolName, lock.Path), writeFile(targetPath, merged)
 	}
-	merged := make([]byte, 0, len(target)-targetEnd+targetStart+len(lockedSymbol))
-	merged = append(merged, target[:targetStart]...)
+	lockedSymbol := goSymbolReplacementFragment(locked, lockedMatch, targetMatch.Grouped)
+	merged := make([]byte, 0, len(target)-targetMatch.End+targetMatch.Start+len(lockedSymbol))
+	merged = append(merged, target[:targetMatch.Start]...)
 	merged = append(merged, lockedSymbol...)
-	merged = append(merged, target[targetEnd:]...)
+	merged = append(merged, target[targetMatch.End:]...)
 	merged, err = reconcileGoImports(merged, locked)
 	if err != nil {
 		return false, "", err
@@ -3453,6 +3454,14 @@ type goSymbolSelector struct {
 	Receiver string
 }
 
+type goSymbolMatch struct {
+	Start     int
+	End       int
+	DeclStart int
+	DeclEnd   int
+	Grouped   bool
+}
+
 func parseGoSymbolSelector(symbolKind, symbolName string) goSymbolSelector {
 	selector := goSymbolSelector{Name: strings.TrimSpace(symbolName)}
 	if strings.EqualFold(strings.TrimSpace(symbolKind), "method") {
@@ -3465,18 +3474,26 @@ func parseGoSymbolSelector(symbolKind, symbolName string) goSymbolSelector {
 }
 
 func findGoSymbol(source []byte, symbolKind string, selector goSymbolSelector) (int, int, error) {
+	match, err := findGoSymbolMatch(source, symbolKind, selector)
+	if err != nil {
+		return 0, 0, err
+	}
+	return match.Start, match.End, nil
+}
+
+func findGoSymbolMatch(source []byte, symbolKind string, selector goSymbolSelector) (goSymbolMatch, error) {
 	fileSet := token.NewFileSet()
 	file, err := parser.ParseFile(fileSet, "lock.go", source, parser.ParseComments)
 	if err != nil {
-		return 0, 0, fmt.Errorf("go_symbol lock content must be parseable Go: %w", err)
+		return goSymbolMatch{}, fmt.Errorf("go_symbol lock content must be parseable Go: %w", err)
 	}
 	symbolKind = strings.ToLower(strings.TrimSpace(symbolKind))
 	for _, decl := range file.Decls {
-		if start, end, ok := goDeclSymbolRange(fileSet, decl, symbolKind, selector); ok {
-			return start, end, nil
+		if match, ok := goDeclSymbolRange(fileSet, decl, symbolKind, selector); ok {
+			return match, nil
 		}
 	}
-	return 0, 0, fmt.Errorf("go_symbol lock content must contain Go %s %s", symbolKind, selector.DisplayName())
+	return goSymbolMatch{}, fmt.Errorf("go_symbol lock content must contain Go %s %s", symbolKind, selector.DisplayName())
 }
 
 func (s goSymbolSelector) DisplayName() string {
@@ -3486,26 +3503,47 @@ func (s goSymbolSelector) DisplayName() string {
 	return s.Name
 }
 
-func goDeclSymbolRange(fileSet *token.FileSet, decl ast.Decl, symbolKind string, selector goSymbolSelector) (int, int, bool) {
+func goDeclSymbolRange(fileSet *token.FileSet, decl ast.Decl, symbolKind string, selector goSymbolSelector) (goSymbolMatch, bool) {
 	switch typedDecl := decl.(type) {
 	case *ast.FuncDecl:
 		if typedDecl.Name == nil || typedDecl.Name.Name != selector.Name {
-			return 0, 0, false
+			return goSymbolMatch{}, false
 		}
 		if symbolKind == "func" && typedDecl.Recv == nil || symbolKind == "method" && goMethodReceiverMatches(typedDecl, selector.Receiver) {
-			return goNodeStartOffset(fileSet, typedDecl.Doc, typedDecl.Pos()), fileSet.Position(typedDecl.End()).Offset, true
+			return goSymbolMatch{Start: goNodeStartOffset(fileSet, typedDecl.Doc, typedDecl.Pos()), End: fileSet.Position(typedDecl.End()).Offset}, true
 		}
 	case *ast.GenDecl:
 		if typedDecl.Tok == token.TYPE && symbolKind != "type" || typedDecl.Tok == token.VAR && symbolKind != "var" || typedDecl.Tok == token.CONST && symbolKind != "const" {
-			return 0, 0, false
+			return goSymbolMatch{}, false
 		}
+		declStart := goNodeStartOffset(fileSet, typedDecl.Doc, typedDecl.Pos())
+		declEnd := fileSet.Position(typedDecl.End()).Offset
+		grouped := len(typedDecl.Specs) > 1
 		for _, spec := range typedDecl.Specs {
 			if goSpecName(spec) == selector.Name {
-				return goNodeStartOffset(fileSet, typedDecl.Doc, typedDecl.Pos()), fileSet.Position(typedDecl.End()).Offset, true
+				if grouped {
+					specStart := goNodeStartOffset(fileSet, goSpecDoc(spec), spec.Pos())
+					return goSymbolMatch{Start: specStart, End: fileSet.Position(spec.End()).Offset, DeclStart: declStart, DeclEnd: declEnd, Grouped: true}, true
+				}
+				return goSymbolMatch{Start: declStart, End: declEnd}, true
 			}
 		}
 	}
-	return 0, 0, false
+	return goSymbolMatch{}, false
+}
+
+func goSymbolTopLevelDeclaration(source []byte, match goSymbolMatch) []byte {
+	if match.DeclEnd > match.DeclStart {
+		return source[match.DeclStart:match.DeclEnd]
+	}
+	return source[match.Start:match.End]
+}
+
+func goSymbolReplacementFragment(source []byte, match goSymbolMatch, replaceGroupedSpec bool) []byte {
+	if replaceGroupedSpec && match.Grouped {
+		return source[match.Start:match.End]
+	}
+	return goSymbolTopLevelDeclaration(source, match)
 }
 
 func goMethodReceiverMatches(decl *ast.FuncDecl, receiver string) bool {
@@ -3537,6 +3575,16 @@ func goReceiverTypeName(expr ast.Expr) string {
 	return ""
 }
 
+func goSpecDoc(spec ast.Spec) *ast.CommentGroup {
+	switch typedSpec := spec.(type) {
+	case *ast.TypeSpec:
+		return typedSpec.Doc
+	case *ast.ValueSpec:
+		return typedSpec.Doc
+	}
+	return nil
+}
+
 func goNodeStartOffset(fileSet *token.FileSet, doc *ast.CommentGroup, fallback token.Pos) int {
 	if doc != nil {
 		return fileSet.Position(doc.Pos()).Offset
@@ -3550,7 +3598,7 @@ func goLockedSymbolFile(source []byte, symbolKind string, selector goSymbolSelec
 	if err != nil {
 		return nil, fmt.Errorf("go_symbol lock content must be parseable Go: %w", err)
 	}
-	start, end, err := findGoSymbol(source, symbolKind, selector)
+	match, err := findGoSymbolMatch(source, symbolKind, selector)
 	if err != nil {
 		return nil, err
 	}
@@ -3567,7 +3615,7 @@ func goLockedSymbolFile(source []byte, symbolKind string, selector goSymbolSelec
 		builder.WriteByte('\n')
 	}
 	builder.WriteByte('\n')
-	builder.Write(appendNewline(source[start:end]))
+	builder.Write(appendNewline(goSymbolTopLevelDeclaration(source, match)))
 	return reconcileGoImports([]byte(builder.String()), source)
 }
 

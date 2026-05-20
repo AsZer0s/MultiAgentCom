@@ -90,7 +90,7 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - `POST /projects/{id}/workspaces/rebase` 必须显式传入 `targetRef` 且指定 `sandboxIds` 或 `all=true`；只处理受管 Git private task workspace，dirty content worktree 被拒绝，冲突会 abort 并保持原 head；`publish=true` 只执行非 force push，远端 non-fast-forward 拒绝时远端分支保持不变
 - `POST /projects/{id}/snapshots/rollback` 回滚到 Git workspace snapshot 时会创建新的受管 shared rollback worktree；restored HEAD 等于原 snapshot `workspaceChecksum`，rollback snapshot 继续包含 `workspaceStateRef` / `workspaceChecksum`，原 shared worktree 不被 reset/覆盖，后续 shared merge 以 restored head 为 base
 - 文件存储模式下，快照 rollback 可从 `file://` StateRef 恢复；checksum 被篡改时应拒绝回滚
-- `POST /projects/{id}/locks` 可提交 `lockMode=go_symbol`、`language=go`、`symbolKind=func|method|type|var|const` 和 `symbolName`，并只替换对应 Go 声明；method 可通过 `symbolName=Receiver.Method` 精确锁定同名不同 receiver 的方法；`LOCKED BY HUMAN` 必须位于被锁定 symbol 或其 doc comment 内，缺失 Go 目标文件可由 locked content 的 package/import 上下文创建，同时合并锁内容所需 imports、移除替换后不再使用的普通 imports
+- `POST /projects/{id}/locks` 可提交 `lockMode=go_symbol`、`language=go`、`symbolKind=func|method|type|var|const` 和 `symbolName`，并只替换对应 Go 声明；method 可通过 `symbolName=Receiver.Method` 精确锁定同名不同 receiver 的方法；grouped `type/var/const` 只替换命中的目标 spec；`LOCKED BY HUMAN` 必须位于被锁定 symbol 或其 doc comment 内，缺失 Go 目标文件可由 locked content 的 package/import 上下文创建，同时合并锁内容所需 imports、移除替换后不再使用的普通 imports
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回 `runtime.http.v1` success 时可执行成功并采用嵌套 `usage`
 - `MULTI_AGENT_RUNTIME_HTTP_BEARER_TOKEN` 配置后，runtime provider 请求携带 `Authorization: Bearer ...`
 - `MULTI_AGENT_RUNTIME_HTTP_MAX_ATTEMPTS` 配置后，runtime provider 对 retryable 失败执行有界重试；`release-check.sh` 会验证一次 `503` 后成功恢复
