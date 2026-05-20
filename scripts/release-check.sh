@@ -135,6 +135,7 @@ bash -n "$ROOT_DIR/scripts/auth-smoke.sh"
 bash -n "$ROOT_DIR/scripts/release-check.sh"
 bash -n "$ROOT_DIR/scripts/security-check.sh"
 bash -n "$ROOT_DIR/scripts/status-stream-smoke.sh"
+bash -n "$ROOT_DIR/scripts/container-runtime-smoke.sh"
 
 echo
 echo "== security checks =="
@@ -306,6 +307,16 @@ unset RUNTIME_SERVER_PID
 kill "$RUNTIME_PROVIDER_PID" >/dev/null 2>&1 || true
 wait "$RUNTIME_PROVIDER_PID" 2>/dev/null || true
 unset RUNTIME_PROVIDER_PID
+
+if [[ "${RUN_CONTAINER_SMOKE:-0}" == "1" ]]; then
+  echo
+  echo "== container runtime smoke verification =="
+  RUN_CONTAINER_SMOKE=1 bash "$ROOT_DIR/scripts/container-runtime-smoke.sh"
+else
+  echo
+  echo "== container runtime smoke verification skipped =="
+  echo "Set RUN_CONTAINER_SMOKE=1 to run the real Docker/Podman-backed container smoke."
+fi
 
 echo
 echo "== docs check =="

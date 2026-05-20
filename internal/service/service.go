@@ -566,6 +566,12 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 			User:           cfg.RuntimeContainerUser,
 			ReadonlyRootFS: cfg.RuntimeContainerReadonlyRootFS,
 			Workdir:        cfg.RuntimeContainerWorkdir,
+			CPUs:           cfg.RuntimeContainerCPUs,
+			Memory:         cfg.RuntimeContainerMemory,
+			PidsLimit:      cfg.RuntimeContainerPidsLimit,
+			Tmpfs:          strings.Split(cfg.RuntimeContainerTmpfs, ";"),
+			Entrypoint:     cfg.RuntimeContainerEntrypoint,
+			Command:        cfg.RuntimeContainerCommand,
 		}
 		if runner, err := agentruntime.NewContainerRunnerWithOptions(options); err != nil {
 			runtimeInitErr = fmt.Errorf("initialize container runtime runner: %w", err)

@@ -48,7 +48,7 @@
 
 - 后端使用 Go 标准库先跑通最小闭环，领域层与 HTTP 层已解耦，后续可按 `docs/Tech-Stack-Decision.md` 平滑替换为 Gin。
 - 存储支持默认内存模式，也可通过 `MULTI_AGENT_STORE_PROVIDER=file` 与 `MULTI_AGENT_DATA_ROOT` 启用文件持久化；项目、任务、运行、审计/告警/通信流、artifact 元数据与快照状态可在服务重启后恢复。
-- 单 Agent 执行器当前为**规则驱动的本地交付实现**，同时支持通过 `MULTI_AGENT_RUNTIME_PROVIDER=http` 接入外部 runtime provider，或通过 `MULTI_AGENT_RUNTIME_PROVIDER=container` 启用容器级 sandbox 隔离；HTTP runtime 使用 `runtime.http.v1` 协议发送 `protocolVersion` 与 `X-MultiAgentCom-Runtime-Protocol`，支持嵌套 `usage`、兼容旧版 flat token 字段，并把非 2xx、超时、网络、malformed、超大响应和协议版本不匹配归一化为结构化 provider error；container runtime 使用 `docker run --rm` 风格的独立进程边界，仅挂载任务 workspace，并通过 stdin 接收结构化 sandbox/workspace 元数据；系统会基于 PRD 生成标准交付包（README、Go 后端、Node 预览前端、Dockerfile、Compose、元数据），并在 `metadata/manifest.json` 输出 `delivery.bundle.v1` 交付契约、在 `metadata/release-gate.json` 输出本地 release gate 报告。
+- 单 Agent 执行器当前为**规则驱动的本地交付实现**，同时支持通过 `MULTI_AGENT_RUNTIME_PROVIDER=http` 接入外部 runtime provider，或通过 `MULTI_AGENT_RUNTIME_PROVIDER=container` 启用容器级 sandbox 隔离；HTTP runtime 使用 `runtime.http.v1` 协议发送 `protocolVersion` 与 `X-MultiAgentCom-Runtime-Protocol`，支持嵌套 `usage`、兼容旧版 flat token 字段，并把非 2xx、超时、网络、malformed、超大响应和协议版本不匹配归一化为结构化 provider error；container runtime 使用 `docker run --rm` 风格的独立进程边界，仅挂载任务 workspace，并通过 stdin 接收结构化 sandbox/workspace 元数据，可配置 CPU、memory、PID 限制、tmpfs writable paths、entrypoint 与 post-image command；系统会基于 PRD 生成标准交付包（README、Go 后端、Node 预览前端、Dockerfile、Compose、元数据），并在 `metadata/manifest.json` 输出 `delivery.bundle.v1` 交付契约、在 `metadata/release-gate.json` 输出本地 release gate 报告。
 - Contract Hub 当前为**最小可演示实现**：支持基于最新 PRD 规则生成 CRUD 风格 API/Schema 契约，并按版本保存在服务状态中。
 - 契约校验当前支持**合并前最小闸门**：可检查候选 endpoints/schemas 与契约的缺失、类型不一致、额外字段；若存在冲突，会拒绝校验并自动创建修复任务。
 - 并行调度当前支持**双 Agent + 简单 DAG**：可生成后端/前端实现任务，并在依赖满足后触发集成任务；失败任务可单独创建 retry 任务，不影响其他任务继续推进。
@@ -66,7 +66,7 @@
 - 安全基线当前支持**多 token scoped auth 与审计**：除 `MULTI_AGENT_API_TOKEN` 兼容模式外，可通过 `MULTI_AGENT_AUTH_TOKENS` 或 `MULTI_AGENT_AUTH_TOKENS_FILE` 配置带 actor、roles、project scope、disabled、expiry 的 token 记录；关键操作会写入 `/projects/{id}/audit-logs` 审计流。
 - 告警通知当前支持**最小 webhook 主动推送**：设置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，run 失败和回滚事件会异步推送结构化 alert 到外部接收端。
 - 状态面板当前支持**WebUI 运维总览**：同一页面可查看 readiness、任务拓扑、任务矩阵、失败告警、HITL conflict queue、审计轨迹、通信日志、Token 成本趋势、沙盒和快照，更新机制为 SSE + 轮询兜底，并使用 DOM/SVG API 渲染接口数据以降低 XSS 风险。
-- 运维 readiness 当前支持 `GET /ready`：会检查配置有效性、auth token 配置、存储/数据目录、artifact/sandbox 根目录可写性、Git workspace provider 的 repo/base ref 可用性以及 runtime provider 配置；`RuntimeProvider=container` 会校验容器 image 配置与本地 container binary 可执行性，但不会 pull image 或启动容器；配置 remote Git 后，readiness 可 clone 缺失 repo 并按需 fetch。
+- 运维 readiness 当前支持 `GET /ready`：会检查配置有效性、auth token 配置、存储/数据目录、artifact/sandbox 根目录可写性、Git workspace provider 的 repo/base ref 可用性以及 runtime provider 配置；`RuntimeProvider=container` 会校验容器 image 配置、本地 container binary 可执行性和资源/tmpfs 配置合法性，但不会 pull image、inspect image 或启动容器；配置 remote Git 后，readiness 可 clone 缺失 repo 并按需 fetch。
 - Git workspace v5 当前支持 pure Git snapshot restore MVP：在 v4 的 manual private rebase 基础上，`POST /projects/{id}/snapshots/rollback` 会同时恢复 service state（`memory://` / `file://` StateRef）与 Git workspace state（`workspaceStateRef` / `workspaceChecksum`）；恢复会创建新的受管 shared rollback worktree/branch，HEAD 等于原 snapshot checksum，并作为后续 shared merge 的 base。`POST /projects/{id}/workspaces/rebase` 仍只作用于受管且已 release 的 private Git task workspace，dirty content worktree 会被拒绝，冲突会自动 `git rebase --abort` 并保留原 head；shared branch rebase、force push、remote branch 删除、repo-only service-state restore 仍是后续工作。
 
 ## 本地运行
@@ -104,6 +104,16 @@ RUNS=3 bash scripts/demo.sh
 ```bash
 bash scripts/release-check.sh
 ```
+
+默认发布检查不依赖 Docker/Podman；如需执行真实容器 runtime smoke：
+
+```bash
+RUN_CONTAINER_SMOKE=1 bash scripts/container-runtime-smoke.sh
+# 或随 release-check 一起执行
+RUN_CONTAINER_SMOKE=1 bash scripts/release-check.sh
+```
+
+容器 runtime 相关环境变量：`MULTI_AGENT_RUNTIME_CONTAINER_BINARY`（默认 `docker`）、`MULTI_AGENT_RUNTIME_CONTAINER_IMAGE`、`MULTI_AGENT_RUNTIME_CONTAINER_NETWORK`（默认 `none`）、`MULTI_AGENT_RUNTIME_CONTAINER_USER`、`MULTI_AGENT_RUNTIME_CONTAINER_READONLY_ROOTFS`（默认 `true`）、`MULTI_AGENT_RUNTIME_CONTAINER_WORKDIR`（默认 `/workspace`）、`MULTI_AGENT_RUNTIME_CONTAINER_CPUS`、`MULTI_AGENT_RUNTIME_CONTAINER_MEMORY`、`MULTI_AGENT_RUNTIME_CONTAINER_PIDS_LIMIT`、`MULTI_AGENT_RUNTIME_CONTAINER_TMPFS`（默认 `/tmp:rw,nosuid,nodev,noexec,size=64m`，多个条目用 `;` 分隔）、`MULTI_AGENT_RUNTIME_CONTAINER_ENTRYPOINT`、`MULTI_AGENT_RUNTIME_CONTAINER_COMMAND`。镜像约定为从 stdin 读取 `runtime.http.v1` JSON payload，正常结果写 stdout，诊断/错误写 stderr 并以非 0 退出；entrypoint 和 command 直接作为参数传递，不经 shell 展开。
 
 如需执行安全扫描：
 

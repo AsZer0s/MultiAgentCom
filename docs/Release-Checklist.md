@@ -22,6 +22,7 @@ bash scripts/release-check.sh
 - `bash scripts/demo.sh` 端到端执行通过
 - `bash scripts/alert-smoke.sh` 验证失败告警与 webhook 推送通过
 - `bash scripts/auth-smoke.sh` 验证 token 鉴权兼容路径通过
+- `RUN_CONTAINER_SMOKE=1` 时，`bash scripts/container-runtime-smoke.sh` 验证真实 Docker/Podman-backed container runtime；默认不执行、不阻塞普通 CI
 - 预览环境可访问
 - 导出 ZIP 交付包结构符合 AC-15，并通过 `delivery.bundle.v1` / `delivery.release_gate.v1` 契约校验
 - Sprint 4 验收文档存在
@@ -96,8 +97,11 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回 `runtime.http.v1` success 时可执行成功并采用嵌套 `usage`
 - `MULTI_AGENT_RUNTIME_HTTP_BEARER_TOKEN` 配置后，runtime provider 请求携带 `Authorization: Bearer ...`
 - `MULTI_AGENT_RUNTIME_HTTP_MAX_ATTEMPTS` 配置后，runtime provider 对 retryable 失败执行有界重试；`release-check.sh` 会验证一次 `503` 后成功恢复
-- `MULTI_AGENT_RUNTIME_PROVIDER=container` 且配置 `MULTI_AGENT_RUNTIME_CONTAINER_IMAGE` 后，`GET /ready` 校验 container binary 可执行；binary 缺失时返回 `not_ready`，readiness 不 pull image、不启动容器
-- `MULTI_AGENT_RUNTIME_PROVIDER=container` 执行时只挂载任务 workspace，默认 `MULTI_AGENT_RUNTIME_CONTAINER_NETWORK=none`、`MULTI_AGENT_RUNTIME_CONTAINER_READONLY_ROOTFS=true`，并通过 stdin 传入 prompt/context/sandbox workspace 元数据
+- `MULTI_AGENT_RUNTIME_PROVIDER=container` 且配置 `MULTI_AGENT_RUNTIME_CONTAINER_IMAGE` 后，`GET /ready` 校验 container binary 可执行与资源/tmpfs 配置合法性；binary 缺失或资源配置非法时返回 `not_ready`，readiness 不 pull image、不 inspect image、不启动容器
+- `MULTI_AGENT_RUNTIME_PROVIDER=container` 执行时只挂载任务 workspace，默认 `MULTI_AGENT_RUNTIME_CONTAINER_NETWORK=none`、`MULTI_AGENT_RUNTIME_CONTAINER_READONLY_ROOTFS=true`、`MULTI_AGENT_RUNTIME_CONTAINER_WORKDIR=/workspace`，并通过 stdin 传入 prompt/context/sandbox workspace 元数据
+- container runtime 可用 `MULTI_AGENT_RUNTIME_CONTAINER_CPUS`、`MULTI_AGENT_RUNTIME_CONTAINER_MEMORY`、`MULTI_AGENT_RUNTIME_CONTAINER_PIDS_LIMIT` 设置资源限制；`MULTI_AGENT_RUNTIME_CONTAINER_TMPFS` 配置 readonly rootfs 下的 writable paths，多个 tmpfs spec 使用 `;` 分隔且不能覆盖 workspace mount
+- container runtime 镜像约定：从 stdin 读取 `runtime.http.v1` JSON payload，正常输出写 stdout，诊断/错误写 stderr 并以非 0 退出；`MULTI_AGENT_RUNTIME_CONTAINER_ENTRYPOINT` 与 `MULTI_AGENT_RUNTIME_CONTAINER_COMMAND` 只作为显式参数传递，不经 shell 展开
+- 默认 `bash scripts/release-check.sh` 只对 `scripts/container-runtime-smoke.sh` 做语法检查；真实容器 smoke 需显式 `RUN_CONTAINER_SMOKE=1 bash scripts/container-runtime-smoke.sh` 或 `RUN_CONTAINER_SMOKE=1 bash scripts/release-check.sh`
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回结构化非 2xx error 时，run 失败原因包含稳定 code/status/retryable/requestId，且项目告警记录该失败
 - 配置 `MULTI_AGENT_API_TOKEN` 后，未带 token 的 API 请求返回 `401`
 - 配置 `MULTI_AGENT_API_TOKEN` 后，带 token 的 API 请求可正常创建项目并写入审计
@@ -136,3 +140,17 @@ bash scripts/status-stream-smoke.sh
 - 响应头 `Content-Type` 包含 `event-stream`
 - SSE 输出包含 `event: status`
 - SSE 输出包含 `data:`
+
+## Container Runtime Smoke
+
+```bash
+RUN_CONTAINER_SMOKE=1 bash scripts/container-runtime-smoke.sh
+```
+
+预期结果：
+
+- 本地 Docker/Podman binary 存在且可执行
+- 脚本构建最小 runtime image，启动 `RuntimeProvider=container` 的本地 server
+- `GET /ready` 返回 ready，但不会在 readiness 阶段 pull / inspect / start 容器
+- 任务执行结果包含 `model=container-runtime` 与 `container runtime smoke passed`
+- 未设置 `RUN_CONTAINER_SMOKE=1` 时脚本明确跳过，不影响普通 release check

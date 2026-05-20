@@ -188,6 +188,12 @@ func TestLoadRuntimeDefaults(t *testing.T) {
 	if cfg.RuntimeContainerBinary != "docker" || cfg.RuntimeContainerNetwork != "none" || cfg.RuntimeContainerWorkdir != "/workspace" {
 		t.Fatalf("unexpected container runtime defaults: %+v", cfg)
 	}
+	if cfg.RuntimeContainerTmpfs != "/tmp:rw,nosuid,nodev,noexec,size=64m" {
+		t.Fatalf("RuntimeContainerTmpfs = %q, want default /tmp tmpfs", cfg.RuntimeContainerTmpfs)
+	}
+	if cfg.RuntimeContainerCPUs != "" || cfg.RuntimeContainerMemory != "" || cfg.RuntimeContainerPidsLimit != 0 || cfg.RuntimeContainerEntrypoint != "" || cfg.RuntimeContainerCommand != "" {
+		t.Fatalf("expected optional container limits to default empty/zero: %+v", cfg)
+	}
 	if !cfg.RuntimeContainerReadonlyRootFS {
 		t.Fatal("expected container readonly rootfs default")
 	}
@@ -206,6 +212,12 @@ func TestLoadRuntimeOverrides(t *testing.T) {
 	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_USER", "1000:1000")
 	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_READONLY_ROOTFS", "false")
 	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_WORKDIR", "/work")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_CPUS", "1.5")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_MEMORY", "256m")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_PIDS_LIMIT", "128")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_TMPFS", "/tmp:rw,size=64m;/run:rw,size=16m")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_ENTRYPOINT", "/usr/local/bin/runtime")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_COMMAND", "--mode worker")
 	t.Setenv("MULTI_AGENT_TOKEN_PROMPT_PRICE_PER_MILLION", "3.5")
 	t.Setenv("MULTI_AGENT_TOKEN_OUTPUT_PRICE_PER_MILLION", "7.25")
 	t.Setenv("MULTI_AGENT_TOKEN_BUDGET_WARN_USD", "10")
@@ -233,6 +245,12 @@ func TestLoadRuntimeOverrides(t *testing.T) {
 	}
 	if cfg.RuntimeContainerBinary != "podman" || cfg.RuntimeContainerImage != "multiagent-runtime:test" || cfg.RuntimeContainerNetwork != "bridge" || cfg.RuntimeContainerUser != "1000:1000" || cfg.RuntimeContainerWorkdir != "/work" {
 		t.Fatalf("unexpected container runtime overrides: %+v", cfg)
+	}
+	if cfg.RuntimeContainerCPUs != "1.5" || cfg.RuntimeContainerMemory != "256m" || cfg.RuntimeContainerPidsLimit != 128 || cfg.RuntimeContainerTmpfs != "/tmp:rw,size=64m;/run:rw,size=16m" {
+		t.Fatalf("unexpected container hardening overrides: %+v", cfg)
+	}
+	if cfg.RuntimeContainerEntrypoint != "/usr/local/bin/runtime" || cfg.RuntimeContainerCommand != "--mode worker" {
+		t.Fatalf("unexpected container entrypoint/command overrides: %+v", cfg)
 	}
 	if cfg.RuntimeContainerReadonlyRootFS {
 		t.Fatal("expected readonly rootfs override to be false")
@@ -272,6 +290,33 @@ func TestValidateAcceptsDefaultConfig(t *testing.T) {
 func TestValidateAcceptsContainerRuntimeConfig(t *testing.T) {
 	if err := Validate(Config{RuntimeProvider: "container", RuntimeContainerImage: "multiagent-runtime:test"}); err != nil {
 		t.Fatalf("Validate container runtime config: %v", err)
+	}
+}
+
+func TestValidateRejectsInvalidContainerRuntimeHardeningConfig(t *testing.T) {
+	err := Validate(Config{
+		RuntimeProvider:                "container",
+		RuntimeContainerImage:          "multiagent-runtime:test",
+		RuntimeContainerCPUs:           "zero",
+		RuntimeContainerMemory:         "lots",
+		RuntimeContainerPidsLimit:      -1,
+		RuntimeContainerTmpfs:          "tmp:rw;/workspace:rw",
+		RuntimeContainerWorkdir:        "/workspace",
+		RuntimeContainerBinary:         "/bin/sh",
+		RuntimeContainerReadonlyRootFS: true,
+	})
+	issues := ValidationIssues(err)
+	if len(issues) < 4 {
+		t.Fatalf("expected validation issues, got %v", issues)
+	}
+	fields := map[string]bool{}
+	for _, issue := range issues {
+		fields[issue.Field] = true
+	}
+	for _, field := range []string{"RuntimeContainerCPUs", "RuntimeContainerMemory", "RuntimeContainerPidsLimit", "RuntimeContainerTmpfs"} {
+		if !fields[field] {
+			t.Fatalf("expected issue for %s, got %v", field, issues)
+		}
 	}
 }
 

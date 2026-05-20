@@ -17,6 +17,12 @@ type ContainerRunner struct {
 	user           string
 	readonlyRootFS bool
 	workdir        string
+	cpus           string
+	memory         string
+	pidsLimit      int
+	tmpfs          []string
+	entrypoint     string
+	command        string
 	exec           containerCommandExecutor
 }
 
@@ -27,6 +33,12 @@ type ContainerRunnerOptions struct {
 	User           string
 	ReadonlyRootFS bool
 	Workdir        string
+	CPUs           string
+	Memory         string
+	PidsLimit      int
+	Tmpfs          []string
+	Entrypoint     string
+	Command        string
 	Executor       containerCommandExecutor
 }
 
@@ -65,6 +77,12 @@ func NewContainerRunnerWithOptions(options ContainerRunnerOptions) (*ContainerRu
 		user:           strings.TrimSpace(options.User),
 		readonlyRootFS: options.ReadonlyRootFS,
 		workdir:        workdir,
+		cpus:           strings.TrimSpace(options.CPUs),
+		memory:         strings.TrimSpace(options.Memory),
+		pidsLimit:      options.PidsLimit,
+		tmpfs:          cleanContainerList(options.Tmpfs),
+		entrypoint:     strings.TrimSpace(options.Entrypoint),
+		command:        strings.TrimSpace(options.Command),
 		exec:           executor,
 	}, nil
 }
@@ -132,8 +150,37 @@ func (r *ContainerRunner) args(workspacePath string) []string {
 	if r.user != "" {
 		args = append(args, "--user", r.user)
 	}
+	if r.cpus != "" {
+		args = append(args, "--cpus", r.cpus)
+	}
+	if r.memory != "" {
+		args = append(args, "--memory", r.memory)
+	}
+	if r.pidsLimit > 0 {
+		args = append(args, "--pids-limit", fmt.Sprintf("%d", r.pidsLimit))
+	}
+	for _, spec := range r.tmpfs {
+		args = append(args, "--tmpfs", spec)
+	}
+	if r.entrypoint != "" {
+		args = append(args, "--entrypoint", r.entrypoint)
+	}
 	args = append(args, r.image)
+	if r.command != "" {
+		args = append(args, strings.Fields(r.command)...)
+	}
 	return args
+}
+
+func cleanContainerList(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 type containerRuntimePayload struct {

@@ -50,6 +50,12 @@ type Config struct {
 	RuntimeContainerUser              string
 	RuntimeContainerReadonlyRootFS    bool
 	RuntimeContainerWorkdir           string
+	RuntimeContainerCPUs              string
+	RuntimeContainerMemory            string
+	RuntimeContainerPidsLimit         int
+	RuntimeContainerTmpfs             string
+	RuntimeContainerEntrypoint        string
+	RuntimeContainerCommand           string
 	TokenPromptPricePerMillion        float64
 	TokenOutputPricePerMillion        float64
 	TokenBudgetWarnUSD                float64
@@ -115,6 +121,12 @@ func Load() Config {
 		RuntimeContainerUser:              getenv("MULTI_AGENT_RUNTIME_CONTAINER_USER", ""),
 		RuntimeContainerReadonlyRootFS:    getenvBool("MULTI_AGENT_RUNTIME_CONTAINER_READONLY_ROOTFS", true),
 		RuntimeContainerWorkdir:           getenv("MULTI_AGENT_RUNTIME_CONTAINER_WORKDIR", "/workspace"),
+		RuntimeContainerCPUs:              getenv("MULTI_AGENT_RUNTIME_CONTAINER_CPUS", ""),
+		RuntimeContainerMemory:            getenv("MULTI_AGENT_RUNTIME_CONTAINER_MEMORY", ""),
+		RuntimeContainerPidsLimit:         getenvInt("MULTI_AGENT_RUNTIME_CONTAINER_PIDS_LIMIT", 0),
+		RuntimeContainerTmpfs:             getenv("MULTI_AGENT_RUNTIME_CONTAINER_TMPFS", "/tmp:rw,nosuid,nodev,noexec,size=64m"),
+		RuntimeContainerEntrypoint:        getenv("MULTI_AGENT_RUNTIME_CONTAINER_ENTRYPOINT", ""),
+		RuntimeContainerCommand:           getenv("MULTI_AGENT_RUNTIME_CONTAINER_COMMAND", ""),
 		TokenPromptPricePerMillion:        getenvFloat("MULTI_AGENT_TOKEN_PROMPT_PRICE_PER_MILLION", 1.5),
 		TokenOutputPricePerMillion:        getenvFloat("MULTI_AGENT_TOKEN_OUTPUT_PRICE_PER_MILLION", 2.5),
 		TokenBudgetWarnUSD:                getenvFloat("MULTI_AGENT_TOKEN_BUDGET_WARN_USD", 0),
@@ -263,6 +275,18 @@ func Validate(cfg Config) error {
 	}
 	if strings.TrimSpace(cfg.RuntimeContainerWorkdir) == "" {
 		issues = append(issues, ValidationIssue{Field: "RuntimeContainerWorkdir", Message: "is required"})
+	}
+	if err := validateContainerCPUs(cfg.RuntimeContainerCPUs); err != nil {
+		issues = append(issues, ValidationIssue{Field: "RuntimeContainerCPUs", Message: err.Error()})
+	}
+	if err := validateContainerMemory(cfg.RuntimeContainerMemory); err != nil {
+		issues = append(issues, ValidationIssue{Field: "RuntimeContainerMemory", Message: err.Error()})
+	}
+	if cfg.RuntimeContainerPidsLimit < 0 {
+		issues = append(issues, ValidationIssue{Field: "RuntimeContainerPidsLimit", Message: "must be positive when set"})
+	}
+	if err := validateContainerTmpfs(cfg.RuntimeContainerTmpfs, cfg.RuntimeContainerWorkdir); err != nil {
+		issues = append(issues, ValidationIssue{Field: "RuntimeContainerTmpfs", Message: err.Error()})
 	}
 	if cfg.TokenPromptPricePerMillion <= 0 {
 		issues = append(issues, ValidationIssue{Field: "TokenPromptPricePerMillion", Message: "must be positive"})
@@ -436,4 +460,88 @@ func getenvInt(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func validateContainerCPUs(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed <= 0 {
+		return fmt.Errorf("must be a positive number")
+	}
+	return nil
+}
+
+func validateContainerMemory(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if strings.HasPrefix(value, "-") {
+		return fmt.Errorf("must be positive")
+	}
+	if _, err := parseContainerSize(value); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateContainerTmpfs(value, workdir string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	entries := splitContainerList(value)
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		path := entry
+		if idx := strings.Index(entry, ":"); idx >= 0 {
+			path = entry[:idx]
+		}
+		if !strings.HasPrefix(path, "/") {
+			return fmt.Errorf("must use absolute container paths")
+		}
+		if workdir != "" && strings.TrimRight(path, "/") == strings.TrimRight(workdir, "/") {
+			return fmt.Errorf("must not overlap workspace mount")
+		}
+	}
+	return nil
+}
+
+func parseContainerSize(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("must not be empty")
+	}
+	if strings.HasSuffix(value, "b") || strings.HasSuffix(value, "B") {
+		value = value[:len(value)-1]
+	}
+	multiplier := int64(1)
+	switch suffix := strings.ToLower(value[len(value)-1:]); suffix {
+	case "k":
+		multiplier = 1024
+		value = value[:len(value)-1]
+	case "m":
+		multiplier = 1024 * 1024
+		value = value[:len(value)-1]
+	case "g":
+		multiplier = 1024 * 1024 * 1024
+		value = value[:len(value)-1]
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("must be a positive size")
+	}
+	return parsed * multiplier, nil
+}
+
+func splitContainerList(value string) []string {
+	return strings.FieldsFunc(value, func(r rune) bool {
+		return r == ';'
+	})
 }

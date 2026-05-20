@@ -37,6 +37,12 @@ func TestContainerRunnerRunBuildsIsolatedCommand(t *testing.T) {
 		User:           "1000:1000",
 		ReadonlyRootFS: true,
 		Workdir:        "/workspace",
+		CPUs:           "1.5",
+		Memory:         "256m",
+		PidsLimit:      128,
+		Tmpfs:          []string{"/tmp:rw,nosuid,nodev,noexec,size=64m", "/run:rw,size=16m"},
+		Entrypoint:     "/usr/local/bin/runtime",
+		Command:        "--mode worker --once",
 		Executor:       executor,
 	})
 	if err != nil {
@@ -68,7 +74,7 @@ func TestContainerRunnerRunBuildsIsolatedCommand(t *testing.T) {
 	if executor.binary != "podman" {
 		t.Fatalf("binary = %q", executor.binary)
 	}
-	expectedArgs := []string{"run", "--rm", "--network", "none", "-v", "/tmp/sandbox/workspace:/workspace", "-w", "/workspace", "--read-only", "--user", "1000:1000", "multiagent-runtime:test"}
+	expectedArgs := []string{"run", "--rm", "--network", "none", "-v", "/tmp/sandbox/workspace:/workspace", "-w", "/workspace", "--read-only", "--user", "1000:1000", "--cpus", "1.5", "--memory", "256m", "--pids-limit", "128", "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=64m", "--tmpfs", "/run:rw,size=16m", "--entrypoint", "/usr/local/bin/runtime", "multiagent-runtime:test", "--mode", "worker", "--once"}
 	if !reflect.DeepEqual(executor.args, expectedArgs) {
 		t.Fatalf("args = %#v, want %#v", executor.args, expectedArgs)
 	}
@@ -128,6 +134,13 @@ func TestContainerRunnerRunReturnsStderrOnFailure(t *testing.T) {
 	var providerErr *ProviderError
 	if !errors.As(err, &providerErr) || providerErr.Code != ProviderErrorContainerFailed || !strings.Contains(providerErr.Message, "container failed") {
 		t.Fatalf("expected stderr provider error, got %T: %v", err, err)
+	}
+}
+
+func TestCleanContainerListDropsEmptyValues(t *testing.T) {
+	values := cleanContainerList([]string{" /tmp:rw ", "", "  ", "/run:rw"})
+	if !reflect.DeepEqual(values, []string{"/tmp:rw", "/run:rw"}) {
+		t.Fatalf("unexpected cleaned list: %#v", values)
 	}
 }
 

@@ -309,6 +309,31 @@ func TestHTTPReadyRejectsMissingContainerRuntimeBinary(t *testing.T) {
 	assertContainsBody(t, body, `"name":"runtime"`)
 }
 
+func TestHTTPReadyRejectsInvalidContainerRuntimeHardeningConfig(t *testing.T) {
+	cfg := config.Config{
+		Address:                        ":0",
+		ServiceName:                    "test-http-ready-container-invalid-hardening",
+		ArtifactRoot:                   t.TempDir(),
+		SandboxRoot:                    t.TempDir(),
+		RuntimeProvider:                "container",
+		RuntimeContainerImage:          "multiagent-runtime:test",
+		RuntimeContainerBinary:         "/bin/sh",
+		RuntimeContainerNetwork:        "none",
+		RuntimeContainerReadonlyRootFS: true,
+		RuntimeContainerWorkdir:        "/workspace",
+		RuntimeContainerCPUs:           "zero",
+		RuntimeContainerTmpfs:          "tmp:rw",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSONExpectStatus(t, server.Client(), server.URL+"/ready", http.StatusServiceUnavailable)
+	assertContainsBody(t, body, `"status":"not_ready"`)
+	assertContainsBody(t, body, `"name":"config"`)
+}
+
 func TestHTTPReadyReportsConfigFailure(t *testing.T) {
 	cfg := config.Config{
 		Address:         ":0",
