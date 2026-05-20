@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"multiagentcom/internal/agentruntime"
 	"multiagentcom/internal/config"
 	"multiagentcom/internal/domain"
 )
@@ -372,6 +373,68 @@ func TestRunUsesHTTPRuntimeProviderWhenConfigured(t *testing.T) {
 	}
 	if !strings.Contains(status.Run.ResultSummary, "runtime output") {
 		t.Fatalf("expected runtime summary in result summary, got %s", status.Run.ResultSummary)
+	}
+}
+
+type captureRuntimeRunner struct {
+	request agentruntime.Request
+}
+
+func (r *captureRuntimeRunner) Run(_ context.Context, req agentruntime.Request) (agentruntime.Response, error) {
+	r.request = req
+	return agentruntime.Response{Model: "capture-runtime", Output: "captured runtime request"}, nil
+}
+
+func TestExecuteRuntimeRunPassesWorkspaceMetadata(t *testing.T) {
+	cfg := config.Config{RuntimeTimeout: 2 * time.Second}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	runner := &captureRuntimeRunner{}
+	registry := agentruntime.NewRegistry()
+	if err := registry.Register("capture", runner); err != nil {
+		t.Fatalf("register capture runtime: %v", err)
+	}
+	if err := registry.SetDefault("capture"); err != nil {
+		t.Fatalf("set default runtime: %v", err)
+	}
+	svc.runtimeRegistry = registry
+
+	run := &domain.AgentRun{ID: "run_1", AgentType: "go-backend-agent", SandboxID: "sandbox_1"}
+	task := &domain.Task{ID: "task_1", Name: "Build API", Type: "backend"}
+	plan := &domain.Plan{ID: "plan_1", Version: 3}
+	project := &domain.Project{ID: "project_1", Name: "Runtime Metadata"}
+	sandbox := &domain.Sandbox{
+		ID:                "sandbox_1",
+		RootPath:          "  /tmp/sandbox/root  ",
+		WorkspacePath:     "  /tmp/sandbox/workspace  ",
+		WorkspaceProvider: "  git  ",
+		WorkspaceBranch:   "  multiagent/sandbox_1  ",
+		WorkspaceBaseRef:  "  main  ",
+		WorkspaceHeadRef:  "  abc123  ",
+	}
+
+	resp, err := svc.executeRuntimeRun(run, task, plan, project, sandbox)
+	if err != nil {
+		t.Fatalf("execute runtime run: %v", err)
+	}
+	if resp.Model != "capture-runtime" {
+		t.Fatalf("unexpected runtime response: %+v", resp)
+	}
+
+	got := runner.request
+	if got.ProjectID != project.ID || got.TaskID != task.ID || got.RunID != run.ID || got.AgentType != run.AgentType {
+		t.Fatalf("runtime request missing IDs: %+v", got)
+	}
+	if got.Timeout != cfg.RuntimeTimeout {
+		t.Fatalf("Timeout = %s, want %s", got.Timeout, cfg.RuntimeTimeout)
+	}
+	if got.SandboxID != "sandbox_1" || got.SandboxRootPath != "/tmp/sandbox/root" || got.WorkspacePath != "/tmp/sandbox/workspace" {
+		t.Fatalf("runtime request missing sandbox paths: %+v", got)
+	}
+	if got.WorkspaceProvider != "git" || got.WorkspaceBranch != "multiagent/sandbox_1" || got.WorkspaceBaseRef != "main" || got.WorkspaceHeadRef != "abc123" {
+		t.Fatalf("runtime request missing workspace metadata: %+v", got)
+	}
+	if !strings.Contains(got.Context, "workspacePath=/tmp/sandbox/workspace") || !strings.Contains(got.Context, "workspaceProvider=git") {
+		t.Fatalf("runtime context missing workspace details: %s", got.Context)
 	}
 }
 

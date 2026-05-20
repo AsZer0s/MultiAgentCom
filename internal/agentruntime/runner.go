@@ -19,13 +19,20 @@ type Runner interface {
 }
 
 type Request struct {
-	ProjectID string
-	TaskID    string
-	RunID     string
-	AgentType string
-	Prompt    string
-	Context   string
-	Timeout   time.Duration
+	ProjectID         string
+	TaskID            string
+	RunID             string
+	AgentType         string
+	Prompt            string
+	Context           string
+	Timeout           time.Duration
+	SandboxID         string
+	SandboxRootPath   string
+	WorkspacePath     string
+	WorkspaceProvider string
+	WorkspaceBranch   string
+	WorkspaceBaseRef  string
+	WorkspaceHeadRef  string
 }
 
 const ProtocolVersion = "runtime.http.v1"
@@ -37,6 +44,7 @@ const (
 	ProviderErrorMalformedResponse          = "PROVIDER_MALFORMED_RESPONSE"
 	ProviderErrorResponseTooLarge           = "PROVIDER_RESPONSE_TOO_LARGE"
 	ProviderErrorProtocolVersionUnsupported = "PROVIDER_PROTOCOL_VERSION_UNSUPPORTED"
+	ProviderErrorContainerFailed            = "PROVIDER_CONTAINER_FAILED"
 )
 
 type Response struct {

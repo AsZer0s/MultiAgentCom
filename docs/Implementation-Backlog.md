@@ -332,6 +332,18 @@
 - **目标：** 将 HITL override / code lock 升级为带 owner lease 的本地治理流程。
 - **DoD：** override/lock 支持 `owner` 与 `ttlSeconds`；同 scope 未过期 lease owner 不同时进入 `OPEN` conflict queue；conflict 可查询与 resolve；file-store 持久化与 audit 覆盖通过。
 
+### BL-911 Container sandbox isolation MVP
+- **优先级：** P1
+- **估时：** 1.5 PD
+- **目标：** 为 runtime provider 增加容器级隔离的最小闭环。
+- **DoD：** `MULTI_AGENT_RUNTIME_PROVIDER=container` 可注册并执行 container runtime；支持 binary/image/network/user/read-only/workdir 配置；只挂载 workspace，默认 `network=none` 与 `read-only=true`；通过 stdin 传入结构化 sandbox/workspace 元数据；readiness 校验 binary 可执行但不 pull image、不启动容器；service/HTTP/unit 测试覆盖成功、timeout、stderr failure 与缺失 binary。
+
+### BL-912 HITL conflict dashboard
+- **优先级：** P1
+- **估时：** 1 PD
+- **目标：** 将 HITL conflict queue 暴露到状态面板。
+- **DoD：** `/status/panel` 增加 HITL Conflicts 面板；通过 `/projects/{id}/conflicts` 获取数据；OPEN/RESOLVED 条目以不同样式渲染；空态与 project-less 状态有明确提示；HTTP panel smoke 覆盖通过。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：

@@ -44,6 +44,12 @@ type Config struct {
 	RuntimeHTTPBearerToken            string
 	RuntimeHTTPMaxAttempts            int
 	RuntimeHTTPRetryBaseDelay         time.Duration
+	RuntimeContainerBinary            string
+	RuntimeContainerImage             string
+	RuntimeContainerNetwork           string
+	RuntimeContainerUser              string
+	RuntimeContainerReadonlyRootFS    bool
+	RuntimeContainerWorkdir           string
 	TokenPromptPricePerMillion        float64
 	TokenOutputPricePerMillion        float64
 	TokenBudgetWarnUSD                float64
@@ -103,6 +109,12 @@ func Load() Config {
 		RuntimeHTTPBearerToken:            getenv("MULTI_AGENT_RUNTIME_HTTP_BEARER_TOKEN", ""),
 		RuntimeHTTPMaxAttempts:            getenvInt("MULTI_AGENT_RUNTIME_HTTP_MAX_ATTEMPTS", 1),
 		RuntimeHTTPRetryBaseDelay:         getenvDuration("MULTI_AGENT_RUNTIME_HTTP_RETRY_BASE_DELAY", 100*time.Millisecond),
+		RuntimeContainerBinary:            getenv("MULTI_AGENT_RUNTIME_CONTAINER_BINARY", "docker"),
+		RuntimeContainerImage:             getenv("MULTI_AGENT_RUNTIME_CONTAINER_IMAGE", ""),
+		RuntimeContainerNetwork:           getenv("MULTI_AGENT_RUNTIME_CONTAINER_NETWORK", "none"),
+		RuntimeContainerUser:              getenv("MULTI_AGENT_RUNTIME_CONTAINER_USER", ""),
+		RuntimeContainerReadonlyRootFS:    getenvBool("MULTI_AGENT_RUNTIME_CONTAINER_READONLY_ROOTFS", true),
+		RuntimeContainerWorkdir:           getenv("MULTI_AGENT_RUNTIME_CONTAINER_WORKDIR", "/workspace"),
 		TokenPromptPricePerMillion:        getenvFloat("MULTI_AGENT_TOKEN_PROMPT_PRICE_PER_MILLION", 1.5),
 		TokenOutputPricePerMillion:        getenvFloat("MULTI_AGENT_TOKEN_OUTPUT_PRICE_PER_MILLION", 2.5),
 		TokenBudgetWarnUSD:                getenvFloat("MULTI_AGENT_TOKEN_BUDGET_WARN_USD", 0),
@@ -156,6 +168,15 @@ func WithDefaults(cfg Config) Config {
 	if cfg.RuntimeHTTPRetryBaseDelay == 0 {
 		cfg.RuntimeHTTPRetryBaseDelay = 100 * time.Millisecond
 	}
+	if strings.TrimSpace(cfg.RuntimeContainerBinary) == "" {
+		cfg.RuntimeContainerBinary = "docker"
+	}
+	if strings.TrimSpace(cfg.RuntimeContainerNetwork) == "" {
+		cfg.RuntimeContainerNetwork = "none"
+	}
+	if strings.TrimSpace(cfg.RuntimeContainerWorkdir) == "" {
+		cfg.RuntimeContainerWorkdir = "/workspace"
+	}
 	if cfg.TokenPromptPricePerMillion == 0 {
 		cfg.TokenPromptPricePerMillion = 1.5
 	}
@@ -201,8 +222,12 @@ func Validate(cfg Config) error {
 		} else if parsed, err := url.ParseRequestURI(strings.TrimSpace(cfg.RuntimeEndpoint)); err != nil || parsed.Scheme == "" || parsed.Host == "" {
 			issues = append(issues, ValidationIssue{Field: "RuntimeEndpoint", Message: "must be a valid absolute URL"})
 		}
+	case "container":
+		if strings.TrimSpace(cfg.RuntimeContainerImage) == "" {
+			issues = append(issues, ValidationIssue{Field: "RuntimeContainerImage", Message: "is required when RuntimeProvider is container"})
+		}
 	default:
-		issues = append(issues, ValidationIssue{Field: "RuntimeProvider", Message: "must be local or http"})
+		issues = append(issues, ValidationIssue{Field: "RuntimeProvider", Message: "must be local, http, or container"})
 	}
 	if remoteURL := strings.TrimSpace(cfg.WorkspaceGitRemoteURL); remoteURL != "" {
 		if err := validateWorkspaceGitRemoteURL(remoteURL); err != nil {
@@ -232,6 +257,12 @@ func Validate(cfg Config) error {
 	}
 	if cfg.RuntimeHTTPRetryBaseDelay <= 0 {
 		issues = append(issues, ValidationIssue{Field: "RuntimeHTTPRetryBaseDelay", Message: "must be positive"})
+	}
+	if strings.TrimSpace(cfg.RuntimeContainerBinary) == "" {
+		issues = append(issues, ValidationIssue{Field: "RuntimeContainerBinary", Message: "is required"})
+	}
+	if strings.TrimSpace(cfg.RuntimeContainerWorkdir) == "" {
+		issues = append(issues, ValidationIssue{Field: "RuntimeContainerWorkdir", Message: "is required"})
 	}
 	if cfg.TokenPromptPricePerMillion <= 0 {
 		issues = append(issues, ValidationIssue{Field: "TokenPromptPricePerMillion", Message: "must be positive"})

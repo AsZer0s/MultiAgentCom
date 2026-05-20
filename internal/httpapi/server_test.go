@@ -263,6 +263,52 @@ func TestHTTPReadyFetchesRemoteGitWorkspace(t *testing.T) {
 	}
 }
 
+func TestHTTPReadyChecksContainerRuntimeBinary(t *testing.T) {
+	cfg := config.Config{
+		Address:                        ":0",
+		ServiceName:                    "test-http-ready-container",
+		ArtifactRoot:                   t.TempDir(),
+		SandboxRoot:                    t.TempDir(),
+		RuntimeProvider:                "container",
+		RuntimeContainerImage:          "multiagent-runtime:test",
+		RuntimeContainerBinary:         "/bin/sh",
+		RuntimeContainerNetwork:        "none",
+		RuntimeContainerReadonlyRootFS: true,
+		RuntimeContainerWorkdir:        "/workspace",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSON(t, server.Client(), server.URL+"/ready")
+	assertContainsBody(t, body, `"name":"runtime"`)
+	assertContainsBody(t, body, `"status":"ready"`)
+}
+
+func TestHTTPReadyRejectsMissingContainerRuntimeBinary(t *testing.T) {
+	cfg := config.Config{
+		Address:                        ":0",
+		ServiceName:                    "test-http-ready-container-missing",
+		ArtifactRoot:                   t.TempDir(),
+		SandboxRoot:                    t.TempDir(),
+		RuntimeProvider:                "container",
+		RuntimeContainerImage:          "multiagent-runtime:test",
+		RuntimeContainerBinary:         "definitely-missing-container-runtime-binary",
+		RuntimeContainerNetwork:        "none",
+		RuntimeContainerReadonlyRootFS: true,
+		RuntimeContainerWorkdir:        "/workspace",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSONExpectStatus(t, server.Client(), server.URL+"/ready", http.StatusServiceUnavailable)
+	assertContainsBody(t, body, `"status":"not_ready"`)
+	assertContainsBody(t, body, `"name":"runtime"`)
+}
+
 func TestHTTPReadyReportsConfigFailure(t *testing.T) {
 	cfg := config.Config{
 		Address:         ":0",
@@ -616,6 +662,8 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 		"Task Topology",
 		"topologyPanel",
 		"Failure Alerts",
+		"HITL Conflicts",
+		"conflictPanel",
 		"Audit Trail",
 		"Agent Message Log",
 		"Token Cost Trend",
@@ -641,6 +689,9 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 	}
 	if !strings.Contains(bodyText, "renderPanelFetch") {
 		t.Fatalf("expected status panel html to isolate project panel fetch failures, got %s", bodyText)
+	}
+	if !strings.Contains(bodyText, "renderConflictQueue") || !strings.Contains(bodyText, "/conflicts") || !strings.Contains(bodyText, "OPEN") || !strings.Contains(bodyText, "RESOLVED") {
+		t.Fatalf("expected status panel html to render HITL conflict queue, got %s", bodyText)
 	}
 	if !strings.Contains(bodyText, "renderTopology") || !strings.Contains(bodyText, "createElementNS") {
 		t.Fatalf("expected status panel html to render SVG task topology safely, got %s", bodyText)

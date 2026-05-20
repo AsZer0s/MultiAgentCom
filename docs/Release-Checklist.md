@@ -67,6 +67,7 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - `GET /status/panel` 任务拓扑展示依赖边、agent lane、通信 badge，并可点击任务节点按 `taskId` 过滤日志
 - `GET /status/panel` 页面包含 `Agent Message Log`
 - `GET /status/panel` 页面包含 `Failure Alerts`
+- `GET /status/panel` 页面包含 `HITL Conflicts`，并能展示 `OPEN` / `RESOLVED` conflict queue 条目
 - `GET /status/panel` 页面包含 `Audit Trail`
 - `GET /status/panel` 页面包含 `Token Cost Trend`
 - `GET /status/panel` 页面包含 `Sandboxes`
@@ -95,6 +96,8 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回 `runtime.http.v1` success 时可执行成功并采用嵌套 `usage`
 - `MULTI_AGENT_RUNTIME_HTTP_BEARER_TOKEN` 配置后，runtime provider 请求携带 `Authorization: Bearer ...`
 - `MULTI_AGENT_RUNTIME_HTTP_MAX_ATTEMPTS` 配置后，runtime provider 对 retryable 失败执行有界重试；`release-check.sh` 会验证一次 `503` 后成功恢复
+- `MULTI_AGENT_RUNTIME_PROVIDER=container` 且配置 `MULTI_AGENT_RUNTIME_CONTAINER_IMAGE` 后，`GET /ready` 校验 container binary 可执行；binary 缺失时返回 `not_ready`，readiness 不 pull image、不启动容器
+- `MULTI_AGENT_RUNTIME_PROVIDER=container` 执行时只挂载任务 workspace，默认 `MULTI_AGENT_RUNTIME_CONTAINER_NETWORK=none`、`MULTI_AGENT_RUNTIME_CONTAINER_READONLY_ROOTFS=true`，并通过 stdin 传入 prompt/context/sandbox workspace 元数据
 - `MULTI_AGENT_RUNTIME_PROVIDER=http` runtime provider 返回结构化非 2xx error 时，run 失败原因包含稳定 code/status/retryable/requestId，且项目告警记录该失败
 - 配置 `MULTI_AGENT_API_TOKEN` 后，未带 token 的 API 请求返回 `401`
 - 配置 `MULTI_AGENT_API_TOKEN` 后，带 token 的 API 请求可正常创建项目并写入审计

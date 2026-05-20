@@ -185,6 +185,12 @@ func TestLoadRuntimeDefaults(t *testing.T) {
 	if cfg.RuntimeHTTPRetryBaseDelay != 100*time.Millisecond {
 		t.Fatalf("RuntimeHTTPRetryBaseDelay = %s, want %s", cfg.RuntimeHTTPRetryBaseDelay, 100*time.Millisecond)
 	}
+	if cfg.RuntimeContainerBinary != "docker" || cfg.RuntimeContainerNetwork != "none" || cfg.RuntimeContainerWorkdir != "/workspace" {
+		t.Fatalf("unexpected container runtime defaults: %+v", cfg)
+	}
+	if !cfg.RuntimeContainerReadonlyRootFS {
+		t.Fatal("expected container readonly rootfs default")
+	}
 }
 
 func TestLoadRuntimeOverrides(t *testing.T) {
@@ -194,6 +200,12 @@ func TestLoadRuntimeOverrides(t *testing.T) {
 	t.Setenv("MULTI_AGENT_RUNTIME_HTTP_BEARER_TOKEN", "runtime-secret")
 	t.Setenv("MULTI_AGENT_RUNTIME_HTTP_MAX_ATTEMPTS", "3")
 	t.Setenv("MULTI_AGENT_RUNTIME_HTTP_RETRY_BASE_DELAY", "250ms")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_BINARY", "podman")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_IMAGE", "multiagent-runtime:test")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_NETWORK", "bridge")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_USER", "1000:1000")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_READONLY_ROOTFS", "false")
+	t.Setenv("MULTI_AGENT_RUNTIME_CONTAINER_WORKDIR", "/work")
 	t.Setenv("MULTI_AGENT_TOKEN_PROMPT_PRICE_PER_MILLION", "3.5")
 	t.Setenv("MULTI_AGENT_TOKEN_OUTPUT_PRICE_PER_MILLION", "7.25")
 	t.Setenv("MULTI_AGENT_TOKEN_BUDGET_WARN_USD", "10")
@@ -218,6 +230,12 @@ func TestLoadRuntimeOverrides(t *testing.T) {
 	}
 	if cfg.RuntimeHTTPRetryBaseDelay != 250*time.Millisecond {
 		t.Fatalf("RuntimeHTTPRetryBaseDelay = %s, want %s", cfg.RuntimeHTTPRetryBaseDelay, 250*time.Millisecond)
+	}
+	if cfg.RuntimeContainerBinary != "podman" || cfg.RuntimeContainerImage != "multiagent-runtime:test" || cfg.RuntimeContainerNetwork != "bridge" || cfg.RuntimeContainerUser != "1000:1000" || cfg.RuntimeContainerWorkdir != "/work" {
+		t.Fatalf("unexpected container runtime overrides: %+v", cfg)
+	}
+	if cfg.RuntimeContainerReadonlyRootFS {
+		t.Fatal("expected readonly rootfs override to be false")
 	}
 	if cfg.TokenPromptPricePerMillion != 3.5 || cfg.TokenOutputPricePerMillion != 7.25 {
 		t.Fatalf("unexpected token prices: %+v", cfg)
@@ -249,6 +267,26 @@ func TestValidateAcceptsDefaultConfig(t *testing.T) {
 	if err := Validate(Config{}); err != nil {
 		t.Fatalf("Validate default config: %v", err)
 	}
+}
+
+func TestValidateAcceptsContainerRuntimeConfig(t *testing.T) {
+	if err := Validate(Config{RuntimeProvider: "container", RuntimeContainerImage: "multiagent-runtime:test"}); err != nil {
+		t.Fatalf("Validate container runtime config: %v", err)
+	}
+}
+
+func TestValidateRejectsContainerRuntimeWithoutImage(t *testing.T) {
+	err := Validate(Config{RuntimeProvider: "container"})
+	issues := ValidationIssues(err)
+	if len(issues) == 0 {
+		t.Fatal("expected validation issue")
+	}
+	for _, issue := range issues {
+		if issue.Field == "RuntimeContainerImage" {
+			return
+		}
+	}
+	t.Fatalf("expected RuntimeContainerImage issue, got %v", issues)
 }
 
 func TestValidateRejectsInvalidProductionConfig(t *testing.T) {

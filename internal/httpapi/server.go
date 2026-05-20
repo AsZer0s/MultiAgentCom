@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -901,6 +902,14 @@ func (s *Server) readiness() readinessResult {
 		addCheck("runtime", nil)
 	} else if strings.EqualFold(strings.TrimSpace(cfg.RuntimeProvider), "local") {
 		addCheck("runtime", nil)
+	} else if strings.EqualFold(strings.TrimSpace(cfg.RuntimeProvider), "container") {
+		if strings.TrimSpace(cfg.RuntimeContainerImage) == "" {
+			addCheck("runtime", fmt.Errorf("runtime provider container requires RuntimeContainerImage"))
+		} else if _, err := exec.LookPath(strings.TrimSpace(cfg.RuntimeContainerBinary)); err != nil {
+			addCheck("runtime", err)
+		} else {
+			addCheck("runtime", nil)
+		}
 	} else {
 		addCheck("runtime", fmt.Errorf("runtime provider %q is not registered", cfg.RuntimeProvider))
 	}
@@ -1430,9 +1439,9 @@ func renderStatusPanelHTML(serviceName string) string {
     .dot { width: 10px; height: 10px; border-radius: 999px; background: var(--idle); }
     .status.RUNNING .dot, .status.ACTIVE .dot, .status.SUCCEEDED .dot { background: var(--accent); }
     .status.READY .dot, .status.PENDING .dot, .status.RELEASED .dot { background: var(--warn); }
-    .status.BLOCKED .dot, .status.FAILED .dot, .status.ERROR .dot, .status.CRITICAL .dot { background: var(--bad); }
+    .status.BLOCKED .dot, .status.FAILED .dot, .status.ERROR .dot, .status.CRITICAL .dot, .status.OPEN .dot { background: var(--bad); }
     .status.HUMAN_OVERRIDE .dot { background: var(--hold); }
-    .status.COMPLETED .dot, .status.DONE .dot, .status.OK .dot { background: var(--ok); }
+    .status.COMPLETED .dot, .status.DONE .dot, .status.OK .dot, .status.RESOLVED .dot { background: var(--ok); }
     table { width: 100%%; border-collapse: collapse; margin-top: 12px; }
     th, td { text-align: left; padding: 12px 10px; border-top: 1px solid rgba(214, 202, 184, 0.7); vertical-align: top; font-size: 14px; }
     th { color: var(--muted); font-weight: 600; }
@@ -1458,8 +1467,9 @@ func renderStatusPanelHTML(serviceName string) string {
       padding: 12px 14px;
       background: rgba(255,255,255,0.6);
     }
-    .item.CRITICAL, .item.FAILED { border-color: rgba(180, 35, 24, 0.45); box-shadow: inset 0 0 0 1px rgba(180, 35, 24, 0.12); }
+    .item.CRITICAL, .item.FAILED, .item.OPEN { border-color: rgba(180, 35, 24, 0.45); box-shadow: inset 0 0 0 1px rgba(180, 35, 24, 0.12); }
     .item.ERROR, .item.WARN { border-color: rgba(183, 121, 31, 0.45); box-shadow: inset 0 0 0 1px rgba(183, 121, 31, 0.12); }
+    .item.RESOLVED { border-color: rgba(15, 139, 76, 0.42); box-shadow: inset 0 0 0 1px rgba(15, 139, 76, 0.10); }
     .trend-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 8px; }
     .trend-head strong { display: block; }
     .bar-track { width: 100%%; height: 10px; border-radius: 999px; background: rgba(22, 93, 255, 0.12); overflow: hidden; }
@@ -1479,7 +1489,7 @@ func renderStatusPanelHTML(serviceName string) string {
     <section class="hero">
       <div class="eyebrow">Operational View</div>
       <h1>Operations Dashboard</h1>
-      <div class="sub">集中查看 readiness、Status Matrix、Failure Alerts、Audit Trail、Agent Message Log、Token Cost Trend、Sandboxes 和 Snapshots。页面复用现有 JSON/SSE API，并在 SSE 中断时保留轮询兜底。</div>
+      <div class="sub">集中查看 readiness、Status Matrix、Failure Alerts、HITL Conflicts、Audit Trail、Agent Message Log、Token Cost Trend、Sandboxes 和 Snapshots。页面复用现有 JSON/SSE API，并在 SSE 中断时保留轮询兜底。</div>
     </section>
 
     <section id="readinessPanel" class="panel"></section>
@@ -1504,8 +1514,9 @@ func renderStatusPanelHTML(serviceName string) string {
       <section id="matrixPanel" class="panel"></section>
       <div class="two-col">
         <section id="alertPanel" class="panel"></section>
-        <section id="auditPanel" class="panel"></section>
+        <section id="conflictPanel" class="panel"></section>
       </div>
+      <section id="auditPanel" class="panel"></section>
       <section id="commPanel" class="panel"></section>
       <section id="costPanel" class="panel"></section>
       <div class="two-col">
@@ -1527,6 +1538,7 @@ func renderStatusPanelHTML(serviceName string) string {
     const generatedAt = document.getElementById("generatedAt");
     const streamState = document.getElementById("streamState");
     const alertPanel = document.getElementById("alertPanel");
+    const conflictPanel = document.getElementById("conflictPanel");
     const auditPanel = document.getElementById("auditPanel");
     const commPanel = document.getElementById("commPanel");
     const costPanel = document.getElementById("costPanel");
@@ -1546,7 +1558,7 @@ func renderStatusPanelHTML(serviceName string) string {
     }
 
     function statusClass(value) {
-      const allowed = new Set(['RUNNING', 'READY', 'BLOCKED', 'HUMAN_OVERRIDE', 'COMPLETED', 'DONE', 'IDLE', 'CREATED', 'IN_PROGRESS', 'FAILED', 'PENDING', 'SUCCEEDED', 'ACTIVE', 'RELEASED', 'OK', 'ERROR', 'CRITICAL']);
+      const allowed = new Set(['RUNNING', 'READY', 'BLOCKED', 'HUMAN_OVERRIDE', 'COMPLETED', 'DONE', 'IDLE', 'CREATED', 'IN_PROGRESS', 'FAILED', 'PENDING', 'SUCCEEDED', 'ACTIVE', 'RELEASED', 'OK', 'ERROR', 'CRITICAL', 'OPEN', 'RESOLVED']);
       const normalized = String(value || 'IDLE').toUpperCase().replace(/[^A-Z_]/g, '_');
       return allowed.has(normalized) ? normalized : 'IDLE';
     }
@@ -1893,6 +1905,31 @@ func renderStatusPanelHTML(serviceName string) string {
       alertPanel.replaceChildren(panelHead('Alerts', 'Failure Alerts', ['Project ' + projectId, 'Count ' + (payload.count || 0)]), list.childElementCount ? list : empty('No active alerts'));
     }
 
+    function renderConflictQueue(projectId, payload) {
+      if (!projectId) {
+        conflictPanel.replaceChildren(panelHead('HITL', 'HITL Conflicts', []), empty('选择一个项目后可查看 HITL 冲突队列。'));
+        return;
+      }
+      const list = el('div', 'item-list');
+      let openCount = 0;
+      (payload.items || []).forEach((item) => {
+        const status = item.status || 'OPEN';
+        if (String(status).toUpperCase() === 'OPEN') openCount += 1;
+        const owner = item.requestedOwner || item.currentOwner ? (item.requestedOwner || '-') + ' → ' + (item.currentOwner || '-') : 'owner -';
+        const resource = item.taskId || item.resourceId || '-';
+        const entry = el('div', 'item ' + statusClass(status));
+        const pills = [status, owner, resource, 'Created ' + formatTime(item.createdAt)];
+        if (item.resolvedAt) pills.push('Resolved ' + formatTime(item.resolvedAt));
+        entry.appendChild(panelHead(item.kind || 'Conflict', item.scope || '-', pills));
+        entry.appendChild(el('div', 'statline', item.reason || '-'));
+        if (item.resolvedBy || item.resolutionNote) {
+          entry.appendChild(el('div', 'statline', 'Resolved by ' + (item.resolvedBy || '-') + ' · ' + (item.resolutionNote || '-')));
+        }
+        list.appendChild(entry);
+      });
+      conflictPanel.replaceChildren(panelHead('HITL', 'HITL Conflicts', ['Project ' + projectId, 'Open ' + openCount, 'Count ' + (payload.count || 0)]), list.childElementCount ? list : empty('No HITL conflicts queued'));
+    }
+
     function renderAuditLogs(projectId, payload) {
       if (!projectId) {
         auditPanel.replaceChildren(panelHead('Audit', 'Audit Trail', []), empty('选择一个项目后可查看关键操作审计。'));
@@ -1998,6 +2035,7 @@ func renderStatusPanelHTML(serviceName string) string {
     async function loadProjectPanels(projectId) {
       if (!projectId) {
         renderAlerts('', { items: [], count: 0 });
+        renderConflictQueue('', { items: [], count: 0 });
         renderAuditLogs('', { items: [], count: 0 });
         renderCommunications('', { items: [], count: 0 });
         renderCosts('', { points: [], totalTokens: 0, estimatedCostUsd: 0, maxTokens: 0 });
@@ -2009,8 +2047,9 @@ func renderStatusPanelHTML(serviceName string) string {
       const limit = encodeURIComponent(logLimit.value || '25');
       const scopedTask = taskId ? '&taskId=' + encodeURIComponent(taskId) : '';
       const costPath = '/projects/' + encodeURIComponent(projectId) + '/token-costs' + (taskId ? '?taskId=' + encodeURIComponent(taskId) : '');
-      const [, , communications, costs] = await Promise.all([
+      const [, , , communications, costs] = await Promise.all([
         renderPanelFetch(alertPanel, 'Failure Alerts', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/alerts?limit=' + limit), (payload) => renderAlerts(projectId, payload)),
+        renderPanelFetch(conflictPanel, 'HITL Conflicts', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/conflicts'), (payload) => renderConflictQueue(projectId, payload)),
         renderPanelFetch(auditPanel, 'Audit Trail', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/audit-logs?limit=' + limit), (payload) => renderAuditLogs(projectId, payload)),
         renderPanelFetch(commPanel, 'Agent Message Log', () => fetchJSON('/projects/' + encodeURIComponent(projectId) + '/communications?limit=' + limit + scopedTask), (payload) => renderCommunications(projectId, payload)),
         renderPanelFetch(costPanel, 'Token Cost Trend', () => fetchJSON(costPath), (payload) => renderCosts(projectId, payload)),

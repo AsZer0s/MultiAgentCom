@@ -27,7 +27,7 @@
 - 当前元数据存储：**memory / file provider**；目标演进：**PostgreSQL**
 - 当前缓存/消息：**进程内调度与状态流**；目标演进：**Redis（缓存 + Stream）**
 - 当前 artifact 存储：**本地文件系统**；目标演进：**MinIO（本地）/ S3 兼容（线上）**
-- 当前 workspace/sandbox：**directory provider + local-only Git workspace provider v1**；目标演进：**Docker 容器 + 远程 Git clone/fetch/push/rebase 能力**
+- 当前 workspace/sandbox：**directory provider + Git workspace provider v5 + container runtime provider MVP**；目标演进：**更强的容器沙盒隔离（如 gVisor / Firecracker）与更完整的远程 Git 能力**
 - 部署编排：当前可本地单进程运行；目标演进：**docker-compose（MVP）**
 - 可观测基线：**结构化日志 + readiness/status panel + audit/alert/token cost**
 
@@ -128,7 +128,7 @@
 - **gVisor/Firecracker：** 安全性更高，但接入复杂度更高，适合后续阶段。
 
 ### 结论
-- 当前实现提供 directory provider 与 Git workspace provider v5：Git provider 支持本地已有 repo 或 remote clone 的 worktree、任务分支 commit、shared sandbox `git merge --no-ff`、snapshot workspace ref、remote fetch-before-use、非 force push、受管 private rebase，以及合并后已用 worktree/branch 清理；容器级隔离仍是后续生产化方向。
+- 当前实现提供 directory provider 与 Git workspace provider v5，且 runtime 层已支持 container runtime provider MVP：Git provider 支持本地已有 repo 或 remote clone 的 worktree、任务分支 commit、shared sandbox `git merge --no-ff`、snapshot workspace ref、remote fetch-before-use、非 force push、受管 private rebase，以及合并后已用 worktree/branch 清理；container provider 以独立容器进程边界提供最小 sandbox 隔离，但更强隔离仍是后续生产化方向。
 
 ## 4.8 部署：docker-compose（MVP）
 
@@ -179,7 +179,14 @@
   - 服务实例扩展超过单机能力。
   - 需要自动扩缩容、滚动发布、灰度策略。
 
-## 7.3 Docker 沙盒 -> 强隔离沙盒
+## 7.3 Container sandbox MVP -> 强隔离沙盒
+- **当前状态：** runtime 层已具备 container provider MVP，使用容器进程边界与最小挂载面提供基础隔离。
+- **触发条件：**
+  - 安全审计要求提升。
+  - 多租户隔离要求提升。
+- **升级候选：** gVisor / Firecracker。
+
+## 8. 版本兼容与约束建议
 - **触发条件：**
   - 安全审计要求提升。
   - 多租户隔离要求提升。

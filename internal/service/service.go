@@ -558,6 +558,27 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 			}
 		}
 	}
+	if strings.EqualFold(runtimeProvider, "container") || strings.TrimSpace(cfg.RuntimeContainerImage) != "" {
+		options := agentruntime.ContainerRunnerOptions{
+			Binary:         cfg.RuntimeContainerBinary,
+			Image:          cfg.RuntimeContainerImage,
+			Network:        cfg.RuntimeContainerNetwork,
+			User:           cfg.RuntimeContainerUser,
+			ReadonlyRootFS: cfg.RuntimeContainerReadonlyRootFS,
+			Workdir:        cfg.RuntimeContainerWorkdir,
+		}
+		if runner, err := agentruntime.NewContainerRunnerWithOptions(options); err != nil {
+			runtimeInitErr = fmt.Errorf("initialize container runtime runner: %w", err)
+			if logger != nil {
+				logger.Warn("failed to initialize container runtime runner", "image", cfg.RuntimeContainerImage, "error", err)
+			}
+		} else if err := runtimeRegistry.Register("container", runner); err != nil {
+			runtimeInitErr = fmt.Errorf("register container runtime runner: %w", err)
+			if logger != nil {
+				logger.Warn("failed to register container runtime runner", "image", cfg.RuntimeContainerImage, "error", err)
+			}
+		}
+	}
 
 	if err := runtimeRegistry.SetDefault(runtimeProvider); err != nil {
 		if explicitRuntimeProvider {
@@ -2408,11 +2429,18 @@ func (s *Service) executeRuntimeRun(run *domain.AgentRun, task *domain.Task, pla
 
 	ctx := context.Background()
 	request := agentruntime.Request{
-		ProjectID: project.ID,
-		TaskID:    task.ID,
-		RunID:     run.ID,
-		AgentType: run.AgentType,
-		Timeout:   s.cfg.RuntimeTimeout,
+		ProjectID:         project.ID,
+		TaskID:            task.ID,
+		RunID:             run.ID,
+		AgentType:         run.AgentType,
+		Timeout:           s.cfg.RuntimeTimeout,
+		SandboxID:         run.SandboxID,
+		SandboxRootPath:   sandboxRootPath(sandbox),
+		WorkspacePath:     sandboxWorkspacePath(sandbox),
+		WorkspaceProvider: sandboxWorkspaceProvider(sandbox),
+		WorkspaceBranch:   sandboxWorkspaceBranch(sandbox),
+		WorkspaceBaseRef:  sandboxWorkspaceBaseRef(sandbox),
+		WorkspaceHeadRef:  sandboxWorkspaceHeadRef(sandbox),
 		Prompt: fmt.Sprintf(
 			"Execute task %s (%s) for project %s plan v%d",
 			task.Name,
@@ -2488,6 +2516,13 @@ func sandboxWorkspaceBaseRef(sandbox *domain.Sandbox) string {
 		return ""
 	}
 	return strings.TrimSpace(sandbox.WorkspaceBaseRef)
+}
+
+func sandboxWorkspaceHeadRef(sandbox *domain.Sandbox) string {
+	if sandbox == nil {
+		return ""
+	}
+	return strings.TrimSpace(sandbox.WorkspaceHeadRef)
 }
 
 func (s *Service) estimateCostFromTokens(promptTokens, completionTokens int) float64 {
