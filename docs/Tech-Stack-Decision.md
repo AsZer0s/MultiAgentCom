@@ -128,7 +128,7 @@
 - **gVisor/Firecracker：** 安全性更高，但接入复杂度更高，适合后续阶段。
 
 ### 结论
-- 当前实现提供 directory provider 与 local-only Git workspace provider v1：Git provider 支持本地已有 repo 的 worktree、任务分支 commit、shared sandbox `git merge --no-ff` 和 snapshot workspace ref；远程 clone/fetch/push、rebase 执行和容器隔离仍是后续生产化方向。
+- 当前实现提供 directory provider 与 Git workspace provider v5：Git provider 支持本地已有 repo 或 remote clone 的 worktree、任务分支 commit、shared sandbox `git merge --no-ff`、snapshot workspace ref、remote fetch-before-use、非 force push、受管 private rebase，以及合并后已用 worktree/branch 清理；容器级隔离仍是后续生产化方向。
 
 ## 4.8 部署：docker-compose（MVP）
 
