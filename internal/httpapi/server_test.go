@@ -718,6 +718,9 @@ func TestHTTPStatusMatrixAndPanel(t *testing.T) {
 	if !strings.Contains(bodyText, "renderConflictQueue") || !strings.Contains(bodyText, "/conflicts") || !strings.Contains(bodyText, "OPEN") || !strings.Contains(bodyText, "RESOLVED") {
 		t.Fatalf("expected status panel html to render HITL conflict queue, got %s", bodyText)
 	}
+	if !strings.Contains(bodyText, "Resolve conflict") || !strings.Contains(bodyText, "postJSON") || !strings.Contains(bodyText, "Resolved from status panel") {
+		t.Fatalf("expected status panel html to resolve HITL conflicts, got %s", bodyText)
+	}
 	if !strings.Contains(bodyText, "renderTopology") || !strings.Contains(bodyText, "createElementNS") {
 		t.Fatalf("expected status panel html to render SVG task topology safely, got %s", bodyText)
 	}

@@ -1409,6 +1409,8 @@ func renderStatusPanelHTML(serviceName string) string {
       font: inherit;
     }
     .toolbar button { background: var(--ink); color: #fff; cursor: pointer; }
+    .inline-action { border: 1px solid var(--line); border-radius: 999px; background: var(--ink); color: #fff; cursor: pointer; padding: 7px 12px; font: inherit; font-size: 12px; }
+    .inline-action:disabled { cursor: wait; opacity: 0.65; }
     .dashboard-grid { display: grid; gap: 18px; }
     .two-col { display: grid; gap: 18px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .panel {
@@ -1597,6 +1599,16 @@ func renderStatusPanelHTML(serviceName string) string {
 
     async function fetchJSON(path) {
       const response = await fetch(withAuth(path), { headers: { 'Accept': 'application/json' } });
+      if (!response.ok) throw new Error(path + ' returned ' + response.status);
+      return response.json();
+    }
+
+    async function postJSON(path, payload) {
+      const response = await fetch(withAuth(path), {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {})
+      });
       if (!response.ok) throw new Error(path + ' returned ' + response.status);
       return response.json();
     }
@@ -1914,7 +1926,8 @@ func renderStatusPanelHTML(serviceName string) string {
       let openCount = 0;
       (payload.items || []).forEach((item) => {
         const status = item.status || 'OPEN';
-        if (String(status).toUpperCase() === 'OPEN') openCount += 1;
+        const isOpen = String(status).toUpperCase() === 'OPEN';
+        if (isOpen) openCount += 1;
         const owner = item.requestedOwner || item.currentOwner ? (item.requestedOwner || '-') + ' → ' + (item.currentOwner || '-') : 'owner -';
         const resource = item.taskId || item.resourceId || '-';
         const entry = el('div', 'item ' + statusClass(status));
@@ -1922,6 +1935,23 @@ func renderStatusPanelHTML(serviceName string) string {
         if (item.resolvedAt) pills.push('Resolved ' + formatTime(item.resolvedAt));
         entry.appendChild(panelHead(item.kind || 'Conflict', item.scope || '-', pills));
         entry.appendChild(el('div', 'statline', item.reason || '-'));
+        if (isOpen && item.id) {
+          const button = el('button', 'inline-action', 'Resolve conflict');
+          button.type = 'button';
+          button.addEventListener('click', async function() {
+            button.disabled = true;
+            button.textContent = 'Resolving...';
+            try {
+              await postJSON('/projects/' + encodeURIComponent(projectId) + '/conflicts/' + encodeURIComponent(item.id) + '/resolve', { resolutionNote: 'Resolved from status panel' });
+              await loadDashboard();
+            } catch (err) {
+              button.disabled = false;
+              button.textContent = 'Resolve conflict';
+              entry.appendChild(el('div', 'statline error', err.message || String(err)));
+            }
+          });
+          entry.appendChild(button);
+        }
         if (item.resolvedBy || item.resolutionNote) {
           entry.appendChild(el('div', 'statline', 'Resolved by ' + (item.resolvedBy || '-') + ' · ' + (item.resolutionNote || '-')));
         }
