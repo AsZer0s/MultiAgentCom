@@ -297,52 +297,68 @@
 - **DoD：** 每次里程碑后更新 Spec/Plan/Case。
 
 ### BL-905 Git workspace 清理生命周期
+- **状态：** Done
 - **优先级：** P1
 - **估时：** 1 PD
 - **目标：** 减少 local Git provider 长期运行后的 worktree/branch 污染。
 - **DoD：** 已合并私有 worktree 可安全清理，cleanup API 支持 dry-run；分支删除保持显式 opt-in 且不使用 force。
+- **完成范围：** 已提供 `POST /projects/{id}/workspaces/cleanup`，支持 dry-run、PRIVATE/SHARED scope、已合并私有 worktree 清理、分支删除显式 opt-in，HTTP 覆盖 dry-run 与安全保留行为。
 
 ### BL-906 Remote Git 最小闭环
+- **状态：** Done
 - **优先级：** P1
 - **估时：** 1.5 PD
 - **目标：** 将 Git workspace 从 local-only 扩展到 remote-backed MVP。
 - **DoD：** 支持 remote clone、fetch-before-use、private/shared branch 非 force push；token 不写入 remote URL 且错误脱敏；force push/remote 删除保持 out of scope。
+- **完成范围：** Git provider 已支持 remote URL clone、fetch-before-use、origin/main base、private/shared branch 非 force push、token file/auth username 配置与 remote URL credential 校验。
 
 ### BL-907 Git rebase 安全最小闭环
+- **状态：** Done
 - **优先级：** P1
 - **估时：** 1.5 PD
 - **目标：** 为已生成的受管 private task workspace 提供显式、可审计的 rebase 能力。
 - **DoD：** rebase API 要求显式 `targetRef` 与 sandbox 选择；支持 dry-run ahead/behind；dirty content worktree 被拒绝；冲突自动 abort 且保留原 head；可选 publish 仅使用非 force push。
+- **完成范围：** 已提供 `POST /projects/{id}/workspaces/rebase`，要求显式 `targetRef` 与 `sandboxIds` 或 `all=true`，支持 dry-run、dirty worktree 拒绝、冲突 abort、受管 private workspace 限定与非 force publish。
 
 ### BL-908 Pure Git snapshot restore
+- **状态：** Done
 - **优先级：** P1
 - **估时：** 1.5 PD
 - **目标：** 将 Git workspace snapshot 从“仅记录 ref”扩展为可安全恢复的 rollback worktree。
 - **DoD：** rollback 到 Git snapshot 会创建新的受管 shared rollback worktree；checksum/ref mismatch 被拒绝；不覆盖已有 worktree；后续 shared merge 以 restored head 为 base；service/HTTP 测试覆盖成功与安全失败。
+- **完成范围：** Git workspace snapshot rollback 已创建受管 shared rollback worktree/branch，校验 `workspaceStateRef` 与 `workspaceChecksum`，不 reset 原 shared worktree，rollback 后续 shared merge 使用 restored head 作为 base。
 
 ### BL-909 Go AST lock hardening
+- **状态：** Done
 - **优先级：** P1
 - **估时：** 1 PD
 - **目标：** 补强 Go symbol lock 的 marker 归属校验与缺失目标文件创建能力。
 - **DoD：** `LOCKED BY HUMAN` 必须位于被锁定 symbol/doc comment 内；method 支持 `Receiver.Method` 精确区分同名 receiver；grouped `type/var/const` 只替换命中的目标 spec；缺失 Go 文件可由 locked content 的 package/import 上下文创建；service/HTTP 测试覆盖 marker 拒绝、doc comment 保留、receiver 区分、grouped spec 精确替换和缺失文件创建。
+- **完成范围：** Go symbol lock 已支持 marker 归属校验、receiver-qualified method、grouped declaration spec 精确替换、缺失 Go 文件创建、import reconciliation 与 HTTP/service 覆盖。
 
 ### BL-910 HITL lock lease and conflict queue
+- **状态：** Done
 - **优先级：** P1
 - **估时：** 1.5 PD
 - **目标：** 将 HITL override / code lock 升级为带 owner lease 的本地治理流程。
 - **DoD：** override/lock 支持 `owner` 与 `ttlSeconds`；同 scope 未过期 lease owner 不同时进入 `OPEN` conflict queue；conflict 可查询与 resolve；file-store 持久化与 audit 覆盖通过。
+- **完成范围：** override/code lock 已支持 owner/TTL lease、冲突入队、`GET /projects/{id}/conflicts`、resolve API、file-store 持久化与 `HITL_CONFLICT_RESOLVED` audit。
 
 ### BL-911 Container sandbox isolation MVP
+- **状态：** Done
 - **优先级：** P1
 - **估时：** 1.5 PD
 - **目标：** 为 runtime provider 增加容器级隔离的最小闭环。
 - **DoD：** `MULTI_AGENT_RUNTIME_PROVIDER=container` 可注册并执行 container runtime；支持 binary/image/network/user/read-only/workdir 配置；只挂载 workspace，默认 `network=none` 与 `read-only=true`；通过 stdin 传入结构化 sandbox/workspace 元数据；readiness 校验 binary 可执行但不 pull image、不启动容器；service/HTTP/unit 测试覆盖成功、timeout、stderr failure 与缺失 binary。
+- **完成范围：** container runtime 已支持注册执行、workspace-only mount、stdin payload、binary/image/network/user/read-only/workdir 配置、资源限制、tmpfs writable paths、entrypoint/command、轻量 readiness 与 opt-in 真实 smoke。
 
 ### BL-912 HITL conflict dashboard
+- **状态：** Done
 - **优先级：** P1
 - **估时：** 1 PD
 - **目标：** 将 HITL conflict queue 暴露到状态面板。
 - **DoD：** `/status/panel` 增加 HITL Conflicts 面板；通过 `/projects/{id}/conflicts` 获取数据；OPEN/RESOLVED 条目以不同样式渲染；空态与 project-less 状态有明确提示；HTTP panel smoke 覆盖通过。
+- **完成范围：** 状态面板已展示 HITL Conflicts、区分 OPEN/RESOLVED、支持空态/project-less 提示，并可直接 resolve open conflict 后刷新队列。
 
 ## 8. 依赖总览（关键路径）
 
