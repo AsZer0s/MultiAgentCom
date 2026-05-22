@@ -368,6 +368,14 @@
 - **DoD：** Service 通过 typed state-store seam 读写持久化状态；FileStore 保存采用 temp-file/fsync/rename 并同步目录；`/ready` 校验 file-store `service-state.json` JSON 与版本；release check 覆盖 file-store restart smoke；Postgres 保持后续目标而不暴露未完成 provider。
 - **完成范围：** 已新增 service typed state-store 适配层、file-store state path helper 与目录 fsync；`/ready` 增加 `fileStoreState` 检查并拒绝损坏/不支持版本；release check 新增 file-store 重启烟测；README/Release Checklist 已同步 Postgres 前置边界说明。
 
+### BL-914 Postgres store provider MVP
+- **状态：** Done
+- **优先级：** P1
+- **估时：** 1.5 PD
+- **目标：** 将 typed service-state 持久化扩展到真实 Postgres provider。
+- **DoD：** `MULTI_AGENT_STORE_PROVIDER=postgres` 与 `MULTI_AGENT_POSTGRES_DSN` 可启用 JSONB-backed store；`/ready` 校验 Postgres 连接、schema 与状态版本；service restart 可恢复项目/需求/任务状态；release check 提供 opt-in Postgres smoke；默认 CI 不依赖 Postgres。
+- **完成范围：** 已新增 Postgres raw store、`service_state` JSONB schema ensure、provider 配置校验、service wiring、`postgresStore` readiness、guarded integration tests 与 opt-in release smoke；关系化 schema / migrations / 多实例并发治理保持后续目标。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：

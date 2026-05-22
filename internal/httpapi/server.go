@@ -887,10 +887,13 @@ func (s *Server) readiness() readinessResult {
 	addCheck("config", config.Validate(cfg))
 	_, authErr := auth.New(cfg.APIToken, cfg.AuthTokens, cfg.AuthTokensFile)
 	addCheck("auth", authErr)
-	if strings.EqualFold(strings.TrimSpace(cfg.StoreProvider), "file") {
+	switch strings.ToLower(strings.TrimSpace(cfg.StoreProvider)) {
+	case "file":
 		addCheck("dataRoot", ensureWritableDir(cfg.DataRoot))
 		addCheck("fileStoreState", validateFileStoreState(cfg.DataRoot))
-	} else {
+	case "postgres":
+		addCheck("postgresStore", store.CheckPostgres(context.Background(), cfg.PostgresDSN))
+	default:
 		addCheck("store", nil)
 	}
 	addCheck("artifactRoot", ensureWritableDir(cfg.ArtifactRoot))

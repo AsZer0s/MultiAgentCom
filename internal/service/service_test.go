@@ -21,6 +21,7 @@ import (
 	"multiagentcom/internal/agentruntime"
 	"multiagentcom/internal/config"
 	"multiagentcom/internal/domain"
+	"multiagentcom/internal/store"
 )
 
 func TestNewDefaultsArtifactRootWhenEmpty(t *testing.T) {
@@ -157,6 +158,62 @@ func TestCreateProjectReturnsPersistenceFailure(t *testing.T) {
 	}
 	if appErr.Code != "PERSISTENCE_FAILED" {
 		t.Fatalf("AppError.Code = %q, want PERSISTENCE_FAILED", appErr.Code)
+	}
+}
+
+func TestPostgresStoreRestoresServiceState(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	cfg := config.Config{
+		Address:       ":0",
+		ServiceName:   "test-postgres-store-restore",
+		ArtifactRoot:  t.TempDir(),
+		SandboxRoot:   t.TempDir(),
+		StoreProvider: "postgres",
+		PostgresDSN:   dsn,
+		DefaultAgent:  "manager-agent",
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	ctx := context.Background()
+	if err := store.NewPostgresStore(dsn).Save(ctx, []byte(`{"version":1}`)); err != nil {
+		t.Fatalf("reset postgres state: %v", err)
+	}
+	svc := New(cfg, logger)
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Postgres Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Persist state", Content: "Verify postgres restart durability."}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	restored := New(cfg, logger)
+	projects, err := restored.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("list restored projects: %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != project.ID {
+		t.Fatalf("expected restored project %s, got %+v", project.ID, projects)
+	}
+	requirements, err := restored.ListRequirements(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list restored requirements: %v", err)
+	}
+	if len(requirements) != 1 {
+		t.Fatalf("expected 1 restored requirement, got %d", len(requirements))
+	}
+	tasks, err := restored.ListTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list restored tasks: %v", err)
+	}
+	if len(tasks) == 0 {
+		t.Fatal("expected restored tasks")
 	}
 }
 

@@ -24,6 +24,7 @@ type Config struct {
 	AlertWebhookURL                   string
 	StoreProvider                     string
 	DataRoot                          string
+	PostgresDSN                       string
 	WorkspaceProvider                 string
 	WorkspaceGitRepoPath              string
 	WorkspaceGitBaseRef               string
@@ -95,6 +96,7 @@ func Load() Config {
 		AlertWebhookURL:                   getenv("MULTI_AGENT_ALERT_WEBHOOK_URL", ""),
 		StoreProvider:                     getenv("MULTI_AGENT_STORE_PROVIDER", "memory"),
 		DataRoot:                          getenv("MULTI_AGENT_DATA_ROOT", filepath.Join(os.TempDir(), "multiagentcom", "data")),
+		PostgresDSN:                       getenv("MULTI_AGENT_POSTGRES_DSN", ""),
 		WorkspaceProvider:                 getenv("MULTI_AGENT_WORKSPACE_PROVIDER", "directory"),
 		WorkspaceGitRepoPath:              getenv("MULTI_AGENT_WORKSPACE_GIT_REPO_PATH", ""),
 		WorkspaceGitBaseRef:               getenv("MULTI_AGENT_WORKSPACE_GIT_BASE_REF", "HEAD"),
@@ -203,12 +205,15 @@ func Validate(cfg Config) error {
 	var issues []ValidationIssue
 
 	switch strings.ToLower(strings.TrimSpace(cfg.StoreProvider)) {
-	case "memory", "file":
+	case "memory", "file", "postgres":
 	default:
-		issues = append(issues, ValidationIssue{Field: "StoreProvider", Message: "must be memory or file"})
+		issues = append(issues, ValidationIssue{Field: "StoreProvider", Message: "must be memory, file, or postgres"})
 	}
 	if strings.EqualFold(strings.TrimSpace(cfg.StoreProvider), "file") && strings.TrimSpace(cfg.DataRoot) == "" {
 		issues = append(issues, ValidationIssue{Field: "DataRoot", Message: "is required when StoreProvider is file"})
+	}
+	if strings.EqualFold(strings.TrimSpace(cfg.StoreProvider), "postgres") && strings.TrimSpace(cfg.PostgresDSN) == "" {
+		issues = append(issues, ValidationIssue{Field: "PostgresDSN", Message: "is required when StoreProvider is postgres"})
 	}
 	if strings.TrimSpace(cfg.ArtifactRoot) == "" {
 		issues = append(issues, ValidationIssue{Field: "ArtifactRoot", Message: "is required"})

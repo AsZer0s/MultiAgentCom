@@ -39,6 +39,7 @@ func TestLoadStoreOverrides(t *testing.T) {
 	dataRoot := t.TempDir()
 	t.Setenv("MULTI_AGENT_STORE_PROVIDER", "file")
 	t.Setenv("MULTI_AGENT_DATA_ROOT", dataRoot)
+	t.Setenv("MULTI_AGENT_POSTGRES_DSN", "postgres://multiagent@127.0.0.1:5432/multiagentcom_test?sslmode=disable")
 
 	cfg := Load()
 
@@ -47,6 +48,9 @@ func TestLoadStoreOverrides(t *testing.T) {
 	}
 	if cfg.DataRoot != dataRoot {
 		t.Fatalf("DataRoot = %q, want %q", cfg.DataRoot, dataRoot)
+	}
+	if cfg.PostgresDSN != "postgres://multiagent@127.0.0.1:5432/multiagentcom_test?sslmode=disable" {
+		t.Fatalf("PostgresDSN = %q, want configured DSN", cfg.PostgresDSN)
 	}
 }
 
@@ -293,6 +297,20 @@ func TestValidateAcceptsContainerRuntimeConfig(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsPostgresStoreConfig(t *testing.T) {
+	if err := Validate(Config{StoreProvider: "postgres", PostgresDSN: "postgres://multiagent@127.0.0.1:5432/multiagentcom_test?sslmode=disable"}); err != nil {
+		t.Fatalf("Validate postgres store config: %v", err)
+	}
+}
+
+func TestValidateRejectsPostgresStoreWithoutDSN(t *testing.T) {
+	err := Validate(Config{StoreProvider: "postgres"})
+	issues := ValidationIssues(err)
+	if len(issues) != 1 || issues[0].Field != "PostgresDSN" {
+		t.Fatalf("expected PostgresDSN issue, got %v", issues)
+	}
+}
+
 func TestValidateRejectsInvalidContainerRuntimeHardeningConfig(t *testing.T) {
 	err := Validate(Config{
 		RuntimeProvider:                "container",
@@ -336,7 +354,7 @@ func TestValidateRejectsContainerRuntimeWithoutImage(t *testing.T) {
 
 func TestValidateRejectsInvalidProductionConfig(t *testing.T) {
 	err := Validate(Config{
-		StoreProvider:              "postgres",
+		StoreProvider:              "invalid",
 		RuntimeProvider:            "http",
 		RuntimeEndpoint:            "://bad",
 		AlertWebhookURL:            "://bad",

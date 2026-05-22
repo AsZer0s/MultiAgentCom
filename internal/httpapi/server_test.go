@@ -418,6 +418,50 @@ func TestHTTPReadyRejectsUnsupportedFileStoreStateVersion(t *testing.T) {
 	assertContainsBody(t, body, `unsupported service state version`)
 }
 
+func TestHTTPReadyRejectsPostgresStoreWhenUnavailable(t *testing.T) {
+	cfg := config.Config{
+		Address:       ":0",
+		ServiceName:   "test-http-ready-postgres-unavailable",
+		ArtifactRoot:  t.TempDir(),
+		SandboxRoot:   t.TempDir(),
+		StoreProvider: "postgres",
+		PostgresDSN:   "postgres://multiagent@127.0.0.1:1/multiagentcom_test?sslmode=disable",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSONExpectStatus(t, server.Client(), server.URL+"/ready", http.StatusServiceUnavailable)
+	assertContainsBody(t, body, `"name":"postgresStore"`)
+}
+
+func TestHTTPReadyAcceptsPostgresStore(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	if err := store.NewPostgresStore(dsn).Save(context.Background(), []byte(`{"version":1}`)); err != nil {
+		t.Fatalf("reset postgres state: %v", err)
+	}
+	cfg := config.Config{
+		Address:       ":0",
+		ServiceName:   "test-http-ready-postgres",
+		ArtifactRoot:  t.TempDir(),
+		SandboxRoot:   t.TempDir(),
+		StoreProvider: "postgres",
+		PostgresDSN:   dsn,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSON(t, server.Client(), server.URL+"/ready")
+	assertContainsBody(t, body, `"name":"postgresStore"`)
+	assertContainsBody(t, body, `"status":"ready"`)
+}
+
 func TestHTTPRejectsOversizedJSONBody(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",

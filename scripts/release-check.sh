@@ -16,6 +16,8 @@ RUNTIME_PROVIDER_TOKEN="${RUNTIME_PROVIDER_TOKEN:-runtime-release-token}"
 RUNTIME_PROVIDER_LOG="${RUNTIME_PROVIDER_LOG:-${TMPDIR:-/tmp}/multiagentcom-runtime-provider.log}"
 FILE_STORE_SMOKE_PORT="${FILE_STORE_SMOKE_PORT:-$((27000 + RANDOM % 1000))}"
 FILE_STORE_SMOKE_ROOT="${FILE_STORE_SMOKE_ROOT:-}"
+POSTGRES_SMOKE_PORT="${POSTGRES_SMOKE_PORT:-$((28000 + RANDOM % 1000))}"
+POSTGRES_SMOKE_DSN="${MULTI_AGENT_POSTGRES_DSN:-${MULTI_AGENT_TEST_POSTGRES_DSN:-}}"
 
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]]; then
@@ -33,6 +35,10 @@ cleanup() {
   if [[ -n "${FILE_STORE_SERVER_PID:-}" ]]; then
     kill "$FILE_STORE_SERVER_PID" >/dev/null 2>&1 || true
     wait "$FILE_STORE_SERVER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${POSTGRES_SERVER_PID:-}" ]]; then
+    kill "$POSTGRES_SERVER_PID" >/dev/null 2>&1 || true
+    wait "$POSTGRES_SERVER_PID" 2>/dev/null || true
   fi
   if [[ -n "${RUNTIME_PROVIDER_PID:-}" ]]; then
     kill "$RUNTIME_PROVIDER_PID" >/dev/null 2>&1 || true
@@ -153,6 +159,25 @@ stop_file_store_server() {
   fi
 }
 
+start_postgres_store_server() {
+  (cd "$ROOT_DIR" && \
+    MULTI_AGENT_ADDR=":$POSTGRES_SMOKE_PORT" \
+    MULTI_AGENT_SERVICE_NAME="multiagentcom-postgres-smoke" \
+    MULTI_AGENT_STORE_PROVIDER="postgres" \
+    MULTI_AGENT_POSTGRES_DSN="$POSTGRES_SMOKE_DSN" \
+    go run ./cmd/server >"${LOG_FILE}.postgres" 2>&1) &
+  POSTGRES_SERVER_PID="$!"
+  wait_health "http://127.0.0.1:$POSTGRES_SMOKE_PORT" "multiagentcom-postgres-smoke"
+}
+
+stop_postgres_store_server() {
+  if [[ -n "${POSTGRES_SERVER_PID:-}" ]]; then
+    kill "$POSTGRES_SERVER_PID" >/dev/null 2>&1 || true
+    wait "$POSTGRES_SERVER_PID" 2>/dev/null || true
+    unset POSTGRES_SERVER_PID
+  fi
+}
+
 echo "== syntax checks =="
 bash -n "$ROOT_DIR/scripts/demo.sh"
 bash -n "$ROOT_DIR/scripts/alert-smoke.sh"
@@ -252,6 +277,37 @@ if [[ "$ready_json" != *'"name":"fileStoreState"'* ]]; then
   exit 1
 fi
 stop_file_store_server
+
+if [[ "${RUN_POSTGRES_SMOKE:-0}" == "1" ]]; then
+  if [[ -z "$POSTGRES_SMOKE_DSN" ]]; then
+    echo "RUN_POSTGRES_SMOKE=1 requires MULTI_AGENT_POSTGRES_DSN or MULTI_AGENT_TEST_POSTGRES_DSN" >&2
+    exit 1
+  fi
+  echo
+  echo "== postgres store smoke verification =="
+  POSTGRES_BASE_URL="http://127.0.0.1:$POSTGRES_SMOKE_PORT"
+  start_postgres_store_server
+  postgres_project_json="$(request_json "$POSTGRES_BASE_URL" POST "/projects" '{"name":"Postgres Smoke"}')"
+  postgres_project_id="$(printf '%s' "$postgres_project_json" | json_query "id")"
+  request_json "$POSTGRES_BASE_URL" POST "/projects/$postgres_project_id/requirements" '{"title":"Persist state","content":"Verify postgres restart durability."}' >/dev/null
+  request_json "$POSTGRES_BASE_URL" POST "/projects/$postgres_project_id/plan" '{}' >/dev/null
+  stop_postgres_store_server
+  start_postgres_store_server
+  restored_postgres_project_json="$(request_json "$POSTGRES_BASE_URL" GET "/projects/$postgres_project_id")"
+  restored_postgres_project_id="$(printf '%s' "$restored_postgres_project_json" | json_query "id")"
+  if [[ "$restored_postgres_project_id" != "$postgres_project_id" ]]; then
+    echo "Postgres restart did not restore project" >&2
+    printf '%s\n' "$restored_postgres_project_json" >&2
+    exit 1
+  fi
+  postgres_ready_json="$(request_json "$POSTGRES_BASE_URL" GET "/ready")"
+  if [[ "$postgres_ready_json" != *'"name":"postgresStore"'* ]]; then
+    echo "Postgres readiness did not report store check" >&2
+    printf '%s\n' "$postgres_ready_json" >&2
+    exit 1
+  fi
+  stop_postgres_store_server
+fi
 
 echo
 echo "== authenticated api smoke verification =="

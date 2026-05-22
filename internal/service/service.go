@@ -630,6 +630,8 @@ func newServiceStore(cfg config.Config) stateStore {
 	switch strings.ToLower(strings.TrimSpace(cfg.StoreProvider)) {
 	case "file":
 		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}
+	case "postgres":
+		return jsonStateStore{store: store.NewPostgresStore(cfg.PostgresDSN)}
 	default:
 		return jsonStateStore{store: store.NewMemoryStore()}
 	}
