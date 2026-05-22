@@ -14,6 +14,8 @@ RUNTIME_SMOKE_PORT="${RUNTIME_SMOKE_PORT:-$((25000 + RANDOM % 1000))}"
 RUNTIME_PROVIDER_PORT="${RUNTIME_PROVIDER_PORT:-$((26000 + RANDOM % 1000))}"
 RUNTIME_PROVIDER_TOKEN="${RUNTIME_PROVIDER_TOKEN:-runtime-release-token}"
 RUNTIME_PROVIDER_LOG="${RUNTIME_PROVIDER_LOG:-${TMPDIR:-/tmp}/multiagentcom-runtime-provider.log}"
+FILE_STORE_SMOKE_PORT="${FILE_STORE_SMOKE_PORT:-$((27000 + RANDOM % 1000))}"
+FILE_STORE_SMOKE_ROOT="${FILE_STORE_SMOKE_ROOT:-}"
 
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]]; then
@@ -27,6 +29,10 @@ cleanup() {
   if [[ -n "${RUNTIME_SERVER_PID:-}" ]]; then
     kill "$RUNTIME_SERVER_PID" >/dev/null 2>&1 || true
     wait "$RUNTIME_SERVER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${FILE_STORE_SERVER_PID:-}" ]]; then
+    kill "$FILE_STORE_SERVER_PID" >/dev/null 2>&1 || true
+    wait "$FILE_STORE_SERVER_PID" 2>/dev/null || true
   fi
   if [[ -n "${RUNTIME_PROVIDER_PID:-}" ]]; then
     kill "$RUNTIME_PROVIDER_PID" >/dev/null 2>&1 || true
@@ -128,6 +134,25 @@ wait_run_status() {
   exit 1
 }
 
+start_file_store_server() {
+  (cd "$ROOT_DIR" && \
+    MULTI_AGENT_ADDR=":$FILE_STORE_SMOKE_PORT" \
+    MULTI_AGENT_SERVICE_NAME="multiagentcom-file-store-smoke" \
+    MULTI_AGENT_STORE_PROVIDER="file" \
+    MULTI_AGENT_DATA_ROOT="$FILE_STORE_SMOKE_ROOT" \
+    go run ./cmd/server >"${LOG_FILE}.filestore" 2>&1) &
+  FILE_STORE_SERVER_PID="$!"
+  wait_health "http://127.0.0.1:$FILE_STORE_SMOKE_PORT" "multiagentcom-file-store-smoke"
+}
+
+stop_file_store_server() {
+  if [[ -n "${FILE_STORE_SERVER_PID:-}" ]]; then
+    kill "$FILE_STORE_SERVER_PID" >/dev/null 2>&1 || true
+    wait "$FILE_STORE_SERVER_PID" 2>/dev/null || true
+    unset FILE_STORE_SERVER_PID
+  fi
+}
+
 echo "== syntax checks =="
 bash -n "$ROOT_DIR/scripts/demo.sh"
 bash -n "$ROOT_DIR/scripts/alert-smoke.sh"
@@ -189,6 +214,44 @@ RUNS="$DEMO_RUNS" BASE_URL="$BASE_URL" ARTIFACT_DIR="${TMPDIR:-/tmp}/multiagentc
 echo
 echo "== alert webhook smoke verification =="
 BASE_URL="$BASE_URL" ALERT_WEBHOOK_LOG="$ALERT_WEBHOOK_LOG" bash "$ROOT_DIR/scripts/alert-smoke.sh"
+
+echo
+echo "== file-store restart smoke verification =="
+if [[ -z "$FILE_STORE_SMOKE_ROOT" ]]; then
+  FILE_STORE_SMOKE_ROOT="$(mktemp -d)"
+else
+  rm -rf "$FILE_STORE_SMOKE_ROOT"
+  mkdir -p "$FILE_STORE_SMOKE_ROOT"
+fi
+FILE_STORE_BASE_URL="http://127.0.0.1:$FILE_STORE_SMOKE_PORT"
+start_file_store_server
+file_store_project_json="$(request_json "$FILE_STORE_BASE_URL" POST "/projects" '{"name":"File Store Smoke"}')"
+file_store_project_id="$(printf '%s' "$file_store_project_json" | json_query "id")"
+request_json "$FILE_STORE_BASE_URL" POST "/projects/$file_store_project_id/requirements" '{"title":"Persist state","content":"Verify file-store restart durability."}' >/dev/null
+request_json "$FILE_STORE_BASE_URL" POST "/projects/$file_store_project_id/plan" '{}' >/dev/null
+stop_file_store_server
+start_file_store_server
+restored_project_json="$(request_json "$FILE_STORE_BASE_URL" GET "/projects/$file_store_project_id")"
+restored_project_id="$(printf '%s' "$restored_project_json" | json_query "id")"
+if [[ "$restored_project_id" != "$file_store_project_id" ]]; then
+  echo "File-store restart did not restore project" >&2
+  printf '%s\n' "$restored_project_json" >&2
+  exit 1
+fi
+restored_requirements_json="$(request_json "$FILE_STORE_BASE_URL" GET "/projects/$file_store_project_id/requirements")"
+restored_requirements_count="$(printf '%s' "$restored_requirements_json" | json_query "count")"
+if [[ "$restored_requirements_count" != "1" ]]; then
+  echo "File-store restart did not restore requirements" >&2
+  printf '%s\n' "$restored_requirements_json" >&2
+  exit 1
+fi
+ready_json="$(request_json "$FILE_STORE_BASE_URL" GET "/ready")"
+if [[ "$ready_json" != *'"name":"fileStoreState"'* ]]; then
+  echo "File-store readiness did not report state integrity check" >&2
+  printf '%s\n' "$ready_json" >&2
+  exit 1
+fi
+stop_file_store_server
 
 echo
 echo "== authenticated api smoke verification =="

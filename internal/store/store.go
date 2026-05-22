@@ -6,6 +6,12 @@ import (
 	"path/filepath"
 )
 
+const ServiceStateFilename = "service-state.json"
+
+func ServiceStatePath(root string) string {
+	return filepath.Join(root, ServiceStateFilename)
+}
+
 type Store interface {
 	Load(ctx context.Context) ([]byte, error)
 	Save(ctx context.Context, payload []byte) error
@@ -30,7 +36,7 @@ type FileStore struct {
 }
 
 func NewFileStore(root string) *FileStore {
-	return &FileStore{path: filepath.Join(root, "service-state.json")}
+	return &FileStore{path: ServiceStatePath(root)}
 }
 
 func (s *FileStore) Load(ctx context.Context) ([]byte, error) {
@@ -81,5 +87,12 @@ func (s *FileStore) Save(ctx context.Context, payload []byte) error {
 		return err
 	}
 
-	return os.Rename(tmpPath, s.path)
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		return err
+	}
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	return nil
 }

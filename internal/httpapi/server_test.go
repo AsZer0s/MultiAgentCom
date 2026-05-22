@@ -22,6 +22,7 @@ import (
 	"multiagentcom/internal/config"
 	"multiagentcom/internal/domain"
 	"multiagentcom/internal/service"
+	"multiagentcom/internal/store"
 )
 
 func TestHTTPFlow(t *testing.T) {
@@ -350,6 +351,71 @@ func TestHTTPReadyReportsConfigFailure(t *testing.T) {
 	body := getJSONExpectStatus(t, server.Client(), server.URL+"/ready", http.StatusServiceUnavailable)
 	assertContainsBody(t, body, `"status":"not_ready"`)
 	assertContainsBody(t, body, `"name":"config"`)
+}
+
+func TestHTTPReadyAcceptsMissingFileStoreState(t *testing.T) {
+	cfg := config.Config{
+		Address:       ":0",
+		ServiceName:   "test-http-ready-file-missing",
+		ArtifactRoot:  t.TempDir(),
+		SandboxRoot:   t.TempDir(),
+		StoreProvider: "file",
+		DataRoot:      t.TempDir(),
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSON(t, server.Client(), server.URL+"/ready")
+	assertContainsBody(t, body, `"name":"fileStoreState"`)
+	assertContainsBody(t, body, `"status":"ready"`)
+}
+
+func TestHTTPReadyRejectsCorruptedFileStoreState(t *testing.T) {
+	dataRoot := t.TempDir()
+	if err := os.WriteFile(store.ServiceStatePath(dataRoot), []byte("not-json"), 0o644); err != nil {
+		t.Fatalf("write corrupted state: %v", err)
+	}
+	cfg := config.Config{
+		Address:       ":0",
+		ServiceName:   "test-http-ready-file-corrupted",
+		ArtifactRoot:  t.TempDir(),
+		SandboxRoot:   t.TempDir(),
+		StoreProvider: "file",
+		DataRoot:      dataRoot,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSONExpectStatus(t, server.Client(), server.URL+"/ready", http.StatusServiceUnavailable)
+	assertContainsBody(t, body, `"name":"fileStoreState"`)
+	assertContainsBody(t, body, `"status":"failed"`)
+}
+
+func TestHTTPReadyRejectsUnsupportedFileStoreStateVersion(t *testing.T) {
+	dataRoot := t.TempDir()
+	if err := os.WriteFile(store.ServiceStatePath(dataRoot), []byte(`{"version":2}`), 0o644); err != nil {
+		t.Fatalf("write unsupported state: %v", err)
+	}
+	cfg := config.Config{
+		Address:       ":0",
+		ServiceName:   "test-http-ready-file-version",
+		ArtifactRoot:  t.TempDir(),
+		SandboxRoot:   t.TempDir(),
+		StoreProvider: "file",
+		DataRoot:      dataRoot,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSONExpectStatus(t, server.Client(), server.URL+"/ready", http.StatusServiceUnavailable)
+	assertContainsBody(t, body, `"name":"fileStoreState"`)
+	assertContainsBody(t, body, `unsupported service state version`)
 }
 
 func TestHTTPRejectsOversizedJSONBody(t *testing.T) {

@@ -132,6 +132,34 @@ func TestFileStoreRestoresServiceState(t *testing.T) {
 	}
 }
 
+func TestCreateProjectReturnsPersistenceFailure(t *testing.T) {
+	dataRoot := filepath.Join(t.TempDir(), "data-root")
+	if err := os.WriteFile(dataRoot, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write data root file: %v", err)
+	}
+	svc := New(config.Config{
+		Address:       ":0",
+		ServiceName:   "test-persist-failure",
+		ArtifactRoot:  t.TempDir(),
+		SandboxRoot:   t.TempDir(),
+		StoreProvider: "file",
+		DataRoot:      dataRoot,
+		DefaultAgent:  "test-agent",
+	}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+
+	_, err := svc.CreateProject(context.Background(), CreateProjectInput{Name: "Should Fail"})
+	if err == nil {
+		t.Fatal("expected persistence failure")
+	}
+	var appErr *AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected AppError, got %T %v", err, err)
+	}
+	if appErr.Code != "PERSISTENCE_FAILED" {
+		t.Fatalf("AppError.Code = %q, want PERSISTENCE_FAILED", appErr.Code)
+	}
+}
+
 func TestSprintOneFlow(t *testing.T) {
 	cfg := config.Config{
 		Address:      ":0",

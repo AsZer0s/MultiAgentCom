@@ -22,6 +22,7 @@ bash scripts/release-check.sh
 - `bash scripts/demo.sh` 端到端执行通过
 - `bash scripts/alert-smoke.sh` 验证失败告警与 webhook 推送通过
 - `bash scripts/auth-smoke.sh` 验证 token 鉴权兼容路径通过
+- file-store restart smoke 验证 `MULTI_AGENT_STORE_PROVIDER=file` 下项目/需求状态可跨服务重启恢复，且 `/ready` 包含 `fileStoreState` 完整性检查
 - `RUN_CONTAINER_SMOKE=1` 时，`bash scripts/container-runtime-smoke.sh` 验证真实 Docker/Podman-backed container runtime；默认不执行、不阻塞普通 CI
 - 预览环境可访问
 - 导出 ZIP 交付包结构符合 AC-15，并通过 `delivery.bundle.v1` / `delivery.release_gate.v1` 契约校验
@@ -75,6 +76,7 @@ API_TOKEN=your-token BASE_URL=http://127.0.0.1:18082 bash scripts/auth-smoke.sh
 - `GET /status/panel` 页面包含 `Snapshots`
 - `GET /status/stream` 可持续接收 `status` SSE 事件（断开 SSE 后可由轮询兜底刷新）
 - `GET /ready` 返回 readiness 检查结果；配置无效时应返回 `503`
+- `MULTI_AGENT_STORE_PROVIDER=file` 时，`GET /ready` 包含 `fileStoreState` 检查；`service-state.json` 缺失可正常 ready，JSON 损坏或 `version` 不支持时返回 `503` 且不自动覆盖状态文件
 - `GET /projects/{id}/alerts?limit=1&since=...` 返回分页后的关键失败告警流
 - 配置 `MULTI_AGENT_ALERT_WEBHOOK_URL` 后，失败告警可推送到外部 webhook sink
 - `GET /projects/{id}/communications?taskId=...&limit=...&offset=...` 返回 `checksum` 和分页元数据

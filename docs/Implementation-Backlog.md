@@ -360,6 +360,14 @@
 - **DoD：** `/status/panel` 增加 HITL Conflicts 面板；通过 `/projects/{id}/conflicts` 获取数据；OPEN/RESOLVED 条目以不同样式渲染；空态与 project-less 状态有明确提示；HTTP panel smoke 覆盖通过。
 - **完成范围：** 状态面板已展示 HITL Conflicts、区分 OPEN/RESOLVED、支持空态/project-less 提示，并可直接 resolve open conflict 后刷新队列。
 
+### BL-913 File-store durability and typed state seam
+- **状态：** Done
+- **优先级：** P1
+- **估时：** 1 PD
+- **目标：** 将 file-store 从 raw blob 调用深化为 typed service-state 边界，并补强重启恢复与状态完整性检查。
+- **DoD：** Service 通过 typed state-store seam 读写持久化状态；FileStore 保存采用 temp-file/fsync/rename 并同步目录；`/ready` 校验 file-store `service-state.json` JSON 与版本；release check 覆盖 file-store restart smoke；Postgres 保持后续目标而不暴露未完成 provider。
+- **完成范围：** 已新增 service typed state-store 适配层、file-store state path helper 与目录 fsync；`/ready` 增加 `fileStoreState` 检查并拒绝损坏/不支持版本；release check 新增 file-store 重启烟测；README/Release Checklist 已同步 Postgres 前置边界说明。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：

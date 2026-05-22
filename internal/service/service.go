@@ -64,7 +64,7 @@ type Service struct {
 	alertClient       *http.Client
 	runtimeRegistry   *agentruntime.Registry
 	runtimeInitErr    error
-	store             store.Store
+	store             stateStore
 	workspaceProvider workspaceProvider
 
 	mu             sync.RWMutex
@@ -617,13 +617,55 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 	return svc
 }
 
-func newServiceStore(cfg config.Config) store.Store {
+type stateStore interface {
+	LoadState(ctx context.Context) (*persistedServiceState, error)
+	SaveState(ctx context.Context, state *persistedServiceState) error
+}
+
+type jsonStateStore struct {
+	store store.Store
+}
+
+func newServiceStore(cfg config.Config) stateStore {
 	switch strings.ToLower(strings.TrimSpace(cfg.StoreProvider)) {
 	case "file":
-		return store.NewFileStore(cfg.DataRoot)
+		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}
 	default:
-		return store.NewMemoryStore()
+		return jsonStateStore{store: store.NewMemoryStore()}
 	}
+}
+
+func (s jsonStateStore) LoadState(ctx context.Context) (*persistedServiceState, error) {
+	if s.store == nil {
+		return nil, nil
+	}
+	payload, err := s.store.Load(ctx)
+	if err != nil || len(payload) == 0 {
+		return nil, err
+	}
+
+	var state persistedServiceState
+	if err := json.Unmarshal(payload, &state); err != nil {
+		return nil, fmt.Errorf("decode service state: %w", err)
+	}
+	if state.Version != 1 {
+		return nil, fmt.Errorf("unsupported service state version %d", state.Version)
+	}
+	return &state, nil
+}
+
+func (s jsonStateStore) SaveState(ctx context.Context, state *persistedServiceState) error {
+	if s.store == nil {
+		return nil
+	}
+	payload, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode service state: %w", err)
+	}
+	if err := s.store.Save(ctx, payload); err != nil {
+		return fmt.Errorf("save service state: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) resetStateLocked() {
@@ -667,37 +709,26 @@ func (s *Service) loadPersistedState(ctx context.Context) error {
 	if s.store == nil {
 		return nil
 	}
-	payload, err := s.store.Load(ctx)
-	if err != nil || len(payload) == 0 {
+	state, err := s.store.LoadState(ctx)
+	if err != nil || state == nil {
 		return err
-	}
-
-	var state persistedServiceState
-	if err := json.Unmarshal(payload, &state); err != nil {
-		return err
-	}
-	if state.Version != 1 {
-		return fmt.Errorf("unsupported service state version %d", state.Version)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.restorePersistedStateLocked(&state)
+	s.restorePersistedStateLocked(state)
 	return nil
 }
 
-func (s *Service) persistLocked() {
+func (s *Service) persistLocked() error {
 	if s.store == nil {
-		return
+		return nil
 	}
-	payload, err := json.MarshalIndent(s.capturePersistedStateLocked(), "", "  ")
-	if err != nil {
+	if err := s.store.SaveState(context.Background(), s.capturePersistedStateLocked()); err != nil {
 		s.logPersistError(err)
-		return
+		return newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
-	if err := s.store.Save(context.Background(), payload); err != nil {
-		s.logPersistError(err)
-	}
+	return nil
 }
 
 func (s *Service) logPersistError(err error) {
@@ -906,7 +937,10 @@ func (s *Service) CreateProject(ctx context.Context, input CreateProjectInput) (
 	s.projects[project.ID] = project
 	s.projectBranch[project.ID] = "main"
 	s.recordAuditLocked(ctx, project.ID, "PROJECT_CREATE", "project", project.ID, "project created", now)
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
 	s.mu.Unlock()
 
 	return cloneProject(project), nil
@@ -1091,7 +1125,9 @@ func (s *Service) ResolveConflictQueueEntry(ctx context.Context, projectID, conf
 	conflict.ResolutionNote = strings.TrimSpace(input.ResolutionNote)
 	project.UpdatedAt = now
 	s.recordAuditLocked(ctx, projectID, "HITL_CONFLICT_RESOLVED", "conflict", conflict.ID, "HITL conflict resolved for "+conflict.Scope, now)
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return cloneConflictQueueEntry(conflict), nil
 }
@@ -1204,7 +1240,9 @@ func (s *Service) AddRequirement(ctx context.Context, projectID string, input Ad
 	s.requirements[projectID] = append(s.requirements[projectID], req)
 	project.UpdatedAt = now
 	s.recordAuditLocked(ctx, projectID, "REQUIREMENT_ADD", "requirement", req.ID, "requirement added", now)
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return cloneRequirement(req), nil
 }
@@ -1263,7 +1301,9 @@ func (s *Service) GeneratePlan(ctx context.Context, projectID string) (*PlanResu
 	s.taskOrder[projectID] = append(s.taskOrder[projectID], task.ID)
 	project.UpdatedAt = now
 	s.recordAuditLocked(ctx, projectID, "PLAN_GENERATE", "plan", plan.ID, "plan generated from latest requirement", now)
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return &PlanResult{
 		Plan: *clonePlan(plan),
@@ -1298,7 +1338,9 @@ func (s *Service) GenerateContract(_ context.Context, projectID string) (*domain
 	s.contractIndex[contract.ID] = contract
 	s.contracts[projectID] = append(s.contracts[projectID], contract)
 	project.UpdatedAt = now
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return cloneContract(contract), nil
 }
@@ -1367,7 +1409,9 @@ func (s *Service) GenerateTaskContext(_ context.Context, projectID, taskID strin
 	s.contextIndex[injection.ID] = injection
 	s.contexts[task.ID] = append(s.contexts[task.ID], injection)
 	s.recordCommunicationLocked(projectID, "context-engine", task.AssigneeAgent, "CONTEXT_INJECTION", task.ID, "context://"+injection.ID, now)
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return &TaskContextEnvelope{
 		Task:    *cloneTask(task),
@@ -1434,7 +1478,9 @@ func (s *Service) ApplyHumanOverride(ctx context.Context, projectID string, inpu
 	}
 	if conflict := s.findActiveOverrideConflictLocked(ctx, projectID, task.ID, lockScope, owner, now); conflict != nil {
 		project.UpdatedAt = now
-		s.persistLocked()
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
 		result := &HumanOverrideResult{Conflict: cloneConflictQueueEntry(conflict), Message: "human override lease conflict queued"}
 		return result, newConflictError("human override lease conflict queued")
 	}
@@ -1473,7 +1519,9 @@ func (s *Service) ApplyHumanOverride(ctx context.Context, projectID string, inpu
 	if run := s.findActiveRunForTaskLocked(projectID, task.ID); run != nil {
 		result.Run = cloneRun(run)
 	}
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return result, nil
 }
@@ -1546,7 +1594,9 @@ func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input App
 	}
 	if conflict := s.findActiveCodeLockConflictLocked(ctx, projectID, lock, now); conflict != nil {
 		project.UpdatedAt = now
-		s.persistLocked()
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
 		return &CodeLockResult{Conflict: cloneConflictQueueEntry(conflict), Message: "code lock lease conflict queued"}, newConflictError("code lock lease conflict queued")
 	}
 
@@ -1555,7 +1605,9 @@ func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input App
 	s.recordCommunicationLocked(projectID, "human:"+lock.CreatedBy, "delivery-engine", "CODE_LOCK", lock.TaskID, "lock://"+lock.ID, now)
 	s.recordAuditLocked(ctx, projectID, "CODE_LOCK_APPLY", "code_lock", lock.ID, "code lock registered for "+lock.Path, now)
 	project.UpdatedAt = now
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return &CodeLockResult{
 		Lock:    *cloneCodeLock(lock),
@@ -1594,7 +1646,9 @@ func (s *Service) StartPreview(ctx context.Context, projectID string) (*PreviewS
 	s.previews[projectID] = append(s.previews[projectID], preview)
 	s.recordAuditLocked(ctx, projectID, "PREVIEW_START", "preview", preview.ID, "preview started from shared sandbox "+sandbox.ID, now)
 	project.UpdatedAt = now
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return &PreviewStartResult{
 		Preview:           *clonePreview(preview),
@@ -1720,8 +1774,7 @@ func (s *Service) MarkTaskSandboxFailure(_ context.Context, projectID, taskID, r
 		reason = "simulated sandbox failure"
 	}
 	s.sandboxFaults[task.ID] = reason
-	s.persistLocked()
-	return nil
+	return s.persistLocked()
 }
 
 func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, input MergeSharedSandboxInput) (*SharedSandboxMergeResult, error) {
@@ -1779,7 +1832,9 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 			result.RemediationTask = cloneTask(remediationTask)
 			result.Message = "merge blocked by contract conflicts"
 			s.recordAuditLocked(ctx, projectID, "SHARED_SANDBOX_MERGE_BLOCKED", "sandbox", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
-			s.persistLocked()
+			if err := s.persistLocked(); err != nil {
+				return nil, err
+			}
 			return result, nil
 		}
 	}
@@ -1791,7 +1846,9 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 		result.Sandbox = *cloneSandbox(sharedSandbox)
 		result.Message = "merge blocked because shared sandbox manifest could not be created"
 		s.recordAuditLocked(ctx, projectID, "SHARED_SANDBOX_MERGE_BLOCKED", "sandbox", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
-		s.persistLocked()
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
 		return result, nil
 	}
 
@@ -1815,7 +1872,9 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 		}
 		s.recordAlertLocked(projectID, "CRITICAL", "SHARED_SANDBOX_FAILURE", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
 		s.recordAuditLocked(ctx, projectID, "SHARED_SANDBOX_MERGE_BLOCKED", "sandbox", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
-		s.persistLocked()
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
 		return result, nil
 	}
 
@@ -1826,7 +1885,9 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 	snapshot, snapshotErr := s.recordSnapshotWithWorkspaceLocked(projectID, s.currentBranchLocked(projectID), "shared sandbox merge checkpoint", true, s.latestSnapshotIDLocked(projectID), sharedSandbox.UpdatedAt, sharedSandbox)
 	if snapshotErr != nil {
 		result.Message = "artifacts merged into shared sandbox, but checkpoint creation failed: " + snapshotErr.Error()
-		s.persistLocked()
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
 		return result, nil
 	}
 	_ = snapshot
@@ -1839,7 +1900,9 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 		result.Message = "artifacts merged into shared sandbox"
 	}
 	s.recordAuditLocked(ctx, projectID, "SHARED_SANDBOX_MERGE", "sandbox", sharedSandbox.ID, result.Message, sharedSandbox.UpdatedAt)
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return result, nil
 }
@@ -1929,7 +1992,9 @@ func (s *Service) RebaseWorkspaces(ctx context.Context, projectID string, input 
 		}
 	}
 	if !input.DryRun {
-		s.persistLocked()
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
 	}
 	return result, nil
 }
@@ -1958,7 +2023,9 @@ func (s *Service) RollbackToSnapshot(ctx context.Context, projectID string, inpu
 	}
 	s.recordAlertLocked(projectID, "WARN", "SNAPSHOT_ROLLBACK", result.Snapshot.ID, result.Message, now)
 	s.recordAuditLocked(ctx, projectID, "SNAPSHOT_ROLLBACK", "snapshot", result.Snapshot.ID, result.Message, now)
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -2028,7 +2095,9 @@ func (s *Service) DispatchTasks(_ context.Context, projectID string) (*DispatchT
 		s.recordCommunicationLocked(projectID, "manager-agent", task.AssigneeAgent, "TASK_DISPATCH", task.ID, task.InputRef, now)
 	}
 	project.UpdatedAt = now
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return &DispatchTasksResult{
 		Contract: *cloneContract(contract),
@@ -2069,7 +2138,9 @@ func (s *Service) ValidateContract(_ context.Context, projectID string, input Va
 	task := s.createContractRemediationTaskLocked(projectID, contract, now)
 	project.UpdatedAt = now
 	result.RemediationTask = cloneTask(task)
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return result, nil
 }
@@ -2108,7 +2179,9 @@ func (s *Service) RetryTask(_ context.Context, projectID, taskID string) (*domai
 	s.tasks[retryTask.ID] = retryTask
 	s.taskOrder[projectID] = append(s.taskOrder[projectID], retryTask.ID)
 	project.UpdatedAt = now
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	return cloneTask(retryTask), nil
 }
@@ -2134,10 +2207,14 @@ func (s *Service) StartRun(_ context.Context, projectID string, input StartRunIn
 
 	envelope, err := s.startTaskRunLocked(projectID, task, now, "single agent execution started")
 	if err != nil {
-		s.persistLocked()
+		if persistErr := s.persistLocked(); persistErr != nil {
+			return nil, persistErr
+		}
 		return nil, err
 	}
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	go s.executeRun(envelope.Run.ID)
 
@@ -2174,7 +2251,9 @@ func (s *Service) StartParallelRun(_ context.Context, projectID string, input Pa
 		started = append(started, *envelope)
 	}
 
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 
 	for _, envelope := range started {
 		go s.executeRun(envelope.Run.ID)
@@ -2233,7 +2312,9 @@ func (s *Service) ExportDelivery(ctx context.Context, projectID string, input Ex
 			return nil, err
 		}
 		s.recordAuditLocked(ctx, projectID, "DELIVERY_EXPORT", "artifact", artifact.ID, "delivery export requested for run "+run.ID, time.Now().UTC())
-		s.persistLocked()
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
 		return cloneArtifact(artifact), nil
 	}
 
@@ -2246,7 +2327,9 @@ func (s *Service) ExportDelivery(ctx context.Context, projectID string, input Ex
 		artifact, err := s.resolveArtifactFromRunLocked(run)
 		if err == nil {
 			s.recordAuditLocked(ctx, projectID, "DELIVERY_EXPORT", "artifact", artifact.ID, "delivery export requested from latest successful run", time.Now().UTC())
-			s.persistLocked()
+			if err := s.persistLocked(); err != nil {
+				return nil, err
+			}
 			return cloneArtifact(artifact), nil
 		}
 	}
@@ -2295,7 +2378,9 @@ func (s *Service) GetArtifact(ctx context.Context, projectID, artifactID string)
 	}
 
 	s.recordAuditLocked(ctx, projectID, "DELIVERY_DOWNLOAD", "artifact", artifact.ID, "delivery artifact downloaded", time.Now().UTC())
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 	return cloneArtifact(artifact), nil
 }
 
@@ -2415,7 +2500,9 @@ func (s *Service) executeRun(runID string) {
 			storedSandbox.UpdatedAt = now
 		}
 	}
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		s.logger.Error("failed to persist completed run", "runId", storedRun.ID, "taskId", storedTask.ID, "error", err)
+	}
 
 	s.logger.Info("run execution completed", "runId", storedRun.ID, "taskId", storedTask.ID, "artifactId", artifact.ID)
 }
@@ -2654,7 +2741,9 @@ func (s *Service) failRun(runID string, failure error) {
 	run.CompletionTokens = completionTokens
 	run.TotalTokens = totalTokens
 	run.EstimatedCostUSD = s.estimateCostFromTokens(promptTokens, completionTokens)
-	s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		s.logger.Error("failed to persist failed run", "runId", run.ID, "taskId", run.TaskID, "error", err)
+	}
 }
 
 func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.Task, plan *domain.Plan, run *domain.AgentRun, sandbox *domain.Sandbox) (*domain.Artifact, string, error) {
@@ -3270,7 +3359,9 @@ func (s *Service) applyPendingHumanOverrideLocked(runID string) (*domain.HumanOv
 				return nil, newConflictError(err.Error())
 			}
 		}
-		s.persistLocked()
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
 		return cloneHumanOverride(override), nil
 	}
 
@@ -3343,8 +3434,9 @@ func (s *Service) recordCodeLockApplyConflict(projectID, taskID string, existing
 	if project := s.projects[projectID]; project != nil {
 		project.UpdatedAt = now
 	}
-	s.persistLocked()
-	_ = conflict
+	if err := s.persistLocked(); err != nil {
+		s.logger.Error("failed to persist code lock conflict", "projectId", projectID, "taskId", taskID, "conflictId", conflict.ID, "error", err)
+	}
 }
 
 func normalizeLockMode(mode string) string {

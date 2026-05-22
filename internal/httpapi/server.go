@@ -17,6 +17,7 @@ import (
 	"multiagentcom/internal/config"
 	"multiagentcom/internal/domain"
 	"multiagentcom/internal/service"
+	"multiagentcom/internal/store"
 )
 
 const maxJSONBodyBytes int64 = 1 << 20
@@ -888,6 +889,7 @@ func (s *Server) readiness() readinessResult {
 	addCheck("auth", authErr)
 	if strings.EqualFold(strings.TrimSpace(cfg.StoreProvider), "file") {
 		addCheck("dataRoot", ensureWritableDir(cfg.DataRoot))
+		addCheck("fileStoreState", validateFileStoreState(cfg.DataRoot))
 	} else {
 		addCheck("store", nil)
 	}
@@ -925,6 +927,27 @@ func (s *Server) readiness() readinessResult {
 		}
 	}
 	return readinessResult{Status: status, Service: cfg.ServiceName, Timestamp: time.Now().UTC(), Checks: checks}
+}
+
+func validateFileStoreState(root string) error {
+	path := store.ServiceStatePath(root)
+	payload, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var state struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(payload, &state); err != nil {
+		return fmt.Errorf("decode service state: %w", err)
+	}
+	if state.Version != 1 {
+		return fmt.Errorf("unsupported service state version %d", state.Version)
+	}
+	return nil
 }
 
 func ensureWritableDir(path string) error {
