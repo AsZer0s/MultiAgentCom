@@ -631,7 +631,7 @@ func newServiceStore(cfg config.Config) stateStore {
 	case "file":
 		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}
 	case "postgres":
-		return jsonStateStore{store: store.NewPostgresStore(cfg.PostgresDSN)}
+		return newPostgresDomainStateStore(cfg.PostgresDSN)
 	default:
 		return jsonStateStore{store: store.NewMemoryStore()}
 	}

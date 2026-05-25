@@ -166,6 +166,8 @@ func TestPostgresStoreRestoresServiceState(t *testing.T) {
 	if strings.TrimSpace(dsn) == "" {
 		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
 	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
 	cfg := config.Config{
 		Address:       ":0",
 		ServiceName:   "test-postgres-store-restore",
@@ -176,10 +178,6 @@ func TestPostgresStoreRestoresServiceState(t *testing.T) {
 		DefaultAgent:  "manager-agent",
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	ctx := context.Background()
-	if err := store.NewPostgresStore(dsn).Save(ctx, []byte(`{"version":1}`)); err != nil {
-		t.Fatalf("reset postgres state: %v", err)
-	}
 	svc := New(cfg, logger)
 
 	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Postgres Demo"})
@@ -214,6 +212,99 @@ func TestPostgresStoreRestoresServiceState(t *testing.T) {
 	}
 	if len(tasks) == 0 {
 		t.Fatal("expected restored tasks")
+	}
+}
+
+func TestPostgresDomainStoreBackfillsLegacyServiceState(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	raw := store.NewPostgresStore(dsn)
+	legacy := &persistedServiceState{
+		Version:      1,
+		Projects:     map[string]*domain.Project{"project-legacy": {ID: "project-legacy", Name: "Legacy", CreatedAt: time.Now(), UpdatedAt: time.Now()}},
+		Requirements: map[string][]*domain.Requirement{"project-legacy": {{ID: "req-legacy", ProjectID: "project-legacy", Title: "Legacy requirement", Content: "Backfill me", CreatedAt: time.Now()}}},
+	}
+	payload, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal legacy state: %v", err)
+	}
+	if err := raw.Save(ctx, payload); err != nil {
+		t.Fatalf("seed legacy state: %v", err)
+	}
+
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-backfill", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	restored := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	projects, err := restored.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("list restored projects: %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != "project-legacy" {
+		t.Fatalf("expected legacy project restored, got %+v", projects)
+	}
+	var projected int
+	if err := raw.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE id = 'project-legacy'`).Scan(&projected); err != nil {
+		t.Fatalf("query projected project: %v", err)
+	}
+	if projected != 1 {
+		t.Fatalf("expected projected backfill row, got %d", projected)
+	}
+}
+
+func TestPostgresDomainStoreRestoresFromProjectionTables(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-projection-restore", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Projection Demo"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Projection restore", Content: "Restore from domain tables."}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	raw := store.NewPostgresStore(dsn)
+	if _, err := raw.DB().ExecContext(ctx, `DELETE FROM service_state WHERE key = $1`, store.PostgresServiceStateKey()); err != nil {
+		t.Fatalf("delete legacy state: %v", err)
+	}
+
+	restored := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	projects, err := restored.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("list projects: %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != project.ID {
+		t.Fatalf("expected projection-restored project %s, got %+v", project.ID, projects)
+	}
+	tasks, err := restored.ListTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list tasks: %v", err)
+	}
+	if len(tasks) == 0 {
+		t.Fatal("expected projection-restored tasks")
+	}
+}
+
+func resetPostgresStateForTest(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	raw := store.NewPostgresStore(dsn)
+	if err := raw.Migrate(ctx); err != nil {
+		t.Fatalf("migrate postgres: %v", err)
+	}
+	for _, table := range []string{"artifact_order", "artifacts", "run_order", "agent_runs", "task_order", "tasks", "contracts", "plans", "requirements", "projects", "service_state"} {
+		if _, err := raw.DB().ExecContext(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
 	}
 }
 

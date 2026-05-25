@@ -301,9 +301,13 @@ if [[ "${RUN_POSTGRES_SMOKE:-0}" == "1" ]]; then
     exit 1
   fi
   postgres_ready_json="$(request_json "$POSTGRES_BASE_URL" GET "/ready")"
-  if [[ "$postgres_ready_json" != *'"name":"postgresStore"'* ]]; then
-    echo "Postgres readiness did not report store check" >&2
+  if [[ "$postgres_ready_json" != *'"name":"postgresStore"'* || "$postgres_ready_json" != *'"status":"ready"'* ]]; then
+    echo "Postgres readiness did not report ready store check" >&2
     printf '%s\n' "$postgres_ready_json" >&2
+    exit 1
+  fi
+  if ! (cd "$ROOT_DIR" && MULTI_AGENT_TEST_POSTGRES_DSN="$POSTGRES_SMOKE_DSN" go test ./internal/store -run 'TestPostgresMigrationsAreIdempotent|TestCheckPostgresAcceptsFreshMigratedDatabase' -count=1 >/dev/null); then
+    echo "Postgres migration smoke tests failed" >&2
     exit 1
   fi
   stop_postgres_store_server

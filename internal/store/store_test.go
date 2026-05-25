@@ -58,6 +58,56 @@ func TestServiceStatePath(t *testing.T) {
 	}
 }
 
+func TestPostgresMigrationsAreIdempotent(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	store := NewPostgresStore(dsn)
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("first migrate: %v", err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+	applied, err := store.AppliedMigrations(ctx)
+	if err != nil {
+		t.Fatalf("applied migrations: %v", err)
+	}
+	expected := PostgresMigrations()
+	if len(applied) != len(expected) {
+		t.Fatalf("applied migrations = %d, want %d", len(applied), len(expected))
+	}
+	for i := range expected {
+		if applied[i].Version != expected[i].Version || applied[i].Name != expected[i].Name || applied[i].Checksum != expected[i].Checksum {
+			t.Fatalf("migration[%d] = %+v, want %+v", i, applied[i], expected[i])
+		}
+	}
+}
+
+func TestPostgresMigrateRejectsChecksumMismatch(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	store := NewPostgresStore(dsn)
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	migrations := PostgresMigrations()
+	if _, err := store.db.ExecContext(ctx, `UPDATE schema_migrations SET checksum = 'tampered' WHERE version = $1`, migrations[0].Version); err != nil {
+		t.Fatalf("tamper checksum: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.db.ExecContext(ctx, `UPDATE schema_migrations SET checksum = $1 WHERE version = $2`, migrations[0].Checksum, migrations[0].Version)
+	})
+	if err := store.Migrate(ctx); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("expected checksum mismatch, got %v", err)
+	}
+}
+
 func TestPostgresStoreLoadMissingState(t *testing.T) {
 	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
 	if strings.TrimSpace(dsn) == "" {
@@ -110,6 +160,26 @@ func TestPostgresStoreSaveAndLoadState(t *testing.T) {
 	}
 	if _, ok := decoded["projects"].(map[string]any)["p1"]; !ok {
 		t.Fatalf("expected project p1 in loaded state: %v", decoded)
+	}
+}
+
+func TestCheckPostgresAcceptsFreshMigratedDatabase(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	store := NewPostgresStore(dsn)
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	for _, table := range []string{"artifact_order", "artifacts", "run_order", "agent_runs", "task_order", "tasks", "contracts", "plans", "requirements", "projects", "service_state"} {
+		if _, err := store.db.ExecContext(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+	if err := CheckPostgres(ctx, dsn); err != nil {
+		t.Fatalf("check fresh postgres: %v", err)
 	}
 }
 

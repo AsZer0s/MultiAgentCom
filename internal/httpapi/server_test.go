@@ -441,9 +441,7 @@ func TestHTTPReadyAcceptsPostgresStore(t *testing.T) {
 	if strings.TrimSpace(dsn) == "" {
 		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
 	}
-	if err := store.NewPostgresStore(dsn).Save(context.Background(), []byte(`{"version":1}`)); err != nil {
-		t.Fatalf("reset postgres state: %v", err)
-	}
+	resetHTTPPostgresStateForTest(t, context.Background(), dsn)
 	cfg := config.Config{
 		Address:       ":0",
 		ServiceName:   "test-http-ready-postgres",
@@ -460,6 +458,39 @@ func TestHTTPReadyAcceptsPostgresStore(t *testing.T) {
 	body := getJSON(t, server.Client(), server.URL+"/ready")
 	assertContainsBody(t, body, `"name":"postgresStore"`)
 	assertContainsBody(t, body, `"status":"ready"`)
+}
+
+func TestHTTPReadyRejectsPostgresUnsupportedLegacyVersion(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetHTTPPostgresStateForTest(t, ctx, dsn)
+	if err := store.NewPostgresStore(dsn).Save(ctx, []byte(`{"version":2}`)); err != nil {
+		t.Fatalf("seed unsupported state: %v", err)
+	}
+	cfg := config.Config{Address: ":0", ServiceName: "test-http-ready-postgres-version", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(cfg, logger)
+	server := httptest.NewServer(NewServer(cfg, logger, svc))
+	defer server.Close()
+
+	body := getJSONExpectStatus(t, server.Client(), server.URL+"/ready", http.StatusServiceUnavailable)
+	assertContainsBody(t, body, `unsupported service state version`)
+}
+
+func resetHTTPPostgresStateForTest(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	raw := store.NewPostgresStore(dsn)
+	if err := raw.Migrate(ctx); err != nil {
+		t.Fatalf("migrate postgres: %v", err)
+	}
+	for _, table := range []string{"artifact_order", "artifacts", "run_order", "agent_runs", "task_order", "tasks", "contracts", "plans", "requirements", "projects", "service_state"} {
+		if _, err := raw.DB().ExecContext(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
 }
 
 func TestHTTPRejectsOversizedJSONBody(t *testing.T) {

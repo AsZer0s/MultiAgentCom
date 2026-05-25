@@ -376,6 +376,14 @@
 - **DoD：** `MULTI_AGENT_STORE_PROVIDER=postgres` 与 `MULTI_AGENT_POSTGRES_DSN` 可启用 JSONB-backed store；`/ready` 校验 Postgres 连接、schema 与状态版本；service restart 可恢复项目/需求/任务状态；release check 提供 opt-in Postgres smoke；默认 CI 不依赖 Postgres。
 - **完成范围：** 已新增 Postgres raw store、`service_state` JSONB schema ensure、provider 配置校验、service wiring、`postgresStore` readiness、guarded integration tests 与 opt-in release smoke；关系化 schema / migrations / 多实例并发治理保持后续目标。
 
+### BL-915 Postgres migrations and domain projection repository
+- **状态：** Done
+- **优先级：** P1
+- **估时：** 1.5 PD
+- **目标：** 将 Postgres provider 从单行 JSONB aggregate 深化为 versioned migrations + domain projection backing store。
+- **DoD：** Postgres 启动执行 `schema_migrations` 校验；创建 projects/requirements/plans/contracts/tasks/runs/artifacts projection tables；service 可从 legacy `service_state` backfill，并双写 projection tables 与 legacy aggregate；`/ready` 校验 migrations、投影表与 legacy 状态版本；guarded tests 覆盖 migration 幂等、checksum mismatch、legacy backfill、projection restore。
+- **完成范围：** 已新增内嵌 migration runner、checksum 校验、domain projection tables、Postgres typed state store、legacy backfill/dual-write、readiness 加深、guarded store/service/http tests 与 opt-in release smoke migration checks；完整业务路径 SQL repository、多实例并发治理与外部 migration 框架仍保持后续目标。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：
