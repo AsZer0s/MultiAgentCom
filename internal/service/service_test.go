@@ -295,6 +295,259 @@ func TestPostgresDomainStoreRestoresFromProjectionTables(t *testing.T) {
 	}
 }
 
+func TestPostgresProjectRepositoryCreateProjectDualWrites(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-project-repository-create", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Repository Project", Description: "SQL backed project"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	raw := store.NewPostgresStore(dsn)
+	var payload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT payload FROM projects WHERE id = $1`, project.ID).Scan(&payload); err != nil {
+		t.Fatalf("query project projection: %v", err)
+	}
+	var projected domain.Project
+	if err := json.Unmarshal(payload, &projected); err != nil {
+		t.Fatalf("decode projected project: %v", err)
+	}
+	if projected.ID != project.ID || projected.Name != "Repository Project" {
+		t.Fatalf("unexpected projected project: %+v", projected)
+	}
+
+	legacy := loadLegacyServiceStateForTest(t, ctx, raw)
+	if legacy.Projects[project.ID] == nil || legacy.Projects[project.ID].Name != "Repository Project" {
+		t.Fatalf("legacy project missing: %+v", legacy.Projects[project.ID])
+	}
+	if legacy.ProjectBranch[project.ID] != "main" {
+		t.Fatalf("project branch = %q, want main", legacy.ProjectBranch[project.ID])
+	}
+	if len(legacy.AuditLogs[project.ID]) != 1 || legacy.AuditLogs[project.ID][0].Action != "PROJECT_CREATE" {
+		t.Fatalf("expected PROJECT_CREATE audit, got %+v", legacy.AuditLogs[project.ID])
+	}
+}
+
+func TestPostgresProjectRepositoryAddRequirementDualWrites(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-project-repository-requirement", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Requirement Project"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	req, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Persist requirement", Content: "Write requirement through repository", Constraints: []string{"SQL"}})
+	if err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+
+	raw := store.NewPostgresStore(dsn)
+	var position int
+	var payload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT position, payload FROM requirements WHERE id = $1`, req.ID).Scan(&position, &payload); err != nil {
+		t.Fatalf("query requirement projection: %v", err)
+	}
+	if position != 0 {
+		t.Fatalf("position = %d, want 0", position)
+	}
+	var projectedReq domain.Requirement
+	if err := json.Unmarshal(payload, &projectedReq); err != nil {
+		t.Fatalf("decode projected requirement: %v", err)
+	}
+	if projectedReq.ID != req.ID || projectedReq.Title != "Persist requirement" {
+		t.Fatalf("unexpected projected requirement: %+v", projectedReq)
+	}
+
+	var projectPayload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT payload FROM projects WHERE id = $1`, project.ID).Scan(&projectPayload); err != nil {
+		t.Fatalf("query updated project projection: %v", err)
+	}
+	var updatedProject domain.Project
+	if err := json.Unmarshal(projectPayload, &updatedProject); err != nil {
+		t.Fatalf("decode updated project: %v", err)
+	}
+	if !updatedProject.UpdatedAt.After(project.UpdatedAt) {
+		t.Fatalf("expected updated project timestamp after %s, got %s", project.UpdatedAt, updatedProject.UpdatedAt)
+	}
+
+	legacy := loadLegacyServiceStateForTest(t, ctx, raw)
+	if len(legacy.Requirements[project.ID]) != 1 || legacy.Requirements[project.ID][0].ID != req.ID {
+		t.Fatalf("legacy requirement missing: %+v", legacy.Requirements[project.ID])
+	}
+	if legacy.Projects[project.ID] == nil || !legacy.Projects[project.ID].UpdatedAt.After(project.UpdatedAt) {
+		t.Fatalf("legacy project not updated: %+v", legacy.Projects[project.ID])
+	}
+	logs := legacy.AuditLogs[project.ID]
+	if len(logs) != 2 || logs[1].Action != "REQUIREMENT_ADD" {
+		t.Fatalf("expected REQUIREMENT_ADD audit, got %+v", logs)
+	}
+}
+
+func TestPostgresProjectReadsUseSQLProjection(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-project-repository-read", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Original Name"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	updated := cloneProject(project)
+	updated.Name = "SQL Name"
+	updatedPayload, err := json.Marshal(updated)
+	if err != nil {
+		t.Fatalf("marshal updated project: %v", err)
+	}
+	raw := store.NewPostgresStore(dsn)
+	if _, err := raw.DB().ExecContext(ctx, `UPDATE projects SET payload = $2::jsonb WHERE id = $1`, project.ID, updatedPayload); err != nil {
+		t.Fatalf("update projected project: %v", err)
+	}
+
+	got, err := svc.GetProject(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("get project: %v", err)
+	}
+	if got.Name != "SQL Name" {
+		t.Fatalf("GetProject name = %q, want SQL Name", got.Name)
+	}
+	projects, err := svc.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("list projects: %v", err)
+	}
+	if len(projects) != 1 || projects[0].Name != "SQL Name" {
+		t.Fatalf("ListProjects = %+v, want SQL Name", projects)
+	}
+}
+
+func TestPostgresRequirementReadsUseSQLProjection(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-requirement-repository-read", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Requirement SQL Read"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "First", Content: "First requirement"}); err != nil {
+		t.Fatalf("add first requirement: %v", err)
+	}
+
+	second := &domain.Requirement{ID: "req_sql_second", ProjectID: project.ID, Title: "Second", Content: "Second requirement from SQL", CreatedAt: time.Now().UTC()}
+	payload, err := json.Marshal(second)
+	if err != nil {
+		t.Fatalf("marshal second requirement: %v", err)
+	}
+	raw := store.NewPostgresStore(dsn)
+	if _, err := raw.DB().ExecContext(ctx, `INSERT INTO requirements (id, project_id, position, created_at, payload) VALUES ($1, $2, $3, $4, $5::jsonb)`, second.ID, project.ID, 1, second.CreatedAt, payload); err != nil {
+		t.Fatalf("insert projected requirement: %v", err)
+	}
+
+	requirements, err := svc.ListRequirements(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list requirements: %v", err)
+	}
+	if len(requirements) != 2 || requirements[1].ID != second.ID {
+		t.Fatalf("expected SQL-projected second requirement, got %+v", requirements)
+	}
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan after SQL sync: %v", err)
+	}
+	if plan.Plan.RequirementID != second.ID {
+		t.Fatalf("expected generated plan to use SQL-synced requirement %s, got %s", second.ID, plan.Plan.RequirementID)
+	}
+}
+
+func TestPostgresRepositoryWriteFailureDoesNotMutateMemory(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	createSvc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir()}, logger)
+	createSvc.projectRequirementRepo = failingProjectRequirementRepository{err: errors.New("repository unavailable")}
+	if _, err := createSvc.CreateProject(ctx, CreateProjectInput{Name: "Failed Project"}); err == nil {
+		t.Fatal("expected create persistence failure")
+	}
+	createSvc.mu.RLock()
+	projectCount := len(createSvc.projects)
+	createSvc.mu.RUnlock()
+	if projectCount != 0 {
+		t.Fatalf("expected no in-memory project after failed create, got %d", projectCount)
+	}
+
+	addSvc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir()}, logger)
+	project, err := addSvc.CreateProject(ctx, CreateProjectInput{Name: "Existing Project"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	addSvc.projectRequirementRepo = failingProjectRequirementRepository{err: errors.New("repository unavailable")}
+	if _, err := addSvc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Failed Requirement", Content: "Should not stay in memory"}); err == nil {
+		t.Fatal("expected add requirement persistence failure")
+	}
+	addSvc.mu.RLock()
+	requirementCount := len(addSvc.requirements[project.ID])
+	addSvc.mu.RUnlock()
+	if requirementCount != 0 {
+		t.Fatalf("expected no in-memory requirement after failed add, got %d", requirementCount)
+	}
+}
+
+type failingProjectRequirementRepository struct {
+	err error
+}
+
+func (r failingProjectRequirementRepository) CreateProject(context.Context, *domain.Project, *persistedServiceState) error {
+	return r.err
+}
+
+func (r failingProjectRequirementRepository) AddRequirement(context.Context, *domain.Project, *domain.Requirement, int, *persistedServiceState) error {
+	return r.err
+}
+
+func (r failingProjectRequirementRepository) ListProjects(context.Context) ([]*domain.Project, error) {
+	return nil, r.err
+}
+
+func (r failingProjectRequirementRepository) GetProject(context.Context, string) (*domain.Project, error) {
+	return nil, r.err
+}
+
+func (r failingProjectRequirementRepository) ListRequirements(context.Context, string) ([]*domain.Requirement, error) {
+	return nil, r.err
+}
+
+func loadLegacyServiceStateForTest(t *testing.T, ctx context.Context, raw *store.PostgresStore) *persistedServiceState {
+	t.Helper()
+	payload, err := raw.Load(ctx)
+	if err != nil {
+		t.Fatalf("load legacy state: %v", err)
+	}
+	var state persistedServiceState
+	if err := json.Unmarshal(payload, &state); err != nil {
+		t.Fatalf("decode legacy state: %v", err)
+	}
+	return &state
+}
+
 func resetPostgresStateForTest(t *testing.T, ctx context.Context, dsn string) {
 	t.Helper()
 	raw := store.NewPostgresStore(dsn)

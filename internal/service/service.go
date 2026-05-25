@@ -59,13 +59,14 @@ func newInternalError(code, message string) *AppError {
 }
 
 type Service struct {
-	cfg               config.Config
-	logger            *slog.Logger
-	alertClient       *http.Client
-	runtimeRegistry   *agentruntime.Registry
-	runtimeInitErr    error
-	store             stateStore
-	workspaceProvider workspaceProvider
+	cfg                    config.Config
+	logger                 *slog.Logger
+	alertClient            *http.Client
+	runtimeRegistry        *agentruntime.Registry
+	runtimeInitErr         error
+	store                  stateStore
+	projectRequirementRepo projectRequirementRepository
+	workspaceProvider      workspaceProvider
 
 	mu             sync.RWMutex
 	projects       map[string]*domain.Project
@@ -601,14 +602,16 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		cfg.RuntimeProvider = runtimeProvider
 	}
 
+	serviceStore, projectRequirementRepo := newServiceStorage(cfg)
 	svc := &Service{
-		cfg:               cfg,
-		logger:            logger,
-		alertClient:       &http.Client{Timeout: 3 * time.Second},
-		runtimeRegistry:   runtimeRegistry,
-		runtimeInitErr:    runtimeInitErr,
-		store:             newServiceStore(cfg),
-		workspaceProvider: newWorkspaceProvider(cfg),
+		cfg:                    cfg,
+		logger:                 logger,
+		alertClient:            &http.Client{Timeout: 3 * time.Second},
+		runtimeRegistry:        runtimeRegistry,
+		runtimeInitErr:         runtimeInitErr,
+		store:                  serviceStore,
+		projectRequirementRepo: projectRequirementRepo,
+		workspaceProvider:      newWorkspaceProvider(cfg),
 	}
 	svc.resetStateLocked()
 	if err := svc.loadPersistedState(context.Background()); err != nil && logger != nil {
@@ -622,18 +625,32 @@ type stateStore interface {
 	SaveState(ctx context.Context, state *persistedServiceState) error
 }
 
+type projectRequirementRepository interface {
+	CreateProject(ctx context.Context, project *domain.Project, legacy *persistedServiceState) error
+	AddRequirement(ctx context.Context, project *domain.Project, requirement *domain.Requirement, position int, legacy *persistedServiceState) error
+	ListProjects(ctx context.Context) ([]*domain.Project, error)
+	GetProject(ctx context.Context, projectID string) (*domain.Project, error)
+	ListRequirements(ctx context.Context, projectID string) ([]*domain.Requirement, error)
+}
+
 type jsonStateStore struct {
 	store store.Store
 }
 
 func newServiceStore(cfg config.Config) stateStore {
+	serviceStore, _ := newServiceStorage(cfg)
+	return serviceStore
+}
+
+func newServiceStorage(cfg config.Config) (stateStore, projectRequirementRepository) {
 	switch strings.ToLower(strings.TrimSpace(cfg.StoreProvider)) {
 	case "file":
-		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}
+		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}, nil
 	case "postgres":
-		return newPostgresDomainStateStore(cfg.PostgresDSN)
+		raw := store.NewPostgresStore(cfg.PostgresDSN)
+		return postgresDomainStateStore{raw: raw}, postgresProjectRequirementRepository{raw: raw}
 	default:
-		return jsonStateStore{store: store.NewMemoryStore()}
+		return jsonStateStore{store: store.NewMemoryStore()}, nil
 	}
 }
 
@@ -935,14 +952,32 @@ func (s *Service) CreateProject(ctx context.Context, input CreateProjectInput) (
 		UpdatedAt:   now,
 	}
 
-	s.mu.Lock()
-	s.projects[project.ID] = project
-	s.projectBranch[project.ID] = "main"
-	s.recordAuditLocked(ctx, project.ID, "PROJECT_CREATE", "project", project.ID, "project created", now)
-	if err := s.persistLocked(); err != nil {
+	if s.projectRequirementRepo == nil {
+		s.mu.Lock()
+		s.projects[project.ID] = project
+		s.projectBranch[project.ID] = "main"
+		s.recordAuditLocked(ctx, project.ID, "PROJECT_CREATE", "project", project.ID, "project created", now)
+		if err := s.persistLocked(); err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
 		s.mu.Unlock()
-		return nil, err
+		return cloneProject(project), nil
 	}
+
+	s.mu.Lock()
+	candidate := s.capturePersistedStateLocked()
+	candidate.Projects[project.ID] = cloneProject(project)
+	candidate.ProjectBranch[project.ID] = "main"
+	candidate.AuditLogs[project.ID] = append(candidate.AuditLogs[project.ID], newAuditLog(ctx, project.ID, "PROJECT_CREATE", "project", project.ID, "project created", now))
+	if err := s.projectRequirementRepo.CreateProject(ctx, project, candidate); err != nil {
+		s.mu.Unlock()
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+	}
+	s.restorePersistedStateLocked(candidate)
 	s.mu.Unlock()
 
 	return cloneProject(project), nil
@@ -972,26 +1007,48 @@ func (s *Service) ListSandboxes(_ context.Context, projectID string) ([]SandboxV
 	return result, nil
 }
 
-func (s *Service) ListProjects(_ context.Context) ([]domain.Project, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Service) ListProjects(ctx context.Context) ([]domain.Project, error) {
+	if s.projectRequirementRepo == nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-	projects := make([]domain.Project, 0, len(s.projects))
-	for _, project := range s.projects {
-		projects = append(projects, *cloneProject(project))
-	}
-	slices.SortFunc(projects, func(a, b domain.Project) int {
-		switch {
-		case a.CreatedAt.Before(b.CreatedAt):
-			return -1
-		case a.CreatedAt.After(b.CreatedAt):
-			return 1
-		default:
-			return strings.Compare(a.ID, b.ID)
+		projects := make([]domain.Project, 0, len(s.projects))
+		for _, project := range s.projects {
+			projects = append(projects, *cloneProject(project))
 		}
-	})
+		slices.SortFunc(projects, func(a, b domain.Project) int {
+			switch {
+			case a.CreatedAt.Before(b.CreatedAt):
+				return -1
+			case a.CreatedAt.After(b.CreatedAt):
+				return 1
+			default:
+				return strings.Compare(a.ID, b.ID)
+			}
+		})
 
-	return projects, nil
+		return projects, nil
+	}
+
+	projects, err := s.projectRequirementRepo.ListProjects(ctx)
+	if err != nil {
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+	}
+
+	result := make([]domain.Project, 0, len(projects))
+	s.mu.Lock()
+	s.projects = make(map[string]*domain.Project, len(projects))
+	for _, project := range projects {
+		if project == nil {
+			continue
+		}
+		projectCopy := cloneProject(project)
+		s.projects[project.ID] = projectCopy
+		result = append(result, *projectCopy)
+	}
+	s.mu.Unlock()
+
+	return result, nil
 }
 
 func (s *Service) ListSnapshots(_ context.Context, projectID string) ([]domain.Snapshot, error) {
@@ -1197,14 +1254,30 @@ func (s *Service) GetTokenCostTrend(_ context.Context, projectID, taskID string)
 	return result, nil
 }
 
-func (s *Service) GetProject(_ context.Context, projectID string) (*domain.Project, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Service) GetProject(ctx context.Context, projectID string) (*domain.Project, error) {
+	if s.projectRequirementRepo == nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-	project, ok := s.projects[projectID]
-	if !ok {
-		return nil, newNotFoundError("project not found")
+		project, ok := s.projects[projectID]
+		if !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		return cloneProject(project), nil
 	}
+
+	project, err := s.projectRequirementRepo.GetProject(ctx, projectID)
+	if err != nil {
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+	}
+
+	s.mu.Lock()
+	s.projects[project.ID] = cloneProject(project)
+	s.mu.Unlock()
 
 	return cloneProject(project), nil
 }
@@ -1221,11 +1294,39 @@ func (s *Service) AddRequirement(ctx context.Context, projectID string, input Ad
 
 	now := time.Now().UTC()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.projectRequirementRepo == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
+		project, ok := s.projects[projectID]
+		if !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		req := &domain.Requirement{
+			ID:              nextID("req"),
+			ProjectID:       projectID,
+			Title:           title,
+			Content:         content,
+			Constraints:     compactStrings(input.Constraints),
+			AcceptanceHints: compactStrings(input.AcceptanceHints),
+			CreatedAt:       now,
+		}
+
+		s.requirements[projectID] = append(s.requirements[projectID], req)
+		project.UpdatedAt = now
+		s.recordAuditLocked(ctx, projectID, "REQUIREMENT_ADD", "requirement", req.ID, "requirement added", now)
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
+
+		return cloneRequirement(req), nil
+	}
+
+	s.mu.Lock()
 	project, ok := s.projects[projectID]
 	if !ok {
+		s.mu.Unlock()
 		return nil, newNotFoundError("project not found")
 	}
 
@@ -1238,30 +1339,62 @@ func (s *Service) AddRequirement(ctx context.Context, projectID string, input Ad
 		AcceptanceHints: compactStrings(input.AcceptanceHints),
 		CreatedAt:       now,
 	}
-
-	s.requirements[projectID] = append(s.requirements[projectID], req)
-	project.UpdatedAt = now
-	s.recordAuditLocked(ctx, projectID, "REQUIREMENT_ADD", "requirement", req.ID, "requirement added", now)
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+	candidate := s.capturePersistedStateLocked()
+	updatedProject := cloneProject(project)
+	updatedProject.UpdatedAt = now
+	candidate.Requirements[projectID] = append(candidate.Requirements[projectID], cloneRequirement(req))
+	candidate.Projects[projectID] = updatedProject
+	candidate.AuditLogs[projectID] = append(candidate.AuditLogs[projectID], newAuditLog(ctx, projectID, "REQUIREMENT_ADD", "requirement", req.ID, "requirement added", now))
+	position := len(candidate.Requirements[projectID]) - 1
+	if err := s.projectRequirementRepo.AddRequirement(ctx, updatedProject, req, position, candidate); err != nil {
+		s.mu.Unlock()
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
+	s.restorePersistedStateLocked(candidate)
+	s.mu.Unlock()
 
 	return cloneRequirement(req), nil
 }
 
-func (s *Service) ListRequirements(_ context.Context, projectID string) ([]domain.Requirement, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Service) ListRequirements(ctx context.Context, projectID string) ([]domain.Requirement, error) {
+	if s.projectRequirementRepo == nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-	if _, ok := s.projects[projectID]; !ok {
-		return nil, newNotFoundError("project not found")
+		if _, ok := s.projects[projectID]; !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		items := s.requirements[projectID]
+		result := make([]domain.Requirement, 0, len(items))
+		for _, item := range items {
+			result = append(result, *cloneRequirement(item))
+		}
+
+		return result, nil
 	}
 
-	items := s.requirements[projectID]
-	result := make([]domain.Requirement, 0, len(items))
-	for _, item := range items {
+	requirements, err := s.projectRequirementRepo.ListRequirements(ctx, projectID)
+	if err != nil {
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+	}
+
+	result := make([]domain.Requirement, 0, len(requirements))
+	s.mu.Lock()
+	s.requirements[projectID] = cloneRequirements(requirements)
+	for _, item := range requirements {
+		if item == nil {
+			continue
+		}
 		result = append(result, *cloneRequirement(item))
 	}
+	s.mu.Unlock()
 
 	return result, nil
 }
@@ -4073,12 +4206,12 @@ func (s *Service) recordCommunicationLocked(projectID, from, to, messageType, ta
 	s.communications[projectID] = append(s.communications[projectID], entry)
 }
 
-func (s *Service) recordAuditLocked(ctx context.Context, projectID, action, resourceType, resourceID, summary string, now time.Time) {
+func newAuditLog(ctx context.Context, projectID, action, resourceType, resourceID, summary string, now time.Time) *domain.AuditLog {
 	actor := ActorFromContext(ctx)
 	if actor == "" {
 		actor = "system"
 	}
-	entry := &domain.AuditLog{
+	return &domain.AuditLog{
 		ID:           nextID("audit"),
 		ProjectID:    projectID,
 		Actor:        actor,
@@ -4088,7 +4221,10 @@ func (s *Service) recordAuditLocked(ctx context.Context, projectID, action, reso
 		Summary:      strings.TrimSpace(summary),
 		Timestamp:    now,
 	}
-	s.auditLogs[projectID] = append(s.auditLogs[projectID], entry)
+}
+
+func (s *Service) recordAuditLocked(ctx context.Context, projectID, action, resourceType, resourceID, summary string, now time.Time) {
+	s.auditLogs[projectID] = append(s.auditLogs[projectID], newAuditLog(ctx, projectID, action, resourceType, resourceID, summary, now))
 }
 
 func (s *Service) recordAlertLocked(projectID, severity, alertType, resourceID, message string, now time.Time) {

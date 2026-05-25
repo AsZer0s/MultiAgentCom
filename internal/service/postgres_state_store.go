@@ -115,18 +115,23 @@ func (s postgresDomainStateStore) saveProjectionAndLegacy(ctx context.Context, s
 	if err := saveServiceStateProjection(ctx, tx, state); err != nil {
 		return err
 	}
+	if err := saveLegacyServiceState(ctx, tx, state); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func saveLegacyServiceState(ctx context.Context, tx *sql.Tx, state *persistedServiceState) error {
 	payload, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode service state: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO service_state (key, payload, updated_at)
-VALUES ($1, $2::jsonb, now())
-ON CONFLICT (key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
-`, store.PostgresServiceStateKey(), payload); err != nil {
-		return err
-	}
-	return tx.Commit()
+	_, err = tx.ExecContext(ctx, `
+	INSERT INTO service_state (key, payload, updated_at)
+	VALUES ($1, $2::jsonb, now())
+	ON CONFLICT (key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
+	`, store.PostgresServiceStateKey(), payload)
+	return err
 }
 
 func (s postgresDomainStateStore) loadProjection(ctx context.Context, state *persistedServiceState) error {
