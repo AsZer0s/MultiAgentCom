@@ -392,6 +392,14 @@
 - **DoD：** Postgres provider 下 `GeneratePlan`、`GenerateContract`、`DispatchTasks`、contract validation remediation、retry task 与 contract/task reads 直接写读 SQL projection；所有写入继续同事务 dual-write legacy `service_state`；file/memory provider 行为不变；guarded tests 覆盖 dual-write、SQL projection read 与 repository failure 不污染内存。
 - **完成范围：** 已新增 `postgresPlanContractTaskRepository`，覆盖 plans/contracts/tasks projection 写入、contract/task SQL 读取、task_order 保序、legacy aggregate dual-write 与内存同步；runs/artifacts/snapshots/context/audit/communication、多实例并发治理和 SQL-side ordering/version allocation 仍保持后续目标。
 
+### BL-917 Postgres runs/artifacts repository slice
+- **状态：** Done
+- **优先级：** P1
+- **估时：** 1.5 PD
+- **目标：** 继续小切片 repository 化，优先迁移 run execution 与 artifact delivery 核心读写路径。
+- **DoD：** Postgres provider 下 `StartRun`、`StartParallelRun`、run success/failure persistence、`GetRunStatus`、`ExportDelivery` 与 `GetArtifact` 直接读写 SQL projection；`agent_runs`/`run_order`/`artifacts`/`artifact_order` 与相关 tasks projection 和 legacy `service_state` 同事务 dual-write；file/memory provider 行为不变；guarded tests 覆盖 dual-write、SQL projection read、repository failure 不污染内存和 missing artifact 不写 download audit。
+- **完成范围：** 已新增 `postgresRunArtifactRepository`，覆盖 runs/artifacts projection 写入、run/artifact SQL 读取、run_order/artifact_order 保序、task terminal 状态同步、legacy aggregate dual-write 与内存同步；snapshots/workspaces/context/audit/communication、多实例并发治理、SQL-side ordering/version allocation 与外部 side-effect 原子回滚仍保持后续目标。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：

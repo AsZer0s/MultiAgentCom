@@ -645,6 +645,264 @@ func TestPostgresPlanContractTaskRepositoryDispatchTasksDualWrites(t *testing.T)
 	}
 }
 
+func TestPostgresRunArtifactRepositoryStartRunDualWrites(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-run-start-repository", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Run Start Repository"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Run start", Content: "Start a run through SQL"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	started, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: plan.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+
+	raw := store.NewPostgresStore(dsn)
+	var runPosition int
+	var runPayload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT o.position, r.payload FROM run_order o JOIN agent_runs r ON r.id = o.run_id WHERE r.id = $1`, started.Run.ID).Scan(&runPosition, &runPayload); err != nil {
+		t.Fatalf("query run projection: %v", err)
+	}
+	if runPosition != 0 {
+		t.Fatalf("run position = %d, want 0", runPosition)
+	}
+	var projectedRun domain.AgentRun
+	if err := json.Unmarshal(runPayload, &projectedRun); err != nil {
+		t.Fatalf("decode run projection: %v", err)
+	}
+	if projectedRun.ID != started.Run.ID || projectedRun.Status != domain.RunStatusRunning {
+		t.Fatalf("unexpected projected run: %+v", projectedRun)
+	}
+	var taskPayload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT payload FROM tasks WHERE id = $1`, plan.Task.ID).Scan(&taskPayload); err != nil {
+		t.Fatalf("query task projection: %v", err)
+	}
+	var projectedTask domain.Task
+	if err := json.Unmarshal(taskPayload, &projectedTask); err != nil {
+		t.Fatalf("decode task projection: %v", err)
+	}
+	if projectedTask.Status != domain.TaskStatusInProgress {
+		t.Fatalf("projected task status = %s, want IN_PROGRESS", projectedTask.Status)
+	}
+	legacy := loadLegacyServiceStateForTest(t, ctx, raw)
+	if legacy.Runs[started.Run.ID] == nil || len(legacy.RunOrder[project.ID]) != 1 {
+		t.Fatalf("legacy run missing: runs=%+v order=%+v", legacy.Runs[started.Run.ID], legacy.RunOrder[project.ID])
+	}
+}
+
+func TestPostgresRunArtifactRepositoryCompleteRunDualWrites(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-run-complete-repository", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Run Complete Repository"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Run complete", Content: "Complete a run through SQL"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	started, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: plan.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, started.Run.ID)
+
+	raw := store.NewPostgresStore(dsn)
+	var runPayload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT payload FROM agent_runs WHERE id = $1`, started.Run.ID).Scan(&runPayload); err != nil {
+		t.Fatalf("query completed run projection: %v", err)
+	}
+	var projectedRun domain.AgentRun
+	if err := json.Unmarshal(runPayload, &projectedRun); err != nil {
+		t.Fatalf("decode run projection: %v", err)
+	}
+	if projectedRun.Status != domain.RunStatusSucceeded || len(projectedRun.ArtifactIDs) != 1 {
+		t.Fatalf("unexpected projected completed run: %+v", projectedRun)
+	}
+	var taskPayload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT payload FROM tasks WHERE id = $1`, plan.Task.ID).Scan(&taskPayload); err != nil {
+		t.Fatalf("query completed task projection: %v", err)
+	}
+	var projectedTask domain.Task
+	if err := json.Unmarshal(taskPayload, &projectedTask); err != nil {
+		t.Fatalf("decode completed task projection: %v", err)
+	}
+	if projectedTask.Status != domain.TaskStatusDone || projectedTask.OutputRef == "" {
+		t.Fatalf("unexpected projected completed task: %+v", projectedTask)
+	}
+	var artifactPosition int
+	var artifactPayload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT o.position, a.payload FROM artifact_order o JOIN artifacts a ON a.id = o.artifact_id WHERE a.id = $1`, projectedRun.ArtifactIDs[0]).Scan(&artifactPosition, &artifactPayload); err != nil {
+		t.Fatalf("query artifact projection: %v", err)
+	}
+	if artifactPosition != 0 {
+		t.Fatalf("artifact position = %d, want 0", artifactPosition)
+	}
+	var projectedArtifact domain.Artifact
+	if err := json.Unmarshal(artifactPayload, &projectedArtifact); err != nil {
+		t.Fatalf("decode artifact projection: %v", err)
+	}
+	if projectedArtifact.RunID != started.Run.ID || projectedArtifact.TaskID != plan.Task.ID {
+		t.Fatalf("unexpected projected artifact: %+v", projectedArtifact)
+	}
+	legacy := loadLegacyServiceStateForTest(t, ctx, raw)
+	if legacy.Runs[started.Run.ID] == nil || legacy.Runs[started.Run.ID].Status != domain.RunStatusSucceeded || legacy.Artifacts[projectedArtifact.ID] == nil {
+		t.Fatalf("legacy completion missing: run=%+v artifact=%+v", legacy.Runs[started.Run.ID], legacy.Artifacts[projectedArtifact.ID])
+	}
+}
+
+func TestPostgresRunArtifactRepositoryFailRunDualWrites(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-run-fail-repository", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Run Fail Repository"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Run fail", Content: "Fail a run through SQL"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if err := svc.MarkTaskSandboxFailure(ctx, project.ID, plan.Task.ID, "boom"); err != nil {
+		t.Fatalf("inject sandbox failure: %v", err)
+	}
+	started, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: plan.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	status := waitForRunTerminal(t, svc, project.ID, started.Run.ID)
+	if status.Run.Status != domain.RunStatusFailed {
+		t.Fatalf("run status = %s, want FAILED", status.Run.Status)
+	}
+
+	raw := store.NewPostgresStore(dsn)
+	var runPayload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT payload FROM agent_runs WHERE id = $1`, started.Run.ID).Scan(&runPayload); err != nil {
+		t.Fatalf("query failed run projection: %v", err)
+	}
+	var projectedRun domain.AgentRun
+	if err := json.Unmarshal(runPayload, &projectedRun); err != nil {
+		t.Fatalf("decode failed run projection: %v", err)
+	}
+	if projectedRun.Status != domain.RunStatusFailed || !strings.Contains(projectedRun.Error, "boom") {
+		t.Fatalf("unexpected projected failed run: %+v", projectedRun)
+	}
+	var taskPayload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT payload FROM tasks WHERE id = $1`, plan.Task.ID).Scan(&taskPayload); err != nil {
+		t.Fatalf("query failed task projection: %v", err)
+	}
+	var projectedTask domain.Task
+	if err := json.Unmarshal(taskPayload, &projectedTask); err != nil {
+		t.Fatalf("decode failed task projection: %v", err)
+	}
+	if projectedTask.Status != domain.TaskStatusFailed {
+		t.Fatalf("projected task status = %s, want FAILED", projectedTask.Status)
+	}
+	legacy := loadLegacyServiceStateForTest(t, ctx, raw)
+	if len(legacy.Alerts[project.ID]) == 0 || legacy.Alerts[project.ID][len(legacy.Alerts[project.ID])-1].Type != "RUN_FAILURE" {
+		t.Fatalf("legacy run failure alert missing: %+v", legacy.Alerts[project.ID])
+	}
+}
+
+func TestPostgresRunArtifactReadsUseSQLProjection(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-run-artifact-read", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Run Artifact SQL Read"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Read run", Content: "Read runs and artifacts from SQL"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	started, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: plan.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, started.Run.ID)
+	status, err := svc.GetRunStatus(ctx, project.ID, started.Run.ID)
+	if err != nil {
+		t.Fatalf("get run status: %v", err)
+	}
+	if len(status.Artifacts) != 1 {
+		t.Fatalf("expected 1 artifact, got %+v", status.Artifacts)
+	}
+
+	updatedRun := cloneRun(&status.Run)
+	updatedRun.ResultSummary = "SQL projected summary"
+	runPayload, err := json.Marshal(updatedRun)
+	if err != nil {
+		t.Fatalf("marshal run: %v", err)
+	}
+	updatedArtifact := cloneArtifact(&status.Artifacts[0])
+	updatedArtifact.Kind = "sql-projected-bundle"
+	artifactPayload, err := json.Marshal(updatedArtifact)
+	if err != nil {
+		t.Fatalf("marshal artifact: %v", err)
+	}
+	raw := store.NewPostgresStore(dsn)
+	if _, err := raw.DB().ExecContext(ctx, `UPDATE agent_runs SET payload = $2::jsonb WHERE id = $1`, updatedRun.ID, runPayload); err != nil {
+		t.Fatalf("update run projection: %v", err)
+	}
+	if _, err := raw.DB().ExecContext(ctx, `UPDATE artifacts SET payload = $2::jsonb WHERE id = $1`, updatedArtifact.ID, artifactPayload); err != nil {
+		t.Fatalf("update artifact projection: %v", err)
+	}
+
+	gotStatus, err := svc.GetRunStatus(ctx, project.ID, started.Run.ID)
+	if err != nil {
+		t.Fatalf("get projected run status: %v", err)
+	}
+	if gotStatus.Run.ResultSummary != "SQL projected summary" || gotStatus.Artifacts[0].Kind != "sql-projected-bundle" {
+		t.Fatalf("GetRunStatus did not use SQL projection: %+v", gotStatus)
+	}
+	artifact, err := svc.ExportDelivery(ctx, project.ID, ExportDeliveryInput{RunID: started.Run.ID})
+	if err != nil {
+		t.Fatalf("export delivery: %v", err)
+	}
+	if artifact.Kind != "sql-projected-bundle" {
+		t.Fatalf("ExportDelivery artifact kind = %q, want sql-projected-bundle", artifact.Kind)
+	}
+}
+
 func TestPostgresContractAndTaskReadsUseSQLProjection(t *testing.T) {
 	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
 	if strings.TrimSpace(dsn) == "" {
@@ -717,6 +975,82 @@ func TestPostgresContractAndTaskReadsUseSQLProjection(t *testing.T) {
 	}
 	if run.Task.Name != "SQL Task Name" {
 		t.Fatalf("run task name = %q, want SQL Task Name", run.Task.Name)
+	}
+}
+
+func TestPostgresRunArtifactRepositoryWriteFailureDoesNotMutateMemory(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	svc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}, logger)
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Run Artifact Failure"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Run failure", Content: "Should not mutate"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	svc.runArtifactRepo = failingRunArtifactRepository{err: errors.New("repository unavailable")}
+	if _, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: plan.Task.ID}); err == nil {
+		t.Fatal("expected start run persistence failure")
+	}
+	svc.mu.RLock()
+	runCount := len(svc.runOrder[project.ID])
+	taskStatus := svc.tasks[plan.Task.ID].Status
+	svc.mu.RUnlock()
+	if runCount != 0 || taskStatus != domain.TaskStatusCreated {
+		t.Fatalf("expected no run and CREATED task after failed start, got runs=%d status=%s", runCount, taskStatus)
+	}
+}
+
+func TestPostgresGetArtifactDoesNotAuditMissingFile(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-artifact-missing-audit", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Missing Artifact Audit"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Missing artifact", Content: "Check audit behavior"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	started, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: plan.Task.ID})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	waitForSucceededRun(t, svc, project.ID, started.Run.ID)
+	status, err := svc.GetRunStatus(ctx, project.ID, started.Run.ID)
+	if err != nil {
+		t.Fatalf("get run status: %v", err)
+	}
+	if len(status.Artifacts) != 1 {
+		t.Fatalf("expected 1 artifact, got %+v", status.Artifacts)
+	}
+	artifact := status.Artifacts[0]
+	if err := os.Remove(artifact.URI); err != nil {
+		t.Fatalf("remove artifact file: %v", err)
+	}
+	if _, err := svc.GetArtifact(ctx, project.ID, artifact.ID); err == nil {
+		t.Fatal("expected missing artifact error")
+	}
+	raw := store.NewPostgresStore(dsn)
+	legacy := loadLegacyServiceStateForTest(t, ctx, raw)
+	for _, entry := range legacy.AuditLogs[project.ID] {
+		if entry.Action == "DELIVERY_DOWNLOAD" {
+			t.Fatalf("unexpected download audit for missing artifact: %+v", legacy.AuditLogs[project.ID])
+		}
 	}
 }
 
@@ -875,6 +1209,42 @@ func (r failingPlanContractTaskRepository) GetContract(context.Context, string, 
 
 func (r failingPlanContractTaskRepository) ListTasks(context.Context, string) ([]*domain.Task, error) {
 	return nil, r.err
+}
+
+type failingRunArtifactRepository struct {
+	err error
+}
+
+func (r failingRunArtifactRepository) StartRuns(context.Context, []runStartPersistence, *persistedServiceState) error {
+	return r.err
+}
+
+func (r failingRunArtifactRepository) CompleteRun(context.Context, *domain.Task, *domain.AgentRun, *domain.Artifact, int, *persistedServiceState) error {
+	return r.err
+}
+
+func (r failingRunArtifactRepository) FailRun(context.Context, *domain.Task, *domain.AgentRun, *persistedServiceState) error {
+	return r.err
+}
+
+func (r failingRunArtifactRepository) GetRun(context.Context, string, string) (*domain.AgentRun, error) {
+	return nil, r.err
+}
+
+func (r failingRunArtifactRepository) GetArtifactsForRun(context.Context, string, []string) ([]*domain.Artifact, error) {
+	return nil, r.err
+}
+
+func (r failingRunArtifactRepository) GetArtifact(context.Context, string, string) (*domain.Artifact, error) {
+	return nil, r.err
+}
+
+func (r failingRunArtifactRepository) LatestExportableArtifact(context.Context, string) (*domain.AgentRun, *domain.Artifact, error) {
+	return nil, nil, r.err
+}
+
+func (r failingRunArtifactRepository) SaveLegacy(context.Context, *persistedServiceState) error {
+	return r.err
 }
 
 func loadLegacyServiceStateForTest(t *testing.T, ctx context.Context, raw *store.PostgresStore) *persistedServiceState {

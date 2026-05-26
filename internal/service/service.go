@@ -67,6 +67,7 @@ type Service struct {
 	store                  stateStore
 	projectRequirementRepo projectRequirementRepository
 	planContractTaskRepo   planContractTaskRepository
+	runArtifactRepo        runArtifactRepository
 	workspaceProvider      workspaceProvider
 
 	mu             sync.RWMutex
@@ -603,7 +604,7 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		cfg.RuntimeProvider = runtimeProvider
 	}
 
-	serviceStore, projectRequirementRepo, planContractTaskRepo := newServiceStorage(cfg)
+	serviceStore, projectRequirementRepo, planContractTaskRepo, runArtifactRepo := newServiceStorage(cfg)
 	svc := &Service{
 		cfg:                    cfg,
 		logger:                 logger,
@@ -613,6 +614,7 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		store:                  serviceStore,
 		projectRequirementRepo: projectRequirementRepo,
 		planContractTaskRepo:   planContractTaskRepo,
+		runArtifactRepo:        runArtifactRepo,
 		workspaceProvider:      newWorkspaceProvider(cfg),
 	}
 	svc.resetStateLocked()
@@ -644,24 +646,41 @@ type planContractTaskRepository interface {
 	ListTasks(ctx context.Context, projectID string) ([]*domain.Task, error)
 }
 
+type runArtifactRepository interface {
+	StartRuns(ctx context.Context, items []runStartPersistence, legacy *persistedServiceState) error
+	CompleteRun(ctx context.Context, task *domain.Task, run *domain.AgentRun, artifact *domain.Artifact, artifactPosition int, legacy *persistedServiceState) error
+	FailRun(ctx context.Context, task *domain.Task, run *domain.AgentRun, legacy *persistedServiceState) error
+	GetRun(ctx context.Context, projectID, runID string) (*domain.AgentRun, error)
+	GetArtifactsForRun(ctx context.Context, projectID string, artifactIDs []string) ([]*domain.Artifact, error)
+	GetArtifact(ctx context.Context, projectID, artifactID string) (*domain.Artifact, error)
+	LatestExportableArtifact(ctx context.Context, projectID string) (*domain.AgentRun, *domain.Artifact, error)
+	SaveLegacy(ctx context.Context, legacy *persistedServiceState) error
+}
+
+type runStartPersistence struct {
+	Task        *domain.Task
+	Run         *domain.AgentRun
+	RunPosition int
+}
+
 type jsonStateStore struct {
 	store store.Store
 }
 
 func newServiceStore(cfg config.Config) stateStore {
-	serviceStore, _, _ := newServiceStorage(cfg)
+	serviceStore, _, _, _ := newServiceStorage(cfg)
 	return serviceStore
 }
 
-func newServiceStorage(cfg config.Config) (stateStore, projectRequirementRepository, planContractTaskRepository) {
+func newServiceStorage(cfg config.Config) (stateStore, projectRequirementRepository, planContractTaskRepository, runArtifactRepository) {
 	switch strings.ToLower(strings.TrimSpace(cfg.StoreProvider)) {
 	case "file":
-		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}, nil, nil
+		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}, nil, nil, nil
 	case "postgres":
 		raw := store.NewPostgresStore(cfg.PostgresDSN)
-		return postgresDomainStateStore{raw: raw}, postgresProjectRequirementRepository{raw: raw}, postgresPlanContractTaskRepository{raw: raw}
+		return postgresDomainStateStore{raw: raw}, postgresProjectRequirementRepository{raw: raw}, postgresPlanContractTaskRepository{raw: raw}, postgresRunArtifactRepository{raw: raw}
 	default:
-		return jsonStateStore{store: store.NewMemoryStore()}, nil, nil
+		return jsonStateStore{store: store.NewMemoryStore()}, nil, nil, nil
 	}
 }
 
@@ -2644,74 +2663,177 @@ func (s *Service) RetryTask(ctx context.Context, projectID, taskID string) (*dom
 	return cloneTask(retryTask), nil
 }
 
-func (s *Service) StartRun(_ context.Context, projectID string, input StartRunInput) (*RunEnvelope, error) {
+func (s *Service) StartRun(ctx context.Context, projectID string, input StartRunInput) (*RunEnvelope, error) {
 	now := time.Now().UTC()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.runArtifactRepo == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
+		if _, ok := s.projects[projectID]; !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		task, err := s.resolveTaskLocked(projectID, input.TaskID)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := s.ensureTokenBudgetAllowsRunLocked(projectID, task); err != nil {
+			return nil, err
+		}
+
+		envelope, err := s.startTaskRunLocked(projectID, task, now, "single agent execution started")
+		if err != nil {
+			if persistErr := s.persistLocked(); persistErr != nil {
+				return nil, persistErr
+			}
+			return nil, err
+		}
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
+
+		go s.executeRun(envelope.Run.ID)
+
+		return envelope, nil
+	}
+
+	s.mu.Lock()
 	if _, ok := s.projects[projectID]; !ok {
+		s.mu.Unlock()
 		return nil, newNotFoundError("project not found")
 	}
-
 	task, err := s.resolveTaskLocked(projectID, input.TaskID)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-
 	if err := s.ensureTokenBudgetAllowsRunLocked(projectID, task); err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-
+	original := s.capturePersistedStateLocked()
 	envelope, err := s.startTaskRunLocked(projectID, task, now, "single agent execution started")
 	if err != nil {
 		if persistErr := s.persistLocked(); persistErr != nil {
+			s.mu.Unlock()
 			return nil, persistErr
 		}
+		s.mu.Unlock()
 		return nil, err
 	}
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+	candidate := s.capturePersistedStateLocked()
+	candidateTask := candidate.Tasks[envelope.Task.ID]
+	candidateRun := candidate.Runs[envelope.Run.ID]
+	runPosition := len(candidate.RunOrder[projectID]) - 1
+	if err := s.runArtifactRepo.StartRuns(ctx, []runStartPersistence{{Task: candidateTask, Run: candidateRun, RunPosition: runPosition}}, candidate); err != nil {
+		s.restorePersistedStateLocked(original)
+		s.mu.Unlock()
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
+	s.restorePersistedStateLocked(candidate)
+	s.mu.Unlock()
 
 	go s.executeRun(envelope.Run.ID)
 
 	return envelope, nil
 }
 
-func (s *Service) StartParallelRun(_ context.Context, projectID string, input ParallelRunInput) (*ParallelRunResult, error) {
+func (s *Service) StartParallelRun(ctx context.Context, projectID string, input ParallelRunInput) (*ParallelRunResult, error) {
 	now := time.Now().UTC()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.runArtifactRepo == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
+		if _, ok := s.projects[projectID]; !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		selected, blocked, err := s.resolveParallelTasksLocked(projectID, input.TaskIDs)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, task := range selected {
+			if err := s.ensureTokenBudgetAllowsRunLocked(projectID, task); err != nil {
+				return nil, err
+			}
+		}
+
+		started := make([]RunEnvelope, 0, len(selected))
+		for _, task := range selected {
+			envelope, startErr := s.startTaskRunLocked(projectID, task, now, "parallel execution started")
+			if startErr != nil {
+				return nil, startErr
+			}
+			started = append(started, *envelope)
+		}
+
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
+
+		for _, envelope := range started {
+			go s.executeRun(envelope.Run.ID)
+		}
+
+		return &ParallelRunResult{
+			BatchID:      nextID("batch"),
+			Started:      started,
+			BlockedTasks: cloneTasks(blocked),
+		}, nil
+	}
+
+	s.mu.Lock()
 	if _, ok := s.projects[projectID]; !ok {
+		s.mu.Unlock()
 		return nil, newNotFoundError("project not found")
 	}
-
 	selected, blocked, err := s.resolveParallelTasksLocked(projectID, input.TaskIDs)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-
 	for _, task := range selected {
 		if err := s.ensureTokenBudgetAllowsRunLocked(projectID, task); err != nil {
+			s.mu.Unlock()
 			return nil, err
 		}
 	}
-
+	original := s.capturePersistedStateLocked()
 	started := make([]RunEnvelope, 0, len(selected))
 	for _, task := range selected {
 		envelope, startErr := s.startTaskRunLocked(projectID, task, now, "parallel execution started")
 		if startErr != nil {
+			s.mu.Unlock()
 			return nil, startErr
 		}
 		started = append(started, *envelope)
 	}
-
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+	candidate := s.capturePersistedStateLocked()
+	items := make([]runStartPersistence, 0, len(started))
+	for _, envelope := range started {
+		items = append(items, runStartPersistence{
+			Task:        candidate.Tasks[envelope.Task.ID],
+			Run:         candidate.Runs[envelope.Run.ID],
+			RunPosition: slices.Index(candidate.RunOrder[projectID], envelope.Run.ID),
+		})
 	}
+	if err := s.runArtifactRepo.StartRuns(ctx, items, candidate); err != nil {
+		s.restorePersistedStateLocked(original)
+		s.mu.Unlock()
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+	}
+	s.restorePersistedStateLocked(candidate)
+	s.mu.Unlock()
 
 	for _, envelope := range started {
 		go s.executeRun(envelope.Run.ID)
@@ -2724,75 +2846,175 @@ func (s *Service) StartParallelRun(_ context.Context, projectID string, input Pa
 	}, nil
 }
 
-func (s *Service) GetRunStatus(_ context.Context, projectID, runID string) (*RunStatusView, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Service) GetRunStatus(ctx context.Context, projectID, runID string) (*RunStatusView, error) {
+	if s.runArtifactRepo == nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-	run, ok := s.runs[runID]
-	if !ok || run.ProjectID != projectID {
-		return nil, newNotFoundError("run not found")
+		run, ok := s.runs[runID]
+		if !ok || run.ProjectID != projectID {
+			return nil, newNotFoundError("run not found")
+		}
+
+		task, ok := s.tasks[run.TaskID]
+		if !ok {
+			return nil, newNotFoundError("task not found for run")
+		}
+
+		artifacts := make([]domain.Artifact, 0, len(run.ArtifactIDs))
+		for _, artifactID := range run.ArtifactIDs {
+			if artifact, exists := s.artifacts[artifactID]; exists {
+				artifacts = append(artifacts, *cloneArtifact(artifact))
+			}
+		}
+
+		return &RunStatusView{
+			Run:       *cloneRun(run),
+			Task:      *cloneTask(task),
+			Artifacts: artifacts,
+		}, nil
 	}
 
+	run, err := s.runArtifactRepo.GetRun(ctx, projectID, runID)
+	if err != nil {
+		if errors.Is(err, errRepositoryRunNotFound) {
+			return nil, newNotFoundError("run not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+	}
+	artifacts, err := s.runArtifactRepo.GetArtifactsForRun(ctx, projectID, run.ArtifactIDs)
+	if err != nil {
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+	}
+
+	s.mu.Lock()
 	task, ok := s.tasks[run.TaskID]
 	if !ok {
+		s.mu.Unlock()
 		return nil, newNotFoundError("task not found for run")
 	}
-
-	artifacts := make([]domain.Artifact, 0, len(run.ArtifactIDs))
-	for _, artifactID := range run.ArtifactIDs {
-		if artifact, exists := s.artifacts[artifactID]; exists {
-			artifacts = append(artifacts, *cloneArtifact(artifact))
-		}
+	s.runs[run.ID] = cloneRun(run)
+	for _, artifact := range artifacts {
+		s.artifacts[artifact.ID] = cloneArtifact(artifact)
 	}
+	taskCopy := cloneTask(task)
+	s.mu.Unlock()
 
+	artifactValues := make([]domain.Artifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		artifactValues = append(artifactValues, *cloneArtifact(artifact))
+	}
 	return &RunStatusView{
 		Run:       *cloneRun(run),
-		Task:      *cloneTask(task),
-		Artifacts: artifacts,
+		Task:      *taskCopy,
+		Artifacts: artifactValues,
 	}, nil
 }
 
 func (s *Service) ExportDelivery(ctx context.Context, projectID string, input ExportDeliveryInput) (*domain.Artifact, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.runArtifactRepo == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	if _, ok := s.projects[projectID]; !ok {
-		return nil, newNotFoundError("project not found")
-	}
+		if _, ok := s.projects[projectID]; !ok {
+			return nil, newNotFoundError("project not found")
+		}
 
-	if input.RunID != "" {
-		run, ok := s.runs[input.RunID]
-		if !ok || run.ProjectID != projectID {
-			return nil, newNotFoundError("run not found")
-		}
-		artifact, err := s.resolveArtifactFromRunLocked(run)
-		if err != nil {
-			return nil, err
-		}
-		s.recordAuditLocked(ctx, projectID, "DELIVERY_EXPORT", "artifact", artifact.ID, "delivery export requested for run "+run.ID, time.Now().UTC())
-		if err := s.persistLocked(); err != nil {
-			return nil, err
-		}
-		return cloneArtifact(artifact), nil
-	}
-
-	runIDs := s.runOrder[projectID]
-	for idx := len(runIDs) - 1; idx >= 0; idx-- {
-		run := s.runs[runIDs[idx]]
-		if run.Status != domain.RunStatusSucceeded {
-			continue
-		}
-		artifact, err := s.resolveArtifactFromRunLocked(run)
-		if err == nil {
-			s.recordAuditLocked(ctx, projectID, "DELIVERY_EXPORT", "artifact", artifact.ID, "delivery export requested from latest successful run", time.Now().UTC())
+		if input.RunID != "" {
+			run, ok := s.runs[input.RunID]
+			if !ok || run.ProjectID != projectID {
+				return nil, newNotFoundError("run not found")
+			}
+			artifact, err := s.resolveArtifactFromRunLocked(run)
+			if err != nil {
+				return nil, err
+			}
+			s.recordAuditLocked(ctx, projectID, "DELIVERY_EXPORT", "artifact", artifact.ID, "delivery export requested for run "+run.ID, time.Now().UTC())
 			if err := s.persistLocked(); err != nil {
 				return nil, err
 			}
 			return cloneArtifact(artifact), nil
 		}
+
+		runIDs := s.runOrder[projectID]
+		for idx := len(runIDs) - 1; idx >= 0; idx-- {
+			run := s.runs[runIDs[idx]]
+			if run.Status != domain.RunStatusSucceeded {
+				continue
+			}
+			artifact, err := s.resolveArtifactFromRunLocked(run)
+			if err == nil {
+				s.recordAuditLocked(ctx, projectID, "DELIVERY_EXPORT", "artifact", artifact.ID, "delivery export requested from latest successful run", time.Now().UTC())
+				if err := s.persistLocked(); err != nil {
+					return nil, err
+				}
+				return cloneArtifact(artifact), nil
+			}
+		}
+
+		return nil, newConflictError("no exportable artifact found")
 	}
 
-	return nil, newConflictError("no exportable artifact found")
+	var run *domain.AgentRun
+	var artifact *domain.Artifact
+	var err error
+	if input.RunID != "" {
+		run, err = s.runArtifactRepo.GetRun(ctx, projectID, input.RunID)
+		if err != nil {
+			if errors.Is(err, errRepositoryRunNotFound) {
+				return nil, newNotFoundError("run not found")
+			}
+			return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+		}
+		if run.Status != domain.RunStatusSucceeded {
+			return nil, newConflictError("run has not completed successfully")
+		}
+		if len(run.ArtifactIDs) == 0 {
+			return nil, newConflictError("run has no exported artifact")
+		}
+		artifacts, err := s.runArtifactRepo.GetArtifactsForRun(ctx, projectID, run.ArtifactIDs)
+		if err != nil {
+			return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+		}
+		if len(artifacts) == 0 {
+			return nil, newNotFoundError("artifact not found")
+		}
+		artifact = artifacts[len(artifacts)-1]
+	} else {
+		run, artifact, err = s.runArtifactRepo.LatestExportableArtifact(ctx, projectID)
+		if err != nil {
+			if errors.Is(err, errRepositoryProjectNotFound) {
+				return nil, newNotFoundError("project not found")
+			}
+			if errors.Is(err, errRepositoryArtifactNotFound) {
+				return nil, newConflictError("no exportable artifact found")
+			}
+			return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+		}
+	}
+
+	now := time.Now().UTC()
+	s.mu.Lock()
+	if _, ok := s.projects[projectID]; !ok {
+		s.mu.Unlock()
+		return nil, newNotFoundError("project not found")
+	}
+	candidate := s.capturePersistedStateLocked()
+	candidate.Runs[run.ID] = cloneRun(run)
+	candidate.Artifacts[artifact.ID] = cloneArtifact(artifact)
+	summary := "delivery export requested from latest successful run"
+	if input.RunID != "" {
+		summary = "delivery export requested for run " + run.ID
+	}
+	candidate.AuditLogs[projectID] = append(candidate.AuditLogs[projectID], newAuditLog(ctx, projectID, "DELIVERY_EXPORT", "artifact", artifact.ID, summary, now))
+	if err := s.runArtifactRepo.SaveLegacy(ctx, candidate); err != nil {
+		s.mu.Unlock()
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+	}
+	s.restorePersistedStateLocked(candidate)
+	s.mu.Unlock()
+
+	return cloneArtifact(artifact), nil
 }
 
 func (s *Service) artifactPathWithinConfiguredRoots(path string) bool {
@@ -2821,12 +3043,34 @@ func pathWithinRoot(path, root string) bool {
 }
 
 func (s *Service) GetArtifact(ctx context.Context, projectID, artifactID string) (*domain.Artifact, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.runArtifactRepo == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	artifact, ok := s.artifacts[artifactID]
-	if !ok || artifact.ProjectID != projectID {
-		return nil, newNotFoundError("artifact not found")
+		artifact, ok := s.artifacts[artifactID]
+		if !ok || artifact.ProjectID != projectID {
+			return nil, newNotFoundError("artifact not found")
+		}
+		if !s.artifactPathWithinConfiguredRoots(artifact.URI) {
+			return nil, newInternalError("ARTIFACT_PATH_INVALID", "artifact path is outside configured roots")
+		}
+		if _, err := os.Stat(artifact.URI); err != nil {
+			return nil, newInternalError("ARTIFACT_MISSING", "artifact file is missing")
+		}
+
+		s.recordAuditLocked(ctx, projectID, "DELIVERY_DOWNLOAD", "artifact", artifact.ID, "delivery artifact downloaded", time.Now().UTC())
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
+		return cloneArtifact(artifact), nil
+	}
+
+	artifact, err := s.runArtifactRepo.GetArtifact(ctx, projectID, artifactID)
+	if err != nil {
+		if errors.Is(err, errRepositoryArtifactNotFound) {
+			return nil, newNotFoundError("artifact not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
 	if !s.artifactPathWithinConfiguredRoots(artifact.URI) {
 		return nil, newInternalError("ARTIFACT_PATH_INVALID", "artifact path is outside configured roots")
@@ -2835,10 +3079,18 @@ func (s *Service) GetArtifact(ctx context.Context, projectID, artifactID string)
 		return nil, newInternalError("ARTIFACT_MISSING", "artifact file is missing")
 	}
 
-	s.recordAuditLocked(ctx, projectID, "DELIVERY_DOWNLOAD", "artifact", artifact.ID, "delivery artifact downloaded", time.Now().UTC())
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+	now := time.Now().UTC()
+	s.mu.Lock()
+	candidate := s.capturePersistedStateLocked()
+	candidate.Artifacts[artifact.ID] = cloneArtifact(artifact)
+	candidate.AuditLogs[projectID] = append(candidate.AuditLogs[projectID], newAuditLog(ctx, projectID, "DELIVERY_DOWNLOAD", "artifact", artifact.ID, "delivery artifact downloaded", now))
+	if err := s.runArtifactRepo.SaveLegacy(ctx, candidate); err != nil {
+		s.mu.Unlock()
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
+	s.restorePersistedStateLocked(candidate)
+	s.mu.Unlock()
+
 	return cloneArtifact(artifact), nil
 }
 
@@ -2904,17 +3156,20 @@ func (s *Service) executeRun(runID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	storedRun, ok := s.runs[runID]
-	if !ok {
-		return
-	}
 	storedTask, ok := s.tasks[task.ID]
 	if !ok {
 		return
 	}
 
-	s.artifacts[artifact.ID] = artifact
-	s.artifactOrder[artifact.ProjectID] = append(s.artifactOrder[artifact.ProjectID], artifact.ID)
+	candidate := s.capturePersistedStateLocked()
+	candidateRun := candidate.Runs[runID]
+	candidateTask := candidate.Tasks[task.ID]
+	if candidateRun == nil || candidateTask == nil {
+		return
+	}
+	candidate.Artifacts[artifact.ID] = cloneArtifact(artifact)
+	candidate.ArtifactOrder[artifact.ProjectID] = append(candidate.ArtifactOrder[artifact.ProjectID], artifact.ID)
+	artifactPosition := len(candidate.ArtifactOrder[artifact.ProjectID]) - 1
 
 	communicationCount := s.communicationCountForTaskLocked(project.ID, storedTask.ID)
 	promptTokens, completionTokens, totalTokens := estimateRunTokens(storedTask, plan, communicationCount, false)
@@ -2925,30 +3180,33 @@ func (s *Service) executeRun(runID string) {
 		totalTokens = runtimeResponse.TotalTokens
 	}
 	estimatedCostUSD := s.estimateCostFromTokens(promptTokens, completionTokens)
-	storedRun.Status = domain.RunStatusSucceeded
+	candidateRun.Status = domain.RunStatusSucceeded
 	if runtimeModel := strings.TrimSpace(runtimeResponse.Model); runtimeModel != "" {
-		storedRun.Model = runtimeModel
+		candidateRun.Model = runtimeModel
 	}
-	storedRun.PromptTokens = promptTokens
-	storedRun.CompletionTokens = completionTokens
-	storedRun.TotalTokens = totalTokens
-	storedRun.EstimatedCostUSD = estimatedCostUSD
+	candidateRun.PromptTokens = promptTokens
+	candidateRun.CompletionTokens = completionTokens
+	candidateRun.TotalTokens = totalTokens
+	candidateRun.EstimatedCostUSD = estimatedCostUSD
 	if runtimeSummary := compactRuntimeSummary(runtimeResponse.Output); runtimeSummary != "" {
 		summary += "; runtime output: " + runtimeSummary
 	}
 	if appliedOverride != nil {
 		summary += "; applied human override by " + appliedOverride.Operator + ": " + appliedOverride.Instruction
 	}
-	storedRun.ResultSummary = summary
-	storedRun.ArtifactIDs = append(storedRun.ArtifactIDs, artifact.ID)
-	storedRun.EndedAt = now
+	candidateRun.ResultSummary = summary
+	candidateRun.ArtifactIDs = append(candidateRun.ArtifactIDs, artifact.ID)
+	candidateRun.EndedAt = now
 
-	storedTask.OutputRef = artifact.URI
-	if err := storedTask.TransitionTo(domain.TaskStatusDone, "single agent execution completed", now); err != nil {
-		s.logger.Error("failed to transition task to done", "taskId", storedTask.ID, "error", err)
+	candidateTask.OutputRef = artifact.URI
+	if err := candidateTask.TransitionTo(domain.TaskStatusDone, "single agent execution completed", now); err != nil {
+		s.logger.Error("failed to transition task to done", "taskId", candidateTask.ID, "error", err)
 	}
-	if storedRun.SandboxID != "" {
-		if storedSandbox, exists := s.sandboxIndex[storedRun.SandboxID]; exists {
+	if candidateRun.SandboxID != "" {
+		for _, storedSandbox := range candidate.Sandboxes[candidateRun.ProjectID] {
+			if storedSandbox == nil || storedSandbox.ID != candidateRun.SandboxID {
+				continue
+			}
 			if sandbox != nil {
 				storedSandbox.WorkspaceHeadRef = sandbox.WorkspaceHeadRef
 				storedSandbox.WorkspaceBranch = sandbox.WorkspaceBranch
@@ -2956,13 +3214,23 @@ func (s *Service) executeRun(runID string) {
 			}
 			storedSandbox.Status = domain.SandboxStatusReleased
 			storedSandbox.UpdatedAt = now
+			break
 		}
 	}
-	if err := s.persistLocked(); err != nil {
-		s.logger.Error("failed to persist completed run", "runId", storedRun.ID, "taskId", storedTask.ID, "error", err)
+	if s.runArtifactRepo != nil {
+		if err := s.runArtifactRepo.CompleteRun(context.Background(), candidateTask, candidateRun, artifact, artifactPosition, candidate); err != nil {
+			s.logger.Error("failed to persist completed run", "runId", candidateRun.ID, "taskId", candidateTask.ID, "error", err)
+			return
+		}
+		s.restorePersistedStateLocked(candidate)
+	} else {
+		s.restorePersistedStateLocked(candidate)
+		if err := s.persistLocked(); err != nil {
+			s.logger.Error("failed to persist completed run", "runId", candidateRun.ID, "taskId", candidateTask.ID, "error", err)
+		}
 	}
 
-	s.logger.Info("run execution completed", "runId", storedRun.ID, "taskId", storedTask.ID, "artifactId", artifact.ID)
+	s.logger.Info("run execution completed", "runId", candidateRun.ID, "taskId", candidateTask.ID, "artifactId", artifact.ID)
 }
 
 func (s *Service) executeRuntimeRun(run *domain.AgentRun, task *domain.Task, plan *domain.Plan, project *domain.Project, sandbox *domain.Sandbox) (agentruntime.Response, error) {
@@ -3163,45 +3431,72 @@ func (s *Service) failRun(runID string, failure error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	run, ok := s.runs[runID]
-	if !ok {
+	if _, ok := s.runs[runID]; !ok {
+		return
+	}
+	candidate := s.capturePersistedStateLocked()
+	candidateRun := candidate.Runs[runID]
+	if candidateRun == nil {
 		return
 	}
 
-	run.Status = domain.RunStatusFailed
-	run.Error = failure.Error()
-	run.EndedAt = now
-	s.recordAlertLocked(run.ProjectID, "ERROR", "RUN_FAILURE", run.ID, failure.Error(), now)
-	if run.SandboxID != "" {
-		if sandbox, exists := s.sandboxIndex[run.SandboxID]; exists {
+	candidateRun.Status = domain.RunStatusFailed
+	candidateRun.Error = failure.Error()
+	candidateRun.EndedAt = now
+	entry := &domain.Alert{
+		ID:         nextID("alert"),
+		ProjectID:  candidateRun.ProjectID,
+		Severity:   "ERROR",
+		Type:       "RUN_FAILURE",
+		ResourceID: candidateRun.ID,
+		Message:    failure.Error(),
+		Timestamp:  now,
+	}
+	candidate.Alerts[candidateRun.ProjectID] = append(candidate.Alerts[candidateRun.ProjectID], entry)
+	if candidateRun.SandboxID != "" {
+		for _, sandbox := range candidate.Sandboxes[candidateRun.ProjectID] {
+			if sandbox == nil || sandbox.ID != candidateRun.SandboxID {
+				continue
+			}
 			sandbox.Status = domain.SandboxStatusFailed
 			sandbox.FailureReason = failure.Error()
 			sandbox.UpdatedAt = now
+			break
 		}
 	}
 
-	if task, exists := s.tasks[run.TaskID]; exists && (task.Status == domain.TaskStatusInProgress || task.Status == domain.TaskStatusHumanOverride) {
-		if err := task.TransitionTo(domain.TaskStatusFailed, "single agent execution failed", now); err != nil {
-			s.logger.Error("failed to transition task to failed", "taskId", task.ID, "error", err)
+	var candidateTask *domain.Task
+	if task, exists := candidate.Tasks[candidateRun.TaskID]; exists {
+		candidateTask = task
+		if task.Status == domain.TaskStatusInProgress || task.Status == domain.TaskStatusHumanOverride {
+			if err := task.TransitionTo(domain.TaskStatusFailed, "single agent execution failed", now); err != nil {
+				s.logger.Error("failed to transition task to failed", "taskId", task.ID, "error", err)
+			}
 		}
 	}
-	var task *domain.Task
-	if existing, ok := s.tasks[run.TaskID]; ok {
-		task = existing
-	}
 	var plan *domain.Plan
-	if task != nil {
-		plan = s.planIndex[task.PlanID]
+	if candidateTask != nil {
+		plan = s.planIndex[candidateTask.PlanID]
 	}
-	communicationCount := s.communicationCountForTaskLocked(run.ProjectID, run.TaskID)
-	promptTokens, completionTokens, totalTokens := estimateRunTokens(task, plan, communicationCount, true)
-	run.PromptTokens = promptTokens
-	run.CompletionTokens = completionTokens
-	run.TotalTokens = totalTokens
-	run.EstimatedCostUSD = s.estimateCostFromTokens(promptTokens, completionTokens)
-	if err := s.persistLocked(); err != nil {
-		s.logger.Error("failed to persist failed run", "runId", run.ID, "taskId", run.TaskID, "error", err)
+	communicationCount := s.communicationCountForTaskLocked(candidateRun.ProjectID, candidateRun.TaskID)
+	promptTokens, completionTokens, totalTokens := estimateRunTokens(candidateTask, plan, communicationCount, true)
+	candidateRun.PromptTokens = promptTokens
+	candidateRun.CompletionTokens = completionTokens
+	candidateRun.TotalTokens = totalTokens
+	candidateRun.EstimatedCostUSD = s.estimateCostFromTokens(promptTokens, completionTokens)
+	if s.runArtifactRepo != nil {
+		if err := s.runArtifactRepo.FailRun(context.Background(), candidateTask, candidateRun, candidate); err != nil {
+			s.logger.Error("failed to persist failed run", "runId", candidateRun.ID, "taskId", candidateRun.TaskID, "error", err)
+			return
+		}
+		s.restorePersistedStateLocked(candidate)
+	} else {
+		s.restorePersistedStateLocked(candidate)
+		if err := s.persistLocked(); err != nil {
+			s.logger.Error("failed to persist failed run", "runId", candidateRun.ID, "taskId", candidateRun.TaskID, "error", err)
+		}
 	}
+	s.notifyAlertAsync(cloneAlert(entry))
 }
 
 func (s *Service) generateDeliveryBundle(project *domain.Project, task *domain.Task, plan *domain.Plan, run *domain.AgentRun, sandbox *domain.Sandbox) (*domain.Artifact, string, error) {
