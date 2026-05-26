@@ -66,6 +66,7 @@ type Service struct {
 	runtimeInitErr         error
 	store                  stateStore
 	projectRequirementRepo projectRequirementRepository
+	planContractTaskRepo   planContractTaskRepository
 	workspaceProvider      workspaceProvider
 
 	mu             sync.RWMutex
@@ -602,7 +603,7 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		cfg.RuntimeProvider = runtimeProvider
 	}
 
-	serviceStore, projectRequirementRepo := newServiceStorage(cfg)
+	serviceStore, projectRequirementRepo, planContractTaskRepo := newServiceStorage(cfg)
 	svc := &Service{
 		cfg:                    cfg,
 		logger:                 logger,
@@ -611,6 +612,7 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		runtimeInitErr:         runtimeInitErr,
 		store:                  serviceStore,
 		projectRequirementRepo: projectRequirementRepo,
+		planContractTaskRepo:   planContractTaskRepo,
 		workspaceProvider:      newWorkspaceProvider(cfg),
 	}
 	svc.resetStateLocked()
@@ -633,24 +635,33 @@ type projectRequirementRepository interface {
 	ListRequirements(ctx context.Context, projectID string) ([]*domain.Requirement, error)
 }
 
+type planContractTaskRepository interface {
+	GeneratePlan(ctx context.Context, project *domain.Project, plan *domain.Plan, task *domain.Task, taskPosition int, legacy *persistedServiceState) error
+	GenerateContract(ctx context.Context, project *domain.Project, contract *domain.Contract, legacy *persistedServiceState) error
+	SaveTasks(ctx context.Context, project *domain.Project, tasks []*domain.Task, taskPositions map[string]int, legacy *persistedServiceState) error
+	ListContracts(ctx context.Context, projectID string) ([]*domain.Contract, error)
+	GetContract(ctx context.Context, projectID, contractID string) (*domain.Contract, error)
+	ListTasks(ctx context.Context, projectID string) ([]*domain.Task, error)
+}
+
 type jsonStateStore struct {
 	store store.Store
 }
 
 func newServiceStore(cfg config.Config) stateStore {
-	serviceStore, _ := newServiceStorage(cfg)
+	serviceStore, _, _ := newServiceStorage(cfg)
 	return serviceStore
 }
 
-func newServiceStorage(cfg config.Config) (stateStore, projectRequirementRepository) {
+func newServiceStorage(cfg config.Config) (stateStore, projectRequirementRepository, planContractTaskRepository) {
 	switch strings.ToLower(strings.TrimSpace(cfg.StoreProvider)) {
 	case "file":
-		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}, nil
+		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}, nil, nil
 	case "postgres":
 		raw := store.NewPostgresStore(cfg.PostgresDSN)
-		return postgresDomainStateStore{raw: raw}, postgresProjectRequirementRepository{raw: raw}
+		return postgresDomainStateStore{raw: raw}, postgresProjectRequirementRepository{raw: raw}, postgresPlanContractTaskRepository{raw: raw}
 	default:
-		return jsonStateStore{store: store.NewMemoryStore()}, nil
+		return jsonStateStore{store: store.NewMemoryStore()}, nil, nil
 	}
 }
 
@@ -1402,19 +1413,62 @@ func (s *Service) ListRequirements(ctx context.Context, projectID string) ([]dom
 func (s *Service) GeneratePlan(ctx context.Context, projectID string) (*PlanResult, error) {
 	now := time.Now().UTC()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.planContractTaskRepo == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
+		project, ok := s.projects[projectID]
+		if !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		requirements := s.requirements[projectID]
+		if len(requirements) == 0 {
+			return nil, newValidationError("no requirement available for plan generation")
+		}
+
+		latestRequirement := requirements[len(requirements)-1]
+		version := len(s.plans[projectID]) + 1
+		plan := buildPlan(latestRequirement, version, now)
+		task := domain.NewTask(
+			nextID("task"),
+			projectID,
+			plan.ID,
+			fmt.Sprintf("Implement %s", latestRequirement.Title),
+			"SPRINT1_EXECUTE",
+			s.cfg.DefaultAgent,
+			nil,
+			fmt.Sprintf("plan://%s", plan.ID),
+			now,
+		)
+
+		s.planIndex[plan.ID] = plan
+		s.plans[projectID] = append(s.plans[projectID], plan)
+		s.tasks[task.ID] = task
+		s.taskOrder[projectID] = append(s.taskOrder[projectID], task.ID)
+		project.UpdatedAt = now
+		s.recordAuditLocked(ctx, projectID, "PLAN_GENERATE", "plan", plan.ID, "plan generated from latest requirement", now)
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
+
+		return &PlanResult{
+			Plan: *clonePlan(plan),
+			Task: *cloneTask(task),
+		}, nil
+	}
+
+	s.mu.Lock()
 	project, ok := s.projects[projectID]
 	if !ok {
+		s.mu.Unlock()
 		return nil, newNotFoundError("project not found")
 	}
-
 	requirements := s.requirements[projectID]
 	if len(requirements) == 0 {
+		s.mu.Unlock()
 		return nil, newValidationError("no requirement available for plan generation")
 	}
-
 	latestRequirement := requirements[len(requirements)-1]
 	version := len(s.plans[projectID]) + 1
 	plan := buildPlan(latestRequirement, version, now)
@@ -1429,16 +1483,24 @@ func (s *Service) GeneratePlan(ctx context.Context, projectID string) (*PlanResu
 		fmt.Sprintf("plan://%s", plan.ID),
 		now,
 	)
-
-	s.planIndex[plan.ID] = plan
-	s.plans[projectID] = append(s.plans[projectID], plan)
-	s.tasks[task.ID] = task
-	s.taskOrder[projectID] = append(s.taskOrder[projectID], task.ID)
-	project.UpdatedAt = now
-	s.recordAuditLocked(ctx, projectID, "PLAN_GENERATE", "plan", plan.ID, "plan generated from latest requirement", now)
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+	candidate := s.capturePersistedStateLocked()
+	updatedProject := cloneProject(project)
+	updatedProject.UpdatedAt = now
+	candidate.Projects[projectID] = updatedProject
+	candidate.Plans[projectID] = append(candidate.Plans[projectID], clonePlan(plan))
+	candidate.Tasks[task.ID] = cloneTask(task)
+	candidate.TaskOrder[projectID] = append(candidate.TaskOrder[projectID], task.ID)
+	candidate.AuditLogs[projectID] = append(candidate.AuditLogs[projectID], newAuditLog(ctx, projectID, "PLAN_GENERATE", "plan", plan.ID, "plan generated from latest requirement", now))
+	position := len(candidate.TaskOrder[projectID]) - 1
+	if err := s.planContractTaskRepo.GeneratePlan(ctx, updatedProject, plan, task, position, candidate); err != nil {
+		s.mu.Unlock()
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
+	s.restorePersistedStateLocked(candidate)
+	s.mu.Unlock()
 
 	return &PlanResult{
 		Plan: *clonePlan(plan),
@@ -1446,66 +1508,155 @@ func (s *Service) GeneratePlan(ctx context.Context, projectID string) (*PlanResu
 	}, nil
 }
 
-func (s *Service) GenerateContract(_ context.Context, projectID string) (*domain.Contract, error) {
+func (s *Service) GenerateContract(ctx context.Context, projectID string) (*domain.Contract, error) {
 	now := time.Now().UTC()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.planContractTaskRepo == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
+		project, ok := s.projects[projectID]
+		if !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		plans := s.plans[projectID]
+		if len(plans) == 0 {
+			return nil, newValidationError("no plan available for contract generation")
+		}
+
+		plan := plans[len(plans)-1]
+		requirement, err := resolveRequirementByID(s.requirements[projectID], plan.RequirementID)
+		if err != nil {
+			return nil, err
+		}
+
+		version := len(s.contracts[projectID]) + 1
+		contract := buildContract(requirement, plan, version, now)
+		s.contractIndex[contract.ID] = contract
+		s.contracts[projectID] = append(s.contracts[projectID], contract)
+		project.UpdatedAt = now
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
+
+		return cloneContract(contract), nil
+	}
+
+	s.mu.Lock()
 	project, ok := s.projects[projectID]
 	if !ok {
+		s.mu.Unlock()
 		return nil, newNotFoundError("project not found")
 	}
-
 	plans := s.plans[projectID]
 	if len(plans) == 0 {
+		s.mu.Unlock()
 		return nil, newValidationError("no plan available for contract generation")
 	}
-
 	plan := plans[len(plans)-1]
 	requirement, err := resolveRequirementByID(s.requirements[projectID], plan.RequirementID)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-
 	version := len(s.contracts[projectID]) + 1
 	contract := buildContract(requirement, plan, version, now)
-	s.contractIndex[contract.ID] = contract
-	s.contracts[projectID] = append(s.contracts[projectID], contract)
-	project.UpdatedAt = now
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+	candidate := s.capturePersistedStateLocked()
+	updatedProject := cloneProject(project)
+	updatedProject.UpdatedAt = now
+	candidate.Projects[projectID] = updatedProject
+	candidate.Contracts[projectID] = append(candidate.Contracts[projectID], cloneContract(contract))
+	if err := s.planContractTaskRepo.GenerateContract(ctx, updatedProject, contract, candidate); err != nil {
+		s.mu.Unlock()
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
+	s.restorePersistedStateLocked(candidate)
+	s.mu.Unlock()
 
 	return cloneContract(contract), nil
 }
 
-func (s *Service) ListContracts(_ context.Context, projectID string) ([]domain.Contract, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Service) ListContracts(ctx context.Context, projectID string) ([]domain.Contract, error) {
+	if s.planContractTaskRepo == nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-	if _, ok := s.projects[projectID]; !ok {
-		return nil, newNotFoundError("project not found")
+		if _, ok := s.projects[projectID]; !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		items := s.contracts[projectID]
+		result := make([]domain.Contract, 0, len(items))
+		for _, item := range items {
+			result = append(result, *cloneContract(item))
+		}
+
+		return result, nil
 	}
 
-	items := s.contracts[projectID]
-	result := make([]domain.Contract, 0, len(items))
-	for _, item := range items {
-		result = append(result, *cloneContract(item))
+	contracts, err := s.planContractTaskRepo.ListContracts(ctx, projectID)
+	if err != nil {
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
-
+	result := make([]domain.Contract, 0, len(contracts))
+	s.mu.Lock()
+	s.contracts[projectID] = cloneContracts(contracts)
+	for _, contract := range contracts {
+		if contract == nil {
+			continue
+		}
+		contractCopy := cloneContract(contract)
+		s.contractIndex[contract.ID] = contractCopy
+		result = append(result, *contractCopy)
+	}
+	s.mu.Unlock()
 	return result, nil
 }
 
-func (s *Service) GetContract(_ context.Context, projectID, contractID string) (*domain.Contract, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Service) GetContract(ctx context.Context, projectID, contractID string) (*domain.Contract, error) {
+	if s.planContractTaskRepo == nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-	contract, ok := s.contractIndex[contractID]
-	if !ok || contract.ProjectID != projectID {
-		return nil, newNotFoundError("contract not found")
+		contract, ok := s.contractIndex[contractID]
+		if !ok || contract.ProjectID != projectID {
+			return nil, newNotFoundError("contract not found")
+		}
+
+		return cloneContract(contract), nil
 	}
 
+	contract, err := s.planContractTaskRepo.GetContract(ctx, projectID, contractID)
+	if err != nil {
+		if errors.Is(err, errRepositoryContractNotFound) {
+			return nil, newNotFoundError("contract not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+	}
+	s.mu.Lock()
+	contractCopy := cloneContract(contract)
+	s.contractIndex[contract.ID] = contractCopy
+	items := s.contracts[projectID]
+	found := false
+	for i, item := range items {
+		if item != nil && item.ID == contract.ID {
+			items[i] = contractCopy
+			found = true
+			break
+		}
+	}
+	if !found {
+		items = append(items, contractCopy)
+	}
+	s.contracts[projectID] = items
+	s.mu.Unlock()
 	return cloneContract(contract), nil
 }
 
@@ -1871,24 +2022,49 @@ func (s *Service) GetStatusMatrix(_ context.Context, selectedProjectID string) (
 	}, nil
 }
 
-func (s *Service) ListTasks(_ context.Context, projectID string) ([]domain.Task, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Service) ListTasks(ctx context.Context, projectID string) ([]domain.Task, error) {
+	if s.planContractTaskRepo == nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-	if _, ok := s.projects[projectID]; !ok {
-		return nil, newNotFoundError("project not found")
+		if _, ok := s.projects[projectID]; !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		order := s.taskOrder[projectID]
+		result := make([]domain.Task, 0, len(order))
+		for _, taskID := range order {
+			task, ok := s.tasks[taskID]
+			if !ok {
+				continue
+			}
+			result = append(result, *cloneTask(task))
+		}
+
+		return result, nil
 	}
 
-	order := s.taskOrder[projectID]
-	result := make([]domain.Task, 0, len(order))
-	for _, taskID := range order {
-		task, ok := s.tasks[taskID]
-		if !ok {
+	tasks, err := s.planContractTaskRepo.ListTasks(ctx, projectID)
+	if err != nil {
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
+	}
+	result := make([]domain.Task, 0, len(tasks))
+	order := make([]string, 0, len(tasks))
+	s.mu.Lock()
+	for _, task := range tasks {
+		if task == nil {
 			continue
 		}
-		result = append(result, *cloneTask(task))
+		taskCopy := cloneTask(task)
+		s.tasks[task.ID] = taskCopy
+		order = append(order, task.ID)
+		result = append(result, *taskCopy)
 	}
-
+	s.taskOrder[projectID] = order
+	s.mu.Unlock()
 	return result, nil
 }
 
@@ -2164,75 +2340,127 @@ func (s *Service) RollbackToSnapshot(ctx context.Context, projectID string, inpu
 	return result, nil
 }
 
-func (s *Service) DispatchTasks(_ context.Context, projectID string) (*DispatchTasksResult, error) {
+func (s *Service) DispatchTasks(ctx context.Context, projectID string) (*DispatchTasksResult, error) {
 	now := time.Now().UTC()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.planContractTaskRepo == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
+		project, ok := s.projects[projectID]
+		if !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		plan, contract, err := s.resolveLatestPlanAndContractLocked(projectID)
+		if err != nil {
+			return nil, err
+		}
+
+		existing := s.findDispatchedTasksLocked(projectID, plan.ID, contract.ID)
+		if len(existing) > 0 {
+			return &DispatchTasksResult{
+				Contract: *cloneContract(contract),
+				Tasks:    cloneTasks(existing),
+			}, nil
+		}
+
+		inputRef := fmt.Sprintf("contract://%s", contract.ID)
+		backendTask := domain.NewTask(
+			nextID("task"),
+			projectID,
+			plan.ID,
+			fmt.Sprintf("Build backend implementation for %s", plan.Title),
+			"BACKEND_IMPLEMENTATION",
+			"go-backend-agent",
+			nil,
+			inputRef,
+			now,
+		)
+		frontendTask := domain.NewTask(
+			nextID("task"),
+			projectID,
+			plan.ID,
+			fmt.Sprintf("Build frontend implementation for %s", plan.Title),
+			"FRONTEND_IMPLEMENTATION",
+			"vue-frontend-agent",
+			nil,
+			inputRef,
+			now,
+		)
+		integrationTask := domain.NewTask(
+			nextID("task"),
+			projectID,
+			plan.ID,
+			fmt.Sprintf("Merge and verify %s", plan.Title),
+			"INTEGRATION_REVIEW",
+			"integration-agent",
+			[]string{backendTask.ID, frontendTask.ID},
+			inputRef,
+			now,
+		)
+
+		dispatched := []*domain.Task{backendTask, frontendTask, integrationTask}
+		for _, task := range dispatched {
+			s.tasks[task.ID] = task
+			s.taskOrder[projectID] = append(s.taskOrder[projectID], task.ID)
+			s.recordCommunicationLocked(projectID, "manager-agent", task.AssigneeAgent, "TASK_DISPATCH", task.ID, task.InputRef, now)
+		}
+		project.UpdatedAt = now
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
+
+		return &DispatchTasksResult{
+			Contract: *cloneContract(contract),
+			Tasks:    cloneTasks(dispatched),
+		}, nil
+	}
+
+	s.mu.Lock()
 	project, ok := s.projects[projectID]
 	if !ok {
+		s.mu.Unlock()
 		return nil, newNotFoundError("project not found")
 	}
-
 	plan, contract, err := s.resolveLatestPlanAndContractLocked(projectID)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-
 	existing := s.findDispatchedTasksLocked(projectID, plan.ID, contract.ID)
 	if len(existing) > 0 {
+		s.mu.Unlock()
 		return &DispatchTasksResult{
 			Contract: *cloneContract(contract),
 			Tasks:    cloneTasks(existing),
 		}, nil
 	}
-
 	inputRef := fmt.Sprintf("contract://%s", contract.ID)
-	backendTask := domain.NewTask(
-		nextID("task"),
-		projectID,
-		plan.ID,
-		fmt.Sprintf("Build backend implementation for %s", plan.Title),
-		"BACKEND_IMPLEMENTATION",
-		"go-backend-agent",
-		nil,
-		inputRef,
-		now,
-	)
-	frontendTask := domain.NewTask(
-		nextID("task"),
-		projectID,
-		plan.ID,
-		fmt.Sprintf("Build frontend implementation for %s", plan.Title),
-		"FRONTEND_IMPLEMENTATION",
-		"vue-frontend-agent",
-		nil,
-		inputRef,
-		now,
-	)
-	integrationTask := domain.NewTask(
-		nextID("task"),
-		projectID,
-		plan.ID,
-		fmt.Sprintf("Merge and verify %s", plan.Title),
-		"INTEGRATION_REVIEW",
-		"integration-agent",
-		[]string{backendTask.ID, frontendTask.ID},
-		inputRef,
-		now,
-	)
-
+	backendTask := domain.NewTask(nextID("task"), projectID, plan.ID, fmt.Sprintf("Build backend implementation for %s", plan.Title), "BACKEND_IMPLEMENTATION", "go-backend-agent", nil, inputRef, now)
+	frontendTask := domain.NewTask(nextID("task"), projectID, plan.ID, fmt.Sprintf("Build frontend implementation for %s", plan.Title), "FRONTEND_IMPLEMENTATION", "vue-frontend-agent", nil, inputRef, now)
+	integrationTask := domain.NewTask(nextID("task"), projectID, plan.ID, fmt.Sprintf("Merge and verify %s", plan.Title), "INTEGRATION_REVIEW", "integration-agent", []string{backendTask.ID, frontendTask.ID}, inputRef, now)
 	dispatched := []*domain.Task{backendTask, frontendTask, integrationTask}
+	candidate := s.capturePersistedStateLocked()
+	updatedProject := cloneProject(project)
+	updatedProject.UpdatedAt = now
+	candidate.Projects[projectID] = updatedProject
+	positions := make(map[string]int, len(dispatched))
 	for _, task := range dispatched {
-		s.tasks[task.ID] = task
-		s.taskOrder[projectID] = append(s.taskOrder[projectID], task.ID)
-		s.recordCommunicationLocked(projectID, "manager-agent", task.AssigneeAgent, "TASK_DISPATCH", task.ID, task.InputRef, now)
+		candidate.Tasks[task.ID] = cloneTask(task)
+		candidate.TaskOrder[projectID] = append(candidate.TaskOrder[projectID], task.ID)
+		positions[task.ID] = len(candidate.TaskOrder[projectID]) - 1
+		candidate.Communications[projectID] = append(candidate.Communications[projectID], newCommunicationLog(projectID, "manager-agent", task.AssigneeAgent, "TASK_DISPATCH", task.ID, task.InputRef, now))
 	}
-	project.UpdatedAt = now
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+	if err := s.planContractTaskRepo.SaveTasks(ctx, updatedProject, dispatched, positions, candidate); err != nil {
+		s.mu.Unlock()
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
+	s.restorePersistedStateLocked(candidate)
+	s.mu.Unlock()
 
 	return &DispatchTasksResult{
 		Contract: *cloneContract(contract),
@@ -2240,65 +2468,151 @@ func (s *Service) DispatchTasks(_ context.Context, projectID string) (*DispatchT
 	}, nil
 }
 
-func (s *Service) ValidateContract(_ context.Context, projectID string, input ValidateContractInput) (*ContractValidationResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Service) ValidateContract(ctx context.Context, projectID string, input ValidateContractInput) (*ContractValidationResult, error) {
+	if s.planContractTaskRepo == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
+		project, ok := s.projects[projectID]
+		if !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		contract, err := s.resolveContractLocked(projectID, input.ContractID)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(input.Endpoints) == 0 && len(input.Schemas) == 0 {
+			return nil, newValidationError("validation payload must include endpoints or schemas")
+		}
+
+		conflicts := validateContractDefinition(contract, input.Endpoints, input.Schemas)
+		result := &ContractValidationResult{
+			Contract:  *cloneContract(contract),
+			Passed:    len(conflicts) == 0,
+			Conflicts: conflicts,
+		}
+
+		if len(conflicts) == 0 {
+			return result, nil
+		}
+
+		now := time.Now().UTC()
+		task := s.createContractRemediationTaskLocked(projectID, contract, now)
+		project.UpdatedAt = now
+		result.RemediationTask = cloneTask(task)
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
+
+		return result, nil
+	}
+
+	s.mu.Lock()
 	project, ok := s.projects[projectID]
 	if !ok {
+		s.mu.Unlock()
 		return nil, newNotFoundError("project not found")
 	}
-
 	contract, err := s.resolveContractLocked(projectID, input.ContractID)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-
 	if len(input.Endpoints) == 0 && len(input.Schemas) == 0 {
+		s.mu.Unlock()
 		return nil, newValidationError("validation payload must include endpoints or schemas")
 	}
-
 	conflicts := validateContractDefinition(contract, input.Endpoints, input.Schemas)
 	result := &ContractValidationResult{
 		Contract:  *cloneContract(contract),
 		Passed:    len(conflicts) == 0,
 		Conflicts: conflicts,
 	}
-
 	if len(conflicts) == 0 {
+		s.mu.Unlock()
 		return result, nil
 	}
-
 	now := time.Now().UTC()
-	task := s.createContractRemediationTaskLocked(projectID, contract, now)
-	project.UpdatedAt = now
-	result.RemediationTask = cloneTask(task)
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+	task := buildContractRemediationTask(projectID, contract, s.cfg.DefaultAgent, now)
+	candidate := s.capturePersistedStateLocked()
+	updatedProject := cloneProject(project)
+	updatedProject.UpdatedAt = now
+	candidate.Projects[projectID] = updatedProject
+	candidate.Tasks[task.ID] = cloneTask(task)
+	candidate.TaskOrder[projectID] = append(candidate.TaskOrder[projectID], task.ID)
+	positions := map[string]int{task.ID: len(candidate.TaskOrder[projectID]) - 1}
+	if err := s.planContractTaskRepo.SaveTasks(ctx, updatedProject, []*domain.Task{task}, positions, candidate); err != nil {
+		s.mu.Unlock()
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
-
+	s.restorePersistedStateLocked(candidate)
+	s.mu.Unlock()
+	result.RemediationTask = cloneTask(task)
 	return result, nil
 }
 
-func (s *Service) RetryTask(_ context.Context, projectID, taskID string) (*domain.Task, error) {
+func (s *Service) RetryTask(ctx context.Context, projectID, taskID string) (*domain.Task, error) {
 	now := time.Now().UTC()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.planContractTaskRepo == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	project, ok := s.projects[projectID]
-	if !ok {
-		return nil, newNotFoundError("project not found")
+		project, ok := s.projects[projectID]
+		if !ok {
+			return nil, newNotFoundError("project not found")
+		}
+
+		task, err := s.resolveTaskLocked(projectID, taskID)
+		if err != nil {
+			return nil, err
+		}
+		if task.Status != domain.TaskStatusFailed {
+			return nil, newConflictError("only failed tasks can be retried")
+		}
+
+		retryTask := domain.NewTask(
+			nextID("task"),
+			projectID,
+			task.PlanID,
+			task.Name+" (retry)",
+			task.Type,
+			task.AssigneeAgent,
+			task.DependsOn,
+			task.InputRef,
+			now,
+		)
+
+		s.tasks[retryTask.ID] = retryTask
+		s.taskOrder[projectID] = append(s.taskOrder[projectID], retryTask.ID)
+		project.UpdatedAt = now
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
+
+		return cloneTask(retryTask), nil
 	}
 
+	s.mu.Lock()
+	project, ok := s.projects[projectID]
+	if !ok {
+		s.mu.Unlock()
+		return nil, newNotFoundError("project not found")
+	}
 	task, err := s.resolveTaskLocked(projectID, taskID)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
 	if task.Status != domain.TaskStatusFailed {
+		s.mu.Unlock()
 		return nil, newConflictError("only failed tasks can be retried")
 	}
-
 	retryTask := domain.NewTask(
 		nextID("task"),
 		projectID,
@@ -2310,13 +2624,22 @@ func (s *Service) RetryTask(_ context.Context, projectID, taskID string) (*domai
 		task.InputRef,
 		now,
 	)
-
-	s.tasks[retryTask.ID] = retryTask
-	s.taskOrder[projectID] = append(s.taskOrder[projectID], retryTask.ID)
-	project.UpdatedAt = now
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+	candidate := s.capturePersistedStateLocked()
+	updatedProject := cloneProject(project)
+	updatedProject.UpdatedAt = now
+	candidate.Projects[projectID] = updatedProject
+	candidate.Tasks[retryTask.ID] = cloneTask(retryTask)
+	candidate.TaskOrder[projectID] = append(candidate.TaskOrder[projectID], retryTask.ID)
+	positions := map[string]int{retryTask.ID: len(candidate.TaskOrder[projectID]) - 1}
+	if err := s.planContractTaskRepo.SaveTasks(ctx, updatedProject, []*domain.Task{retryTask}, positions, candidate); err != nil {
+		s.mu.Unlock()
+		if errors.Is(err, errRepositoryProjectNotFound) {
+			return nil, newNotFoundError("project not found")
+		}
+		return nil, newInternalError("PERSISTENCE_FAILED", err.Error())
 	}
+	s.restorePersistedStateLocked(candidate)
+	s.mu.Unlock()
 
 	return cloneTask(retryTask), nil
 }
@@ -4179,7 +4502,7 @@ func (s *Service) enqueueConflictLocked(ctx context.Context, projectID, taskID, 
 	return conflict
 }
 
-func (s *Service) recordCommunicationLocked(projectID, from, to, messageType, taskID, payloadRef string, now time.Time) {
+func newCommunicationLog(projectID, from, to, messageType, taskID, payloadRef string, now time.Time) *domain.CommunicationLog {
 	base := strings.Join([]string{
 		"v1",
 		strings.TrimSpace(from),
@@ -4191,7 +4514,7 @@ func (s *Service) recordCommunicationLocked(projectID, from, to, messageType, ta
 	}, "|")
 	sum := sha256.Sum256([]byte(base))
 
-	entry := &domain.CommunicationLog{
+	return &domain.CommunicationLog{
 		ID:         nextID("comm"),
 		ProjectID:  projectID,
 		Version:    "v1",
@@ -4203,7 +4526,10 @@ func (s *Service) recordCommunicationLocked(projectID, from, to, messageType, ta
 		Checksum:   hex.EncodeToString(sum[:4]),
 		Timestamp:  now,
 	}
-	s.communications[projectID] = append(s.communications[projectID], entry)
+}
+
+func (s *Service) recordCommunicationLocked(projectID, from, to, messageType, taskID, payloadRef string, now time.Time) {
+	s.communications[projectID] = append(s.communications[projectID], newCommunicationLog(projectID, from, to, messageType, taskID, payloadRef, now))
 }
 
 func newAuditLog(ctx context.Context, projectID, action, resourceType, resourceID, summary string, now time.Time) *domain.AuditLog {
@@ -4620,18 +4946,22 @@ func (s *Service) resolveLatestSucceededArtifactForTaskLocked(projectID, taskID 
 	return nil, newConflictError("completed task has no successful artifact to merge")
 }
 
-func (s *Service) createContractRemediationTaskLocked(projectID string, contract *domain.Contract, now time.Time) *domain.Task {
-	task := domain.NewTask(
+func buildContractRemediationTask(projectID string, contract *domain.Contract, defaultAgent string, now time.Time) *domain.Task {
+	return domain.NewTask(
 		nextID("task"),
 		projectID,
 		contract.PlanID,
 		fmt.Sprintf("Resolve contract conflicts for v%d", contract.Version),
 		"CONTRACT_REWORK",
-		s.cfg.DefaultAgent,
+		defaultAgent,
 		nil,
 		fmt.Sprintf("contract://%s", contract.ID),
 		now,
 	)
+}
+
+func (s *Service) createContractRemediationTaskLocked(projectID string, contract *domain.Contract, now time.Time) *domain.Task {
+	task := buildContractRemediationTask(projectID, contract, s.cfg.DefaultAgent, now)
 
 	s.tasks[task.ID] = task
 	s.taskOrder[projectID] = append(s.taskOrder[projectID], task.ID)

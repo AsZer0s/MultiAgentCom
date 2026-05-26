@@ -384,6 +384,14 @@
 - **DoD：** Postgres 启动执行 `schema_migrations` 校验；创建 projects/requirements/plans/contracts/tasks/runs/artifacts projection tables；service 可从 legacy `service_state` backfill，并双写 projection tables 与 legacy aggregate；`/ready` 校验 migrations、投影表与 legacy 状态版本；guarded tests 覆盖 migration 幂等、checksum mismatch、legacy backfill、projection restore。
 - **完成范围：** 已新增内嵌 migration runner、checksum 校验、domain projection tables、Postgres typed state store、legacy backfill/dual-write、readiness 加深、guarded store/service/http tests 与 opt-in release smoke migration checks；完整业务路径 SQL repository、多实例并发治理与外部 migration 框架仍保持后续目标。
 
+### BL-916 Postgres plans/contracts/tasks repository slice
+- **状态：** Done
+- **优先级：** P1
+- **估时：** 1.5 PD
+- **目标：** 沿着 repository 化继续推进，但只优先迁移 plans/contracts/tasks 核心读写路径。
+- **DoD：** Postgres provider 下 `GeneratePlan`、`GenerateContract`、`DispatchTasks`、contract validation remediation、retry task 与 contract/task reads 直接写读 SQL projection；所有写入继续同事务 dual-write legacy `service_state`；file/memory provider 行为不变；guarded tests 覆盖 dual-write、SQL projection read 与 repository failure 不污染内存。
+- **完成范围：** 已新增 `postgresPlanContractTaskRepository`，覆盖 plans/contracts/tasks projection 写入、contract/task SQL 读取、task_order 保序、legacy aggregate dual-write 与内存同步；runs/artifacts/snapshots/context/audit/communication、多实例并发治理和 SQL-side ordering/version allocation 仍保持后续目标。
+
 ## 8. 依赖总览（关键路径）
 
 - 关键路径建议：

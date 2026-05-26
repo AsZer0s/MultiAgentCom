@@ -478,6 +478,248 @@ func TestPostgresRequirementReadsUseSQLProjection(t *testing.T) {
 	}
 }
 
+func TestPostgresPlanContractTaskRepositoryGeneratePlanDualWrites(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-plan-repository", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Plan Repository"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Build plan", Content: "Generate a plan through SQL"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	result, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+
+	raw := store.NewPostgresStore(dsn)
+	var planPayload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT payload FROM plans WHERE id = $1`, result.Plan.ID).Scan(&planPayload); err != nil {
+		t.Fatalf("query plan projection: %v", err)
+	}
+	var projectedPlan domain.Plan
+	if err := json.Unmarshal(planPayload, &projectedPlan); err != nil {
+		t.Fatalf("decode plan projection: %v", err)
+	}
+	if projectedPlan.ID != result.Plan.ID || projectedPlan.Version != 1 {
+		t.Fatalf("unexpected projected plan: %+v", projectedPlan)
+	}
+	var taskPosition int
+	var taskPayload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT o.position, t.payload FROM task_order o JOIN tasks t ON t.id = o.task_id WHERE t.id = $1`, result.Task.ID).Scan(&taskPosition, &taskPayload); err != nil {
+		t.Fatalf("query task projection: %v", err)
+	}
+	if taskPosition != 0 {
+		t.Fatalf("task position = %d, want 0", taskPosition)
+	}
+	var projectedTask domain.Task
+	if err := json.Unmarshal(taskPayload, &projectedTask); err != nil {
+		t.Fatalf("decode task projection: %v", err)
+	}
+	if projectedTask.ID != result.Task.ID || projectedTask.PlanID != result.Plan.ID {
+		t.Fatalf("unexpected projected task: %+v", projectedTask)
+	}
+	legacy := loadLegacyServiceStateForTest(t, ctx, raw)
+	if len(legacy.Plans[project.ID]) != 1 || legacy.Plans[project.ID][0].ID != result.Plan.ID {
+		t.Fatalf("legacy plan missing: %+v", legacy.Plans[project.ID])
+	}
+	if legacy.Tasks[result.Task.ID] == nil || legacy.TaskOrder[project.ID][0] != result.Task.ID {
+		t.Fatalf("legacy task missing: tasks=%+v order=%+v", legacy.Tasks[result.Task.ID], legacy.TaskOrder[project.ID])
+	}
+	logs := legacy.AuditLogs[project.ID]
+	if len(logs) < 3 || logs[len(logs)-1].Action != "PLAN_GENERATE" {
+		t.Fatalf("expected PLAN_GENERATE audit, got %+v", logs)
+	}
+}
+
+func TestPostgresPlanContractTaskRepositoryGenerateContractDualWrites(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-contract-repository", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Contract Repository"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Build contract", Content: "Generate a contract through SQL"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	if _, err := svc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	contract, err := svc.GenerateContract(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+
+	raw := store.NewPostgresStore(dsn)
+	var payload []byte
+	if err := raw.DB().QueryRowContext(ctx, `SELECT payload FROM contracts WHERE id = $1`, contract.ID).Scan(&payload); err != nil {
+		t.Fatalf("query contract projection: %v", err)
+	}
+	var projected domain.Contract
+	if err := json.Unmarshal(payload, &projected); err != nil {
+		t.Fatalf("decode contract projection: %v", err)
+	}
+	if projected.ID != contract.ID || projected.Version != 1 {
+		t.Fatalf("unexpected projected contract: %+v", projected)
+	}
+	legacy := loadLegacyServiceStateForTest(t, ctx, raw)
+	if len(legacy.Contracts[project.ID]) != 1 || legacy.Contracts[project.ID][0].ID != contract.ID {
+		t.Fatalf("legacy contract missing: %+v", legacy.Contracts[project.ID])
+	}
+}
+
+func TestPostgresPlanContractTaskRepositoryDispatchTasksDualWrites(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-dispatch-repository", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "Dispatch Repository"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Dispatch tasks", Content: "Dispatch tasks through SQL"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	if _, err := svc.GenerateContract(ctx, project.ID); err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+	dispatched, err := svc.DispatchTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("dispatch tasks: %v", err)
+	}
+	if len(dispatched.Tasks) != 3 {
+		t.Fatalf("expected 3 dispatched tasks, got %+v", dispatched.Tasks)
+	}
+
+	raw := store.NewPostgresStore(dsn)
+	var count int
+	if err := raw.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE project_id = $1`, project.ID).Scan(&count); err != nil {
+		t.Fatalf("count task projections: %v", err)
+	}
+	if count != 4 {
+		t.Fatalf("task projection count = %d, want 4", count)
+	}
+	rows, err := raw.DB().QueryContext(ctx, `SELECT task_id FROM task_order WHERE project_id = $1 ORDER BY position`, project.ID)
+	if err != nil {
+		t.Fatalf("query task order: %v", err)
+	}
+	defer rows.Close()
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan task order: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("task order rows: %v", err)
+	}
+	if len(ids) != 4 || ids[0] != plan.Task.ID || ids[1] != dispatched.Tasks[0].ID || ids[3] != dispatched.Tasks[2].ID {
+		t.Fatalf("unexpected task order: %+v", ids)
+	}
+	legacy := loadLegacyServiceStateForTest(t, ctx, raw)
+	if len(legacy.Communications[project.ID]) != 3 {
+		t.Fatalf("expected 3 legacy communication logs, got %+v", legacy.Communications[project.ID])
+	}
+}
+
+func TestPostgresContractAndTaskReadsUseSQLProjection(t *testing.T) {
+	dsn := os.Getenv("MULTI_AGENT_TEST_POSTGRES_DSN")
+	if strings.TrimSpace(dsn) == "" {
+		t.Skip("MULTI_AGENT_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	resetPostgresStateForTest(t, ctx, dsn)
+	cfg := config.Config{Address: ":0", ServiceName: "test-postgres-contract-task-read", ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), StoreProvider: "postgres", PostgresDSN: dsn, DefaultAgent: "manager-agent"}
+	svc := New(cfg, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	project, err := svc.CreateProject(ctx, CreateProjectInput{Name: "SQL Contract Task Read"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := svc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Read projections", Content: "Read contracts and tasks from SQL"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	plan, err := svc.GeneratePlan(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate plan: %v", err)
+	}
+	contract, err := svc.GenerateContract(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("generate contract: %v", err)
+	}
+
+	updatedContract := cloneContract(contract)
+	updatedContract.Name = "SQL Contract Name"
+	contractPayload, err := json.Marshal(updatedContract)
+	if err != nil {
+		t.Fatalf("marshal contract: %v", err)
+	}
+	updatedTask := cloneTask(&plan.Task)
+	updatedTask.Name = "SQL Task Name"
+	taskPayload, err := json.Marshal(updatedTask)
+	if err != nil {
+		t.Fatalf("marshal task: %v", err)
+	}
+	raw := store.NewPostgresStore(dsn)
+	if _, err := raw.DB().ExecContext(ctx, `UPDATE contracts SET payload = $2::jsonb WHERE id = $1`, contract.ID, contractPayload); err != nil {
+		t.Fatalf("update contract projection: %v", err)
+	}
+	if _, err := raw.DB().ExecContext(ctx, `UPDATE tasks SET payload = $2::jsonb WHERE id = $1`, plan.Task.ID, taskPayload); err != nil {
+		t.Fatalf("update task projection: %v", err)
+	}
+
+	gotContract, err := svc.GetContract(ctx, project.ID, contract.ID)
+	if err != nil {
+		t.Fatalf("get contract: %v", err)
+	}
+	if gotContract.Name != "SQL Contract Name" {
+		t.Fatalf("GetContract name = %q, want SQL Contract Name", gotContract.Name)
+	}
+	contracts, err := svc.ListContracts(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list contracts: %v", err)
+	}
+	if len(contracts) != 1 || contracts[0].Name != "SQL Contract Name" {
+		t.Fatalf("ListContracts = %+v", contracts)
+	}
+	tasks, err := svc.ListTasks(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list tasks: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Name != "SQL Task Name" {
+		t.Fatalf("ListTasks = %+v", tasks)
+	}
+	run, err := svc.StartRun(ctx, project.ID, StartRunInput{TaskID: plan.Task.ID})
+	if err != nil {
+		t.Fatalf("start run after SQL task sync: %v", err)
+	}
+	if run.Task.Name != "SQL Task Name" {
+		t.Fatalf("run task name = %q, want SQL Task Name", run.Task.Name)
+	}
+}
+
 func TestPostgresRepositoryWriteFailureDoesNotMutateMemory(t *testing.T) {
 	ctx := context.Background()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -511,6 +753,78 @@ func TestPostgresRepositoryWriteFailureDoesNotMutateMemory(t *testing.T) {
 	}
 }
 
+func TestPostgresPlanContractTaskRepositoryWriteFailureDoesNotMutateMemory(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	baseSvc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}, logger)
+	project, err := baseSvc.CreateProject(ctx, CreateProjectInput{Name: "Failure Project"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := baseSvc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Failure Requirement", Content: "Should not mutate"}); err != nil {
+		t.Fatalf("add requirement: %v", err)
+	}
+	baseSvc.planContractTaskRepo = failingPlanContractTaskRepository{err: errors.New("repository unavailable")}
+	if _, err := baseSvc.GeneratePlan(ctx, project.ID); err == nil {
+		t.Fatal("expected generate plan persistence failure")
+	}
+	baseSvc.mu.RLock()
+	planCount := len(baseSvc.plans[project.ID])
+	taskCount := len(baseSvc.taskOrder[project.ID])
+	baseSvc.mu.RUnlock()
+	if planCount != 0 || taskCount != 0 {
+		t.Fatalf("expected no plan/task after failed generate plan, got plans=%d tasks=%d", planCount, taskCount)
+	}
+
+	contractSvc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}, logger)
+	project, err = contractSvc.CreateProject(ctx, CreateProjectInput{Name: "Contract Failure Project"})
+	if err != nil {
+		t.Fatalf("create contract project: %v", err)
+	}
+	if _, err := contractSvc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Contract Failure", Content: "Should not mutate"}); err != nil {
+		t.Fatalf("add contract requirement: %v", err)
+	}
+	if _, err := contractSvc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate local plan: %v", err)
+	}
+	contractSvc.planContractTaskRepo = failingPlanContractTaskRepository{err: errors.New("repository unavailable")}
+	if _, err := contractSvc.GenerateContract(ctx, project.ID); err == nil {
+		t.Fatal("expected generate contract persistence failure")
+	}
+	contractSvc.mu.RLock()
+	contractCount := len(contractSvc.contracts[project.ID])
+	contractSvc.mu.RUnlock()
+	if contractCount != 0 {
+		t.Fatalf("expected no contract after failed generate contract, got %d", contractCount)
+	}
+
+	dispatchSvc := New(config.Config{ArtifactRoot: t.TempDir(), SandboxRoot: t.TempDir(), DefaultAgent: "manager-agent"}, logger)
+	project, err = dispatchSvc.CreateProject(ctx, CreateProjectInput{Name: "Dispatch Failure Project"})
+	if err != nil {
+		t.Fatalf("create dispatch project: %v", err)
+	}
+	if _, err := dispatchSvc.AddRequirement(ctx, project.ID, AddRequirementInput{Title: "Dispatch Failure", Content: "Should not mutate"}); err != nil {
+		t.Fatalf("add dispatch requirement: %v", err)
+	}
+	if _, err := dispatchSvc.GeneratePlan(ctx, project.ID); err != nil {
+		t.Fatalf("generate dispatch plan: %v", err)
+	}
+	if _, err := dispatchSvc.GenerateContract(ctx, project.ID); err != nil {
+		t.Fatalf("generate dispatch contract: %v", err)
+	}
+	dispatchSvc.planContractTaskRepo = failingPlanContractTaskRepository{err: errors.New("repository unavailable")}
+	if _, err := dispatchSvc.DispatchTasks(ctx, project.ID); err == nil {
+		t.Fatal("expected dispatch persistence failure")
+	}
+	dispatchSvc.mu.RLock()
+	dispatchTaskCount := len(dispatchSvc.taskOrder[project.ID])
+	commCount := len(dispatchSvc.communications[project.ID])
+	dispatchSvc.mu.RUnlock()
+	if dispatchTaskCount != 1 || commCount != 0 {
+		t.Fatalf("expected only original plan task and no comms after failed dispatch, got tasks=%d comms=%d", dispatchTaskCount, commCount)
+	}
+}
+
 type failingProjectRequirementRepository struct {
 	err error
 }
@@ -532,6 +846,34 @@ func (r failingProjectRequirementRepository) GetProject(context.Context, string)
 }
 
 func (r failingProjectRequirementRepository) ListRequirements(context.Context, string) ([]*domain.Requirement, error) {
+	return nil, r.err
+}
+
+type failingPlanContractTaskRepository struct {
+	err error
+}
+
+func (r failingPlanContractTaskRepository) GeneratePlan(context.Context, *domain.Project, *domain.Plan, *domain.Task, int, *persistedServiceState) error {
+	return r.err
+}
+
+func (r failingPlanContractTaskRepository) GenerateContract(context.Context, *domain.Project, *domain.Contract, *persistedServiceState) error {
+	return r.err
+}
+
+func (r failingPlanContractTaskRepository) SaveTasks(context.Context, *domain.Project, []*domain.Task, map[string]int, *persistedServiceState) error {
+	return r.err
+}
+
+func (r failingPlanContractTaskRepository) ListContracts(context.Context, string) ([]*domain.Contract, error) {
+	return nil, r.err
+}
+
+func (r failingPlanContractTaskRepository) GetContract(context.Context, string, string) (*domain.Contract, error) {
+	return nil, r.err
+}
+
+func (r failingPlanContractTaskRepository) ListTasks(context.Context, string) ([]*domain.Task, error) {
 	return nil, r.err
 }
 
