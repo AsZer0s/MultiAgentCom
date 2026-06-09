@@ -58,6 +58,35 @@ type Config struct {
 	RuntimeContainerEntrypoint        string
 	RuntimeContainerCommand           string
 	TokenPromptPricePerMillion        float64
+	RuntimeClaudeAPIKey    string
+	RuntimeClaudeModel     string
+	RuntimeClaudeBaseURL   string
+	RuntimeClaudeMaxTokens int
+	RuntimeOpenAIAPIKey    string
+	RuntimeOpenAIModel     string
+	RuntimeOpenAIBaseURL   string
+	RuntimeOpenAIMaxTokens int
+	RuntimeOpenAIFormat    string // "chat" (default) or "completions" for legacy Codex-style API
+	RuntimeGeminiAPIKey    string
+	RuntimeGeminiModel     string
+	RuntimeGeminiBaseURL   string
+	RuntimeGeminiMaxTokens int
+	OIDCIssuer       string
+	OIDCClientID     string
+	OIDCClientSecret string
+	OIDCRedirectURL  string
+	WebRoot          string
+	ArtifactStoreProvider string // "filesystem" (default) or "s3"
+	MigrationsDir         string
+	S3Endpoint        string
+	S3AccessKey       string
+	S3SecretKey       string
+	S3Bucket          string
+	S3Region          string
+	S3UseSSL          bool
+	PostgresMaxOpenConns    int
+	PostgresMaxIdleConns    int
+	PostgresConnMaxLifetime time.Duration
 	TokenOutputPricePerMillion        float64
 	TokenBudgetWarnUSD                float64
 	TokenBudgetBlockUSD               float64
@@ -129,10 +158,39 @@ func Load() Config {
 		RuntimeContainerTmpfs:             getenv("MULTI_AGENT_RUNTIME_CONTAINER_TMPFS", "/tmp:rw,nosuid,nodev,noexec,size=64m"),
 		RuntimeContainerEntrypoint:        getenv("MULTI_AGENT_RUNTIME_CONTAINER_ENTRYPOINT", ""),
 		RuntimeContainerCommand:           getenv("MULTI_AGENT_RUNTIME_CONTAINER_COMMAND", ""),
+		RuntimeClaudeAPIKey:       getenv("MULTI_AGENT_RUNTIME_CLAUDE_API_KEY", ""),
+		RuntimeClaudeModel:        getenv("MULTI_AGENT_RUNTIME_CLAUDE_MODEL", ""),
+		RuntimeClaudeBaseURL:      getenv("MULTI_AGENT_RUNTIME_CLAUDE_BASE_URL", ""),
+		RuntimeClaudeMaxTokens:    getenvInt("MULTI_AGENT_RUNTIME_CLAUDE_MAX_TOKENS", 4096),
+		RuntimeOpenAIAPIKey:       getenv("MULTI_AGENT_RUNTIME_OPENAI_API_KEY", ""),
+		RuntimeOpenAIModel:        getenv("MULTI_AGENT_RUNTIME_OPENAI_MODEL", ""),
+		RuntimeOpenAIBaseURL:      getenv("MULTI_AGENT_RUNTIME_OPENAI_BASE_URL", ""),
+		RuntimeOpenAIMaxTokens:    getenvInt("MULTI_AGENT_RUNTIME_OPENAI_MAX_TOKENS", 4096),
+		RuntimeOpenAIFormat:       getenv("MULTI_AGENT_RUNTIME_OPENAI_FORMAT", "chat"),
+		RuntimeGeminiAPIKey:       getenv("MULTI_AGENT_RUNTIME_GEMINI_API_KEY", ""),
+		RuntimeGeminiModel:        getenv("MULTI_AGENT_RUNTIME_GEMINI_MODEL", ""),
+		RuntimeGeminiBaseURL:      getenv("MULTI_AGENT_RUNTIME_GEMINI_BASE_URL", ""),
+		RuntimeGeminiMaxTokens:    getenvInt("MULTI_AGENT_RUNTIME_GEMINI_MAX_TOKENS", 4096),
+		OIDCIssuer:       getenv("MULTI_AGENT_OIDC_ISSUER", ""),
+		OIDCClientID:     getenv("MULTI_AGENT_OIDC_CLIENT_ID", ""),
+		OIDCClientSecret: getenv("MULTI_AGENT_OIDC_CLIENT_SECRET", ""),
+		OIDCRedirectURL:  getenv("MULTI_AGENT_OIDC_REDIRECT_URL", ""),
 		TokenPromptPricePerMillion:        getenvFloat("MULTI_AGENT_TOKEN_PROMPT_PRICE_PER_MILLION", 1.5),
 		TokenOutputPricePerMillion:        getenvFloat("MULTI_AGENT_TOKEN_OUTPUT_PRICE_PER_MILLION", 2.5),
 		TokenBudgetWarnUSD:                getenvFloat("MULTI_AGENT_TOKEN_BUDGET_WARN_USD", 0),
 		TokenBudgetBlockUSD:               getenvFloat("MULTI_AGENT_TOKEN_BUDGET_BLOCK_USD", 0),
+		WebRoot:                           getenv("MULTI_AGENT_WEB_ROOT", ""),
+		ArtifactStoreProvider:             getenv("MULTI_AGENT_ARTIFACT_STORE_PROVIDER", "filesystem"),
+		MigrationsDir:                     getenv("MULTI_AGENT_MIGRATIONS_DIR", "migrations"),
+		S3Endpoint:                        getenv("MULTI_AGENT_S3_ENDPOINT", ""),
+		S3AccessKey:                       getenv("MULTI_AGENT_S3_ACCESS_KEY", ""),
+		S3SecretKey:                       getenv("MULTI_AGENT_S3_SECRET_KEY", ""),
+		S3Bucket:                          getenv("MULTI_AGENT_S3_BUCKET", "multiagentcom"),
+		S3Region:                          getenv("MULTI_AGENT_S3_REGION", "us-east-1"),
+		S3UseSSL:                          getenvBool("MULTI_AGENT_S3_USE_SSL", true),
+		PostgresMaxOpenConns:              getenvInt("MULTI_AGENT_POSTGRES_MAX_OPEN_CONNS", 25),
+		PostgresMaxIdleConns:              getenvInt("MULTI_AGENT_POSTGRES_MAX_IDLE_CONNS", 5),
+		PostgresConnMaxLifetime:           getenvDuration("MULTI_AGENT_POSTGRES_CONN_MAX_LIFETIME", 5*time.Minute),
 	})
 }
 
@@ -239,12 +297,24 @@ func Validate(cfg Config) error {
 		} else if parsed, err := url.ParseRequestURI(strings.TrimSpace(cfg.RuntimeEndpoint)); err != nil || parsed.Scheme == "" || parsed.Host == "" {
 			issues = append(issues, ValidationIssue{Field: "RuntimeEndpoint", Message: "must be a valid absolute URL"})
 		}
+	case "claude":
+		if strings.TrimSpace(cfg.RuntimeClaudeAPIKey) == "" {
+			issues = append(issues, ValidationIssue{Field: "RuntimeClaudeAPIKey", Message: "is required when RuntimeProvider is claude"})
+		}
+	case "openai":
+		if strings.TrimSpace(cfg.RuntimeOpenAIAPIKey) == "" {
+			issues = append(issues, ValidationIssue{Field: "RuntimeOpenAIAPIKey", Message: "is required when RuntimeProvider is openai"})
+		}
+	case "gemini":
+		if strings.TrimSpace(cfg.RuntimeGeminiAPIKey) == "" {
+			issues = append(issues, ValidationIssue{Field: "RuntimeGeminiAPIKey", Message: "is required when RuntimeProvider is gemini"})
+		}
 	case "container":
 		if strings.TrimSpace(cfg.RuntimeContainerImage) == "" {
 			issues = append(issues, ValidationIssue{Field: "RuntimeContainerImage", Message: "is required when RuntimeProvider is container"})
 		}
 	default:
-		issues = append(issues, ValidationIssue{Field: "RuntimeProvider", Message: "must be local, http, or container"})
+		issues = append(issues, ValidationIssue{Field: "RuntimeProvider", Message: "must be local, http, claude, openai, gemini, or container"})
 	}
 	if remoteURL := strings.TrimSpace(cfg.WorkspaceGitRemoteURL); remoteURL != "" {
 		if err := validateWorkspaceGitRemoteURL(remoteURL); err != nil {

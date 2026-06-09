@@ -11,7 +11,8 @@ import (
 )
 
 type postgresDomainStateStore struct {
-	raw *store.PostgresStore
+	raw      *store.PostgresStore
+	extended *postgresExtendedRepository
 }
 
 func newPostgresDomainStateStore(dsn string) stateStore {
@@ -98,7 +99,7 @@ func (s postgresDomainStateStore) saveProjection(ctx context.Context, state *per
 	defer func() {
 		_ = tx.Rollback()
 	}()
-	if err := saveServiceStateProjection(ctx, tx, state); err != nil {
+	if err := saveServiceStateProjection(ctx, tx, state, s.extended); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -112,7 +113,7 @@ func (s postgresDomainStateStore) saveProjectionAndLegacy(ctx context.Context, s
 	defer func() {
 		_ = tx.Rollback()
 	}()
-	if err := saveServiceStateProjection(ctx, tx, state); err != nil {
+	if err := saveServiceStateProjection(ctx, tx, state, s.extended); err != nil {
 		return err
 	}
 	if err := saveLegacyServiceState(ctx, tx, state); err != nil {
@@ -138,7 +139,7 @@ func (s postgresDomainStateStore) loadProjection(ctx context.Context, state *per
 	return loadServiceStateProjection(ctx, s.raw.DB(), state)
 }
 
-func saveServiceStateProjection(ctx context.Context, tx *sql.Tx, state *persistedServiceState) error {
+func saveServiceStateProjection(ctx context.Context, tx *sql.Tx, state *persistedServiceState, extendedRepo *postgresExtendedRepository) error {
 	for _, table := range []string{"artifact_order", "artifacts", "run_order", "agent_runs", "task_order", "tasks", "contracts", "plans", "requirements", "projects"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 			return err
@@ -164,6 +165,51 @@ func saveServiceStateProjection(ctx context.Context, tx *sql.Tx, state *persiste
 	}
 	if err := saveArtifacts(ctx, tx, state.Artifacts, state.ArtifactOrder); err != nil {
 		return err
+	}
+	if extendedRepo != nil {
+		if err := extendedRepo.ClearAll(ctx, tx); err != nil {
+			return err
+		}
+		allContexts := collectAllContexts(state)
+		if err := extendedRepo.SaveContextInjections(ctx, tx, allContexts); err != nil {
+			return err
+		}
+		allSandboxes := collectAllSandboxes(state)
+		if err := extendedRepo.SaveSandboxes(ctx, tx, allSandboxes); err != nil {
+			return err
+		}
+		allSnapshots := collectAllSnapshots(state)
+		if err := extendedRepo.SaveSnapshots(ctx, tx, allSnapshots); err != nil {
+			return err
+		}
+		allAuditLogs := collectAllAuditLogs(state)
+		if err := extendedRepo.SaveAuditLogs(ctx, tx, allAuditLogs); err != nil {
+			return err
+		}
+		allAlerts := collectAllAlerts(state)
+		if err := extendedRepo.SaveAlerts(ctx, tx, allAlerts); err != nil {
+			return err
+		}
+		allOverrides := collectAllOverrides(state)
+		if err := extendedRepo.SaveHumanOverrides(ctx, tx, allOverrides); err != nil {
+			return err
+		}
+		allLocks := collectAllLocks(state)
+		if err := extendedRepo.SaveCodeLocks(ctx, tx, allLocks); err != nil {
+			return err
+		}
+		allConflicts := collectAllConflicts(state)
+		if err := extendedRepo.SaveConflictQueueEntries(ctx, tx, allConflicts); err != nil {
+			return err
+		}
+		allPreviews := collectAllPreviews(state)
+		if err := extendedRepo.SavePreviews(ctx, tx, allPreviews); err != nil {
+			return err
+		}
+		allComms := collectAllCommunications(state)
+		if err := extendedRepo.SaveCommunicationLogs(ctx, tx, allComms); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -522,4 +568,125 @@ func loadOrder(ctx context.Context, db *sql.DB, table, idColumn string) (map[str
 		order[projectID] = append(order[projectID], id)
 	}
 	return order, rows.Err()
+}
+
+func collectAllContexts(state *persistedServiceState) []*domain.ContextInjection {
+	var result []*domain.ContextInjection
+	for _, list := range state.Contexts {
+		for _, inj := range list {
+			if inj != nil {
+				result = append(result, inj)
+			}
+		}
+	}
+	return result
+}
+
+func collectAllSandboxes(state *persistedServiceState) []*domain.Sandbox {
+	var result []*domain.Sandbox
+	for _, list := range state.Sandboxes {
+		for _, sb := range list {
+			if sb != nil {
+				result = append(result, sb)
+			}
+		}
+	}
+	return result
+}
+
+func collectAllSnapshots(state *persistedServiceState) []*domain.Snapshot {
+	var result []*domain.Snapshot
+	for _, list := range state.Snapshots {
+		for _, snap := range list {
+			if snap != nil {
+				result = append(result, snap)
+			}
+		}
+	}
+	return result
+}
+
+func collectAllAuditLogs(state *persistedServiceState) []*domain.AuditLog {
+	var result []*domain.AuditLog
+	for _, list := range state.AuditLogs {
+		for _, log := range list {
+			if log != nil {
+				result = append(result, log)
+			}
+		}
+	}
+	return result
+}
+
+func collectAllAlerts(state *persistedServiceState) []*domain.Alert {
+	var result []*domain.Alert
+	for _, list := range state.Alerts {
+		for _, alert := range list {
+			if alert != nil {
+				result = append(result, alert)
+			}
+		}
+	}
+	return result
+}
+
+
+func collectAllOverrides(state *persistedServiceState) []*domain.HumanOverride {
+	var result []*domain.HumanOverride
+	for _, list := range state.Overrides {
+		for _, o := range list {
+			if o != nil {
+				result = append(result, o)
+			}
+		}
+	}
+	return result
+}
+
+func collectAllLocks(state *persistedServiceState) []*domain.CodeLock {
+	var result []*domain.CodeLock
+	for _, list := range state.Locks {
+		for _, l := range list {
+			if l != nil {
+				result = append(result, l)
+			}
+		}
+	}
+	return result
+}
+
+func collectAllConflicts(state *persistedServiceState) []*domain.ConflictQueueEntry {
+	var result []*domain.ConflictQueueEntry
+	for _, list := range state.Conflicts {
+		for _, e := range list {
+			if e != nil {
+				result = append(result, e)
+			}
+		}
+	}
+	return result
+}
+
+func collectAllPreviews(state *persistedServiceState) []*domain.Preview {
+	var result []*domain.Preview
+	for _, list := range state.Previews {
+		for _, p := range list {
+			if p != nil {
+				result = append(result, p)
+			}
+		}
+	}
+	return result
+}
+
+func collectAllCommunications(state *persistedServiceState) []*domain.CommunicationLog {
+	var result []*domain.CommunicationLog
+	for _, list := range state.Communications {
+		for _, l := range list {
+			if l != nil {
+				result = append(result, l)
+			}
+		}
+	}
+	return result
 }

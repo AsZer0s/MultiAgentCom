@@ -5,3 +5,6 @@ runtime/sandboxes/
 /internal/httpapi/runtime/
 /internal/service/runtime/
 bin/
+.env
+web/node_modules/
+web/dist/

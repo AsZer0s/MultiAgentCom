@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"multiagentcom/internal/auth"
@@ -23,24 +24,32 @@ import (
 const maxJSONBodyBytes int64 = 1 << 20
 
 type Server struct {
-	cfg    config.Config
-	logger *slog.Logger
-	svc    *service.Service
+	cfg     config.Config
+	logger  *slog.Logger
+	svc     *service.Service
+	metrics *MetricsCollector
 }
 
 func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) http.Handler {
 	server := &Server{
-		cfg:    cfg,
-		logger: logger,
-		svc:    svc,
+		cfg:     cfg,
+		logger:  logger,
+		svc:     svc,
+		metrics: NewMetricsCollector(),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", server.handleHealth)
 	mux.HandleFunc("GET /ready", server.handleReady)
+	mux.HandleFunc("GET /metrics", server.handleMetrics)
 	mux.HandleFunc("GET /status/matrix", server.handleGetStatusMatrix)
+	mux.HandleFunc("GET /llm/providers", server.handleListLLMProviders)
+	mux.HandleFunc("GET /migrations/status", server.handleMigrationStatus)
+	mux.HandleFunc("GET /admin/config", server.handleGetAdminConfig)
+	mux.HandleFunc("PUT /admin/config", server.handleUpdateAdminConfig)
 	mux.HandleFunc("GET /status/panel", server.handleStatusPanel)
 	mux.HandleFunc("GET /status/stream", server.handleStatusStream)
+	mux.HandleFunc("GET /auth/oidc/callback", server.handleOIDCCallback)
 	mux.HandleFunc("POST /projects", server.handleCreateProject)
 	mux.HandleFunc("GET /projects/{id}", server.handleGetProject)
 	mux.HandleFunc("POST /projects/{id}/requirements", server.handleAddRequirement)
@@ -80,7 +89,22 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("POST /projects/{id}/delivery/export", server.handleExportDelivery)
 	mux.HandleFunc("GET /projects/{id}/artifacts/{artifactId}/download", server.handleDownloadArtifact)
 
-	return withMiddleware(cfg, logger, mux)
+	// Serve Vue SPA static files from WebRoot if configured.
+	if webRoot := strings.TrimSpace(cfg.WebRoot); webRoot != "" {
+		fs := http.FileServer(http.Dir(webRoot))
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			// Try to serve the exact file first.
+			path := webRoot + r.URL.Path
+			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+				fs.ServeHTTP(w, r)
+				return
+			}
+			// SPA fallback: serve index.html for any non-file route.
+			http.ServeFile(w, r, webRoot+"/index.html")
+		})
+	}
+
+	return withMiddleware(cfg, logger, server.metrics, mux)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -89,6 +113,209 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"service":   s.cfg.ServiceName,
 		"timestamp": time.Now().UTC(),
 	})
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Write([]byte(s.metrics.RenderPrometheus()))
+}
+
+func (s *Server) handleListLLMProviders(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg
+	activeProvider := strings.ToLower(strings.TrimSpace(cfg.RuntimeProvider))
+
+	type providerInfo struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		Available bool   `json:"available"`
+		Active    bool   `json:"active"`
+		Model     string `json:"model,omitempty"`
+	}
+
+	providers := []providerInfo{
+		{
+			ID:        "local",
+			Name:      "Local (Mock)",
+			Available: true,
+			Active:    activeProvider == "local",
+		},
+		{
+			ID:        "claude",
+			Name:      "Claude (Anthropic)",
+			Available: strings.TrimSpace(cfg.RuntimeClaudeAPIKey) != "",
+			Active:    activeProvider == "claude",
+			Model:     cfg.RuntimeClaudeModel,
+		},
+		{
+			ID:        "openai",
+			Name:      "OpenAI Compatible",
+			Available: strings.TrimSpace(cfg.RuntimeOpenAIAPIKey) != "",
+			Active:    activeProvider == "openai",
+			Model:     cfg.RuntimeOpenAIModel,
+		},
+		{
+			ID:        "gemini",
+			Name:      "Gemini (Google)",
+			Available: strings.TrimSpace(cfg.RuntimeGeminiAPIKey) != "",
+			Active:    activeProvider == "gemini",
+			Model:     cfg.RuntimeGeminiModel,
+		},
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"activeProvider": activeProvider,
+		"providers":      providers,
+	})
+}
+
+func (s *Server) handleMigrationStatus(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg
+	if strings.ToLower(strings.TrimSpace(cfg.StoreProvider)) != "postgres" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  "not_applicable",
+			"message": "migrations only apply to postgres store",
+		})
+		return
+	}
+
+	migrationsDir := strings.TrimSpace(cfg.MigrationsDir)
+	if migrationsDir == "" {
+		migrationsDir = "migrations"
+	}
+
+	db, err := store.OpenPostgresDB(cfg.PostgresDSN)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"code":    "MIGRATION_DB_ERROR",
+			"message": err.Error(),
+		})
+		return
+	}
+	defer db.Close()
+
+	mgr := store.NewMigrationManager(db, migrationsDir)
+	status, err := mgr.Status(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"code":    "MIGRATION_STATUS_ERROR",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"migrations": status,
+		"directory":  migrationsDir,
+	})
+}
+
+func (s *Server) handleGetAdminConfig(w http.ResponseWriter, r *http.Request) {
+	if !authorizeAdminOnly(w, r) {
+		return
+	}
+	cfg := s.cfg
+	writeJSON(w, http.StatusOK, map[string]any{
+		"runtime": map[string]any{
+			"provider": cfg.RuntimeProvider,
+			"timeout":  cfg.RuntimeTimeout.String(),
+			"claude": map[string]any{
+				"apiKey":    redactSecret(cfg.RuntimeClaudeAPIKey),
+				"model":     cfg.RuntimeClaudeModel,
+				"baseURL":   cfg.RuntimeClaudeBaseURL,
+				"maxTokens": cfg.RuntimeClaudeMaxTokens,
+			},
+			"openai": map[string]any{
+				"apiKey":    redactSecret(cfg.RuntimeOpenAIAPIKey),
+				"model":     cfg.RuntimeOpenAIModel,
+				"baseURL":   cfg.RuntimeOpenAIBaseURL,
+				"maxTokens": cfg.RuntimeOpenAIMaxTokens,
+				"format":    cfg.RuntimeOpenAIFormat,
+			},
+			"gemini": map[string]any{
+				"apiKey":    redactSecret(cfg.RuntimeGeminiAPIKey),
+				"model":     cfg.RuntimeGeminiModel,
+				"baseURL":   cfg.RuntimeGeminiBaseURL,
+				"maxTokens": cfg.RuntimeGeminiMaxTokens,
+			},
+			"http": map[string]any{
+				"endpoint":    cfg.RuntimeEndpoint,
+				"bearerToken": redactSecret(cfg.RuntimeHTTPBearerToken),
+				"maxAttempts": cfg.RuntimeHTTPMaxAttempts,
+				"retryDelay":  cfg.RuntimeHTTPRetryBaseDelay.String(),
+			},
+		},
+		"token": map[string]any{
+			"promptPricePerMillion": cfg.TokenPromptPricePerMillion,
+			"outputPricePerMillion": cfg.TokenOutputPricePerMillion,
+			"budgetWarnUSD":         cfg.TokenBudgetWarnUSD,
+			"budgetBlockUSD":        cfg.TokenBudgetBlockUSD,
+		},
+		"s3": map[string]any{
+			"provider": cfg.ArtifactStoreProvider,
+			"endpoint": cfg.S3Endpoint,
+			"accessKey": redactSecret(cfg.S3AccessKey),
+			"secretKey": redactSecret(cfg.S3SecretKey),
+			"bucket":   cfg.S3Bucket,
+			"region":   cfg.S3Region,
+			"useSSL":   cfg.S3UseSSL,
+		},
+		"alert": map[string]any{
+			"webhookURL": redactSecret(cfg.AlertWebhookURL),
+		},
+		"oidc": map[string]any{
+			"issuer":       cfg.OIDCIssuer,
+			"clientID":     cfg.OIDCClientID,
+			"clientSecret": redactSecret(cfg.OIDCClientSecret),
+			"redirectURL":  cfg.OIDCRedirectURL,
+		},
+	})
+}
+
+func (s *Server) handleUpdateAdminConfig(w http.ResponseWriter, r *http.Request) {
+	if !authorizeAdminOnly(w, r) {
+		return
+	}
+	var input service.AdminConfigUpdate
+	if err := decodeJSON(r, &input); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	updated := s.svc.UpdateRuntimeConfig(input)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"code":    "CONFIG_UPDATED",
+		"message": updated,
+	})
+}
+
+func authorizeAdminOnly(w http.ResponseWriter, r *http.Request) bool {
+	principal, ok := auth.PrincipalFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"code":    "UNAUTHORIZED",
+			"message": "authentication required",
+		})
+		return false
+	}
+	if !principal.HasAnyRole("admin") {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"code":    "FORBIDDEN",
+			"message": "admin role required",
+		})
+		return false
+	}
+	return true
+}
+
+func redactSecret(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 8 {
+		return "****"
+	}
+	return value[:4] + "****" + value[len(value)-4:]
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
@@ -163,6 +390,10 @@ func (s *Server) handleStatusStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
+	if s.checkIdempotencyOrReject(w, r) {
+		return
+	}
+
 	var input service.CreateProjectInput
 	if err := decodeJSON(r, &input); err != nil {
 		writeServiceError(w, err)
@@ -218,6 +449,10 @@ func (s *Server) handleListRequirements(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleGeneratePlan(w http.ResponseWriter, r *http.Request) {
+	if s.checkIdempotencyOrReject(w, r) {
+		return
+	}
+
 	result, err := s.svc.GeneratePlan(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeServiceError(w, err)
@@ -294,6 +529,10 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDispatchTasks(w http.ResponseWriter, r *http.Request) {
+	if s.checkIdempotencyOrReject(w, r) {
+		return
+	}
+
 	result, err := s.svc.DispatchTasks(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeServiceError(w, err)
@@ -641,6 +880,10 @@ func (s *Server) handlePreviewPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
+	if s.checkIdempotencyOrReject(w, r) {
+		return
+	}
+
 	var input service.StartRunInput
 	if err := decodeJSONAllowEmpty(r, &input); err != nil {
 		writeServiceError(w, err)
@@ -667,6 +910,10 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStartParallelRun(w http.ResponseWriter, r *http.Request) {
+	if s.checkIdempotencyOrReject(w, r) {
+		return
+	}
+
 	var input service.ParallelRunInput
 	if err := decodeJSONAllowEmpty(r, &input); err != nil {
 		writeServiceError(w, err)
@@ -907,6 +1154,12 @@ func (s *Server) readiness() readinessResult {
 		addCheck("runtime", nil)
 	} else if strings.EqualFold(strings.TrimSpace(cfg.RuntimeProvider), "local") {
 		addCheck("runtime", nil)
+	} else if strings.EqualFold(strings.TrimSpace(cfg.RuntimeProvider), "claude") {
+		if strings.TrimSpace(cfg.RuntimeClaudeAPIKey) == "" {
+			addCheck("runtime", fmt.Errorf("runtime provider claude requires RuntimeClaudeAPIKey"))
+		} else {
+			addCheck("runtime", nil)
+		}
 	} else if strings.EqualFold(strings.TrimSpace(cfg.RuntimeProvider), "container") {
 		if strings.TrimSpace(cfg.RuntimeContainerImage) == "" {
 			addCheck("runtime", fmt.Errorf("runtime provider container requires RuntimeContainerImage"))
@@ -915,11 +1168,30 @@ func (s *Server) readiness() readinessResult {
 		} else {
 			addCheck("runtime", nil)
 		}
+	} else if strings.EqualFold(strings.TrimSpace(cfg.RuntimeProvider), "openai") {
+		if strings.TrimSpace(cfg.RuntimeOpenAIAPIKey) == "" {
+			addCheck("runtime", fmt.Errorf("runtime provider openai requires RuntimeOpenAIAPIKey"))
+		} else {
+			addCheck("runtime", nil)
+		}
+	} else if strings.EqualFold(strings.TrimSpace(cfg.RuntimeProvider), "gemini") {
+		if strings.TrimSpace(cfg.RuntimeGeminiAPIKey) == "" {
+			addCheck("runtime", fmt.Errorf("runtime provider gemini requires RuntimeGeminiAPIKey"))
+		} else {
+			addCheck("runtime", nil)
+		}
 	} else {
 		addCheck("runtime", fmt.Errorf("runtime provider %q is not registered", cfg.RuntimeProvider))
 	}
 	if strings.TrimSpace(cfg.AlertWebhookURL) != "" {
 		addCheck("alertWebhook", nil)
+	}
+	if issuer := strings.TrimSpace(cfg.OIDCIssuer); issuer != "" {
+		if strings.TrimSpace(cfg.OIDCClientID) == "" {
+			addCheck("oidc", fmt.Errorf("OIDC issuer configured but OIDCClientID is missing"))
+		} else {
+			addCheck("oidc", nil)
+		}
 	}
 
 	status := "ready"
@@ -1009,14 +1281,90 @@ type contextKey string
 const requestIDKey contextKey = "request_id"
 const authActorKey contextKey = "auth_actor"
 
-func withMiddleware(cfg config.Config, logger *slog.Logger, next http.Handler) http.Handler {
-	return requestIDMiddleware(securityHeadersMiddleware(authMiddleware(cfg)(recoveryMiddleware(logger)(loggingMiddleware(logger)(next)))))
+func withMiddleware(cfg config.Config, logger *slog.Logger, metrics *MetricsCollector, next http.Handler) http.Handler {
+	return requestIDMiddleware(securityHeadersMiddleware(corsMiddleware(rateLimitMiddleware(authMiddleware(cfg)(recoveryMiddleware(logger)(loggingMiddleware(logger, metrics)(next)))))))
 }
 
 func securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		next.ServeHTTP(w, r)
+	})
+}
+
+var corsAllowHeaders = "Authorization, Content-Type, X-API-Key, X-Actor, X-Request-Id, Idempotency-Key"
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+type rateLimiter struct {
+	mu       sync.Mutex
+	visitors map[string]*visitor
+	rate     int           // requests per window
+	window   time.Duration
+}
+
+type visitor struct {
+	count    int
+	lastSeen time.Time
+}
+
+var globalRateLimiter = &rateLimiter{
+	visitors: make(map[string]*visitor),
+	rate:     100,
+	window:   time.Minute,
+}
+
+func (rl *rateLimiter) allow(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	v, exists := rl.visitors[key]
+	now := time.Now()
+	if !exists || now.Sub(v.lastSeen) > rl.window {
+		rl.visitors[key] = &visitor{count: 1, lastSeen: now}
+		return true
+	}
+	if v.count >= rl.rate {
+		return false
+	}
+	v.count++
+	v.lastSeen = now
+	return true
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.RemoteAddr
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			key = strings.Split(xff, ",")[0]
+		}
+		if !globalRateLimiter.allow(strings.TrimSpace(key)) {
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{
+				"code":    "RATE_LIMITED",
+				"message": "rate limit exceeded, try again later",
+			})
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1034,7 +1382,7 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func loggingMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
+func loggingMiddleware(logger *slog.Logger, metrics *MetricsCollector) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
@@ -1042,14 +1390,18 @@ func loggingMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 
 			next.ServeHTTP(writer, r)
 
+			duration := time.Since(start)
 			logger.Info("http_request",
 				"method", r.Method,
 				"path", r.URL.Path,
 				"status", writer.status,
-				"duration_ms", time.Since(start).Milliseconds(),
+				"duration_ms", duration.Milliseconds(),
 				"actor", actorFromRequest(r),
 				"requestId", requestIDFromContext(r.Context()),
 			)
+			if metrics != nil {
+				metrics.RecordHTTPRequest(r.Method, r.URL.Path, writer.status, duration)
+			}
 		})
 	}
 }
@@ -1059,6 +1411,11 @@ func authMiddleware(cfg config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/health" || r.URL.Path == "/ready" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			// Allow unauthenticated access to static assets when WebRoot is configured.
+			if cfg.WebRoot != "" && isStaticAssetPath(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -1101,6 +1458,111 @@ func authMiddleware(cfg config.Config) func(http.Handler) http.Handler {
 	}
 }
 
+func withRBACPolicy(ctx context.Context, policy *auth.RBACPolicy) context.Context {
+	return context.WithValue(ctx, typeRBACPolicyKey{}, policy)
+}
+
+type typeRBACPolicyKey struct{}
+
+func rbacPolicyFromContext(ctx context.Context) *auth.RBACPolicy {
+	policy, _ := ctx.Value(typeRBACPolicyKey{}).(*auth.RBACPolicy)
+	return policy
+}
+
+func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "MISSING_CODE", "message": "authorization code is required"})
+		return
+	}
+
+	oidcProvider := s.svc.OIDCProvider()
+	if oidcProvider == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"code": "OIDC_NOT_CONFIGURED", "message": "OIDC provider is not configured"})
+		return
+	}
+
+	redirectURI := s.cfg.OIDCRedirectURL
+	if redirectURI == "" {
+		redirectURI = fmt.Sprintf("%s://%s/auth/oidc/callback", r.Header.Get("X-Forwarded-Proto"), r.Host)
+	}
+
+	tokenResp, err := oidcProvider.ExchangeCode(r.Context(), code, redirectURI)
+	if err != nil {
+		s.logger.Warn("oidc code exchange failed", "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]any{"code": "OIDC_EXCHANGE_FAILED", "message": "failed to exchange authorization code"})
+		return
+	}
+
+	if tokenResp.IDToken == "" {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"code": "OIDC_NO_ID_TOKEN", "message": "OIDC provider did not return an ID token"})
+		return
+	}
+
+	claims, err := oidcProvider.VerifyIDToken(r.Context(), tokenResp.IDToken)
+	if err != nil {
+		s.logger.Warn("oidc id token verification failed", "error", err)
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"code": "OIDC_INVALID_TOKEN", "message": "ID token verification failed"})
+		return
+	}
+
+	principal := claims.ToPrincipal()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"code":         "OIDC_AUTHENTICATED",
+		"actor":        principal.Actor,
+		"roles":        principal.Roles,
+		"projectId":    principal.ProjectID,
+		"accessToken":  tokenResp.AccessToken,
+		"expiresIn":    tokenResp.ExpiresIn,
+	})
+}
+
+// isStaticAssetPath returns true for paths that are static frontend assets (JS, CSS, images, favicon)
+// or top-level SPA routes that should be served by the frontend router without authentication.
+func isStaticAssetPath(path string) bool {
+	if path == "/" || path == "/login" || path == "/favicon.svg" {
+		return true
+	}
+	if strings.HasPrefix(path, "/assets/") {
+		return true
+	}
+	// SPA routes: /projects, /projects/:id/board, /projects/:id/hitl, /dashboard, /settings
+	if strings.HasPrefix(path, "/projects") || strings.HasPrefix(path, "/dashboard") || path == "/settings" {
+		return true
+	}
+	return false
+}
+
+// checkIdempotencyOrReject checks the Idempotency-Key header and returns true if the request
+// should be rejected (already applied). Returns false if the request should proceed.
+func (s *Server) checkIdempotencyOrReject(w http.ResponseWriter, r *http.Request) bool {
+	keyHeader := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if keyHeader == "" {
+		return false
+	}
+	key, err := service.ParseIdempotencyKey(keyHeader)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"code":    "INVALID_IDEMPOTENCY_KEY",
+			"message": err.Error(),
+		})
+		return true
+	}
+	alreadyApplied, err := s.svc.CheckIdempotency(r.Context(), key)
+	if err != nil {
+		// Log but don't block on idempotency check failures.
+		return false
+	}
+	if alreadyApplied {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":    "IDEMPOTENCY_CONFLICT",
+			"message": "operation with this idempotency key was already applied",
+		})
+		return true
+	}
+	return false
+}
+
 func bearerToken(header string) string {
 	header = strings.TrimSpace(header)
 	if !strings.HasPrefix(strings.ToLower(header), "bearer ") {
@@ -1113,6 +1575,14 @@ func authorizeRequest(w http.ResponseWriter, r *http.Request, projectID string, 
 	principal, ok := auth.PrincipalFromContext(r.Context())
 	if !ok {
 		return true
+	}
+	// Check RBAC policy if available
+	if policy := rbacPolicyFromContext(r.Context()); policy != nil {
+		for _, role := range roles {
+			if policy.CheckProjectAccess(principal, projectID, role) {
+				return true
+			}
+		}
 	}
 	if principal.HasAnyRole(roles...) && principal.AllowsProject(projectID) {
 		return true

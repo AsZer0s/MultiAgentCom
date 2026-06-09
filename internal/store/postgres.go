@@ -9,9 +9,39 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
+
+// OpenPostgresDB opens a new database connection for migration management.
+func OpenPostgresDB(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", strings.TrimSpace(dsn))
+	if err != nil {
+		return nil, fmt.Errorf("open postgres: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	return db, nil
+}
+
+// OpenPostgresDBWithPool opens a new database connection with connection pool settings.
+func OpenPostgresDBWithPool(dsn string, maxOpen, maxIdle int, connMaxLifetime time.Duration) (*sql.DB, error) {
+	db, err := sql.Open("pgx", strings.TrimSpace(dsn))
+	if err != nil {
+		return nil, fmt.Errorf("open postgres: %w", err)
+	}
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
+	db.SetConnMaxLifetime(connMaxLifetime)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	return db, nil
+}
 
 const postgresServiceStateKey = "service-state"
 
@@ -119,6 +149,114 @@ CREATE TABLE IF NOT EXISTS artifact_order (
   artifact_id text NOT NULL,
   PRIMARY KEY(project_id, position)
 )`,
+	},
+	{
+		Version: 3,
+		Name: "extended_domain_projection_tables",
+		SQL: `
+CREATE TABLE IF NOT EXISTS context_injections (
+    id text PRIMARY KEY,
+    project_id text NOT NULL,
+    task_id text NOT NULL,
+    version int NOT NULL,
+    created_at timestamptz,
+    payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS context_injections_project_task_idx ON context_injections(project_id, task_id);
+
+CREATE TABLE IF NOT EXISTS sandboxes (
+    id text PRIMARY KEY,
+    project_id text NOT NULL,
+    run_id text NOT NULL,
+    task_id text NOT NULL,
+    status text NOT NULL,
+    created_at timestamptz,
+    updated_at timestamptz,
+    payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sandboxes_project_idx ON sandboxes(project_id);
+CREATE INDEX IF NOT EXISTS sandboxes_run_idx ON sandboxes(run_id);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+    id text PRIMARY KEY,
+    project_id text NOT NULL,
+    branch text NOT NULL,
+    stable boolean NOT NULL DEFAULT false,
+    created_at timestamptz,
+    payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS snapshots_project_idx ON snapshots(project_id);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id text PRIMARY KEY,
+    project_id text NOT NULL,
+    action text NOT NULL,
+    resource_type text NOT NULL,
+    timestamp timestamptz,
+    payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_logs_project_idx ON audit_logs(project_id);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id text PRIMARY KEY,
+    project_id text NOT NULL,
+    severity text NOT NULL,
+    type text NOT NULL,
+    timestamp timestamptz,
+    payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS alerts_project_idx ON alerts(project_id)`,
+	},
+	{
+		Version: 4,
+		Name: "hitl_and_communication_projection_tables",
+		SQL: `
+CREATE TABLE IF NOT EXISTS human_overrides (
+    id text PRIMARY KEY,
+    project_id text NOT NULL,
+    task_id text NOT NULL,
+    created_at timestamptz,
+    payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS human_overrides_project_idx ON human_overrides(project_id);
+
+CREATE TABLE IF NOT EXISTS code_locks (
+    id text PRIMARY KEY,
+    project_id text NOT NULL,
+    path text NOT NULL,
+    created_at timestamptz,
+    payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS code_locks_project_idx ON code_locks(project_id);
+
+CREATE TABLE IF NOT EXISTS conflict_queue_entries (
+    id text PRIMARY KEY,
+    project_id text NOT NULL,
+    kind text NOT NULL,
+    status text NOT NULL,
+    created_at timestamptz,
+    payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS conflict_queue_entries_project_idx ON conflict_queue_entries(project_id);
+
+CREATE TABLE IF NOT EXISTS previews (
+    id text PRIMARY KEY,
+    project_id text NOT NULL,
+    status text NOT NULL,
+    created_at timestamptz,
+    updated_at timestamptz,
+    payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS previews_project_idx ON previews(project_id);
+
+CREATE TABLE IF NOT EXISTS communication_logs (
+    id text PRIMARY KEY,
+    project_id text NOT NULL,
+    type text NOT NULL,
+    timestamp timestamptz,
+    payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS communication_logs_project_idx ON communication_logs(project_id)`,
 	},
 })
 
@@ -325,7 +463,7 @@ func CheckPostgres(ctx context.Context, dsn string) error {
 }
 
 func (s *PostgresStore) checkProjectionTables(ctx context.Context) error {
-	for _, table := range []string{"projects", "requirements", "plans", "contracts", "tasks", "task_order", "agent_runs", "run_order", "artifacts", "artifact_order"} {
+	for _, table := range []string{"projects", "requirements", "plans", "contracts", "tasks", "task_order", "agent_runs", "run_order", "artifacts", "artifact_order", "context_injections", "sandboxes", "snapshots", "audit_logs", "alerts", "human_overrides", "code_locks", "conflict_queue_entries", "previews", "communication_logs"} {
 		query := fmt.Sprintf("SELECT 1 FROM %s LIMIT 1", table)
 		if _, err := s.db.ExecContext(ctx, query); err != nil {
 			return fmt.Errorf("check postgres projection table %s: %w", table, err)

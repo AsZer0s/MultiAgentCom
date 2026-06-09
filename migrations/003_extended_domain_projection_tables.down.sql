@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS alerts;
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS snapshots;
+DROP TABLE IF EXISTS sandboxes;
+DROP TABLE IF EXISTS context_injections;

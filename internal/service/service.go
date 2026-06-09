@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"multiagentcom/internal/agentruntime"
+	"multiagentcom/internal/auth"
 	"multiagentcom/internal/config"
 	"multiagentcom/internal/domain"
 	"multiagentcom/internal/store"
@@ -68,7 +69,10 @@ type Service struct {
 	projectRequirementRepo projectRequirementRepository
 	planContractTaskRepo   planContractTaskRepository
 	runArtifactRepo        runArtifactRepository
+	extendedRepo    *postgresExtendedRepository
+	lockGuard      *AdvisoryLockGuard
 	workspaceProvider      workspaceProvider
+	oidcProvider   *auth.OIDCProvider
 
 	mu             sync.RWMutex
 	projects       map[string]*domain.Project
@@ -589,6 +593,67 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		}
 	}
 
+	if strings.EqualFold(runtimeProvider, "claude") || strings.TrimSpace(cfg.RuntimeClaudeAPIKey) != "" {
+		claudeOptions := agentruntime.ClaudeRunnerOptions{
+			APIKey:    cfg.RuntimeClaudeAPIKey,
+			Model:     cfg.RuntimeClaudeModel,
+			BaseURL:   cfg.RuntimeClaudeBaseURL,
+			Timeout:   cfg.RuntimeTimeout,
+			MaxTokens: cfg.RuntimeClaudeMaxTokens,
+		}
+		if runner, err := agentruntime.NewClaudeRunner(claudeOptions); err != nil {
+			runtimeInitErr = fmt.Errorf("initialize claude runtime runner: %w", err)
+			if logger != nil {
+				logger.Warn("failed to initialize claude runtime runner", "error", err)
+			}
+		} else if err := runtimeRegistry.Register("claude", runner); err != nil {
+			runtimeInitErr = fmt.Errorf("register claude runtime runner: %w", err)
+			if logger != nil {
+				logger.Warn("failed to register claude runtime runner", "error", err)
+			}
+		}
+	}
+	if strings.EqualFold(runtimeProvider, "openai") || strings.TrimSpace(cfg.RuntimeOpenAIAPIKey) != "" {
+		openaiOptions := agentruntime.OpenAIRunnerOptions{
+			APIKey:    cfg.RuntimeOpenAIAPIKey,
+			Model:     cfg.RuntimeOpenAIModel,
+			BaseURL:   cfg.RuntimeOpenAIBaseURL,
+			Timeout:   cfg.RuntimeTimeout,
+			MaxTokens: cfg.RuntimeOpenAIMaxTokens,
+			Format:    cfg.RuntimeOpenAIFormat,
+		}
+		if runner, err := agentruntime.NewOpenAIRunner(openaiOptions); err != nil {
+			runtimeInitErr = fmt.Errorf("initialize openai runtime runner: %w", err)
+			if logger != nil {
+				logger.Warn("failed to initialize openai runtime runner", "error", err)
+			}
+		} else if err := runtimeRegistry.Register("openai", runner); err != nil {
+			runtimeInitErr = fmt.Errorf("register openai runtime runner: %w", err)
+			if logger != nil {
+				logger.Warn("failed to register openai runtime runner", "error", err)
+			}
+		}
+	}
+	if strings.EqualFold(runtimeProvider, "gemini") || strings.TrimSpace(cfg.RuntimeGeminiAPIKey) != "" {
+		geminiOptions := agentruntime.GeminiRunnerOptions{
+			APIKey:    cfg.RuntimeGeminiAPIKey,
+			Model:     cfg.RuntimeGeminiModel,
+			BaseURL:   cfg.RuntimeGeminiBaseURL,
+			Timeout:   cfg.RuntimeTimeout,
+			MaxTokens: cfg.RuntimeGeminiMaxTokens,
+		}
+		if runner, err := agentruntime.NewGeminiRunner(geminiOptions); err != nil {
+			runtimeInitErr = fmt.Errorf("initialize gemini runtime runner: %w", err)
+			if logger != nil {
+				logger.Warn("failed to initialize gemini runtime runner", "error", err)
+			}
+		} else if err := runtimeRegistry.Register("gemini", runner); err != nil {
+			runtimeInitErr = fmt.Errorf("register gemini runtime runner: %w", err)
+			if logger != nil {
+				logger.Warn("failed to register gemini runtime runner", "error", err)
+			}
+		}
+	}
 	if err := runtimeRegistry.SetDefault(runtimeProvider); err != nil {
 		if explicitRuntimeProvider {
 			runtimeInitErr = fmt.Errorf("configured runtime provider %q unavailable: %w", runtimeProvider, err)
@@ -604,7 +669,26 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		cfg.RuntimeProvider = runtimeProvider
 	}
 
-	serviceStore, projectRequirementRepo, planContractTaskRepo, runArtifactRepo := newServiceStorage(cfg)
+	serviceStore, projectRequirementRepo, planContractTaskRepo, runArtifactRepo, extendedRepo := newServiceStorage(cfg)
+
+	// Initialize OIDC provider if configured.
+	var oidcProvider *auth.OIDCProvider
+	if issuer := strings.TrimSpace(cfg.OIDCIssuer); issuer != "" {
+		provider, err := auth.NewOIDCProvider(auth.OIDCConfig{
+			Issuer:       issuer,
+			ClientID:     cfg.OIDCClientID,
+			ClientSecret: cfg.OIDCClientSecret,
+			RedirectURL:  cfg.OIDCRedirectURL,
+		})
+		if err != nil {
+			if logger != nil {
+				logger.Warn("failed to initialize OIDC provider", "error", err)
+			}
+		} else {
+			oidcProvider = provider
+		}
+	}
+
 	svc := &Service{
 		cfg:                    cfg,
 		logger:                 logger,
@@ -615,13 +699,257 @@ func New(cfg config.Config, logger *slog.Logger) *Service {
 		projectRequirementRepo: projectRequirementRepo,
 		planContractTaskRepo:   planContractTaskRepo,
 		runArtifactRepo:        runArtifactRepo,
+		extendedRepo:    extendedRepo,
+		lockGuard:      newAdvisoryLockGuard(extendedRepo),
 		workspaceProvider:      newWorkspaceProvider(cfg),
+		oidcProvider:   oidcProvider,
 	}
 	svc.resetStateLocked()
 	if err := svc.loadPersistedState(context.Background()); err != nil && logger != nil {
 		logger.Warn("failed to load persisted service state", "error", err)
 	}
 	return svc
+}
+
+// CheckIdempotency checks if an operation with the given key has already been applied.
+// This is the public API used by the HTTP layer for idempotent write protection.
+func (s *Service) CheckIdempotency(ctx context.Context, key IdempotencyKey) (bool, error) {
+	return s.checkIdempotencyKey(ctx, key)
+}
+
+// OIDCProvider returns the OIDC provider if configured, or nil.
+func (s *Service) OIDCProvider() *auth.OIDCProvider {
+	return s.oidcProvider
+}
+
+// AdminConfigUpdate holds runtime configuration updates from the admin UI.
+type AdminConfigUpdate struct {
+	Runtime *RuntimeConfigUpdate `json:"runtime,omitempty"`
+	Token   *TokenConfigUpdate   `json:"token,omitempty"`
+	S3      *S3ConfigUpdate      `json:"s3,omitempty"`
+	Alert   *AlertConfigUpdate   `json:"alert,omitempty"`
+	OIDC    *OIDCConfigUpdate    `json:"oidc,omitempty"`
+}
+
+type RuntimeConfigUpdate struct {
+	Provider *string `json:"provider,omitempty"`
+	Timeout  *string `json:"timeout,omitempty"`
+	Claude   *LLMProviderUpdate `json:"claude,omitempty"`
+	OpenAI   *LLMProviderUpdate `json:"openai,omitempty"`
+	Gemini   *LLMProviderUpdate `json:"gemini,omitempty"`
+	HTTP     *HTTPRuntimeUpdate `json:"http,omitempty"`
+}
+
+type LLMProviderUpdate struct {
+	APIKey    *string `json:"apiKey,omitempty"`
+	Model     *string `json:"model,omitempty"`
+	BaseURL   *string `json:"baseURL,omitempty"`
+	MaxTokens *int    `json:"maxTokens,omitempty"`
+	Format    *string `json:"format,omitempty"`
+}
+
+type HTTPRuntimeUpdate struct {
+	Endpoint    *string `json:"endpoint,omitempty"`
+	BearerToken *string `json:"bearerToken,omitempty"`
+	MaxAttempts *int    `json:"maxAttempts,omitempty"`
+	RetryDelay  *string `json:"retryDelay,omitempty"`
+}
+
+type TokenConfigUpdate struct {
+	PromptPricePerMillion *float64 `json:"promptPricePerMillion,omitempty"`
+	OutputPricePerMillion *float64 `json:"outputPricePerMillion,omitempty"`
+	BudgetWarnUSD         *float64 `json:"budgetWarnUSD,omitempty"`
+	BudgetBlockUSD        *float64 `json:"budgetBlockUSD,omitempty"`
+}
+
+type S3ConfigUpdate struct {
+	Provider *string `json:"provider,omitempty"`
+	Endpoint *string `json:"endpoint,omitempty"`
+	AccessKey *string `json:"accessKey,omitempty"`
+	SecretKey *string `json:"secretKey,omitempty"`
+	Bucket   *string `json:"bucket,omitempty"`
+	Region   *string `json:"region,omitempty"`
+	UseSSL   *bool   `json:"useSSL,omitempty"`
+}
+
+type AlertConfigUpdate struct {
+	WebhookURL *string `json:"webhookURL,omitempty"`
+}
+
+type OIDCConfigUpdate struct {
+	Issuer       *string `json:"issuer,omitempty"`
+	ClientID     *string `json:"clientID,omitempty"`
+	ClientSecret *string `json:"clientSecret,omitempty"`
+	RedirectURL  *string `json:"redirectURL,omitempty"`
+}
+
+// UpdateRuntimeConfig applies runtime configuration updates.
+// Returns a summary of what was updated.
+func (s *Service) UpdateRuntimeConfig(input AdminConfigUpdate) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var updated []string
+
+	if input.Runtime != nil {
+		if input.Runtime.Provider != nil {
+			s.cfg.RuntimeProvider = *input.Runtime.Provider
+			updated = append(updated, "runtime.provider")
+		}
+		if input.Runtime.Claude != nil {
+			if input.Runtime.Claude.APIKey != nil {
+				s.cfg.RuntimeClaudeAPIKey = *input.Runtime.Claude.APIKey
+				updated = append(updated, "runtime.claude.apiKey")
+			}
+			if input.Runtime.Claude.Model != nil {
+				s.cfg.RuntimeClaudeModel = *input.Runtime.Claude.Model
+				updated = append(updated, "runtime.claude.model")
+			}
+			if input.Runtime.Claude.BaseURL != nil {
+				s.cfg.RuntimeClaudeBaseURL = *input.Runtime.Claude.BaseURL
+				updated = append(updated, "runtime.claude.baseURL")
+			}
+			if input.Runtime.Claude.MaxTokens != nil {
+				s.cfg.RuntimeClaudeMaxTokens = *input.Runtime.Claude.MaxTokens
+				updated = append(updated, "runtime.claude.maxTokens")
+			}
+		}
+		if input.Runtime.OpenAI != nil {
+			if input.Runtime.OpenAI.APIKey != nil {
+				s.cfg.RuntimeOpenAIAPIKey = *input.Runtime.OpenAI.APIKey
+				updated = append(updated, "runtime.openai.apiKey")
+			}
+			if input.Runtime.OpenAI.Model != nil {
+				s.cfg.RuntimeOpenAIModel = *input.Runtime.OpenAI.Model
+				updated = append(updated, "runtime.openai.model")
+			}
+			if input.Runtime.OpenAI.BaseURL != nil {
+				s.cfg.RuntimeOpenAIBaseURL = *input.Runtime.OpenAI.BaseURL
+				updated = append(updated, "runtime.openai.baseURL")
+			}
+			if input.Runtime.OpenAI.MaxTokens != nil {
+				s.cfg.RuntimeOpenAIMaxTokens = *input.Runtime.OpenAI.MaxTokens
+				updated = append(updated, "runtime.openai.maxTokens")
+			}
+			if input.Runtime.OpenAI.Format != nil {
+				s.cfg.RuntimeOpenAIFormat = *input.Runtime.OpenAI.Format
+				updated = append(updated, "runtime.openai.format")
+			}
+		}
+		if input.Runtime.Gemini != nil {
+			if input.Runtime.Gemini.APIKey != nil {
+				s.cfg.RuntimeGeminiAPIKey = *input.Runtime.Gemini.APIKey
+				updated = append(updated, "runtime.gemini.apiKey")
+			}
+			if input.Runtime.Gemini.Model != nil {
+				s.cfg.RuntimeGeminiModel = *input.Runtime.Gemini.Model
+				updated = append(updated, "runtime.gemini.model")
+			}
+			if input.Runtime.Gemini.BaseURL != nil {
+				s.cfg.RuntimeGeminiBaseURL = *input.Runtime.Gemini.BaseURL
+				updated = append(updated, "runtime.gemini.baseURL")
+			}
+			if input.Runtime.Gemini.MaxTokens != nil {
+				s.cfg.RuntimeGeminiMaxTokens = *input.Runtime.Gemini.MaxTokens
+				updated = append(updated, "runtime.gemini.maxTokens")
+			}
+		}
+		if input.Runtime.HTTP != nil {
+			if input.Runtime.HTTP.Endpoint != nil {
+				s.cfg.RuntimeEndpoint = *input.Runtime.HTTP.Endpoint
+				updated = append(updated, "runtime.http.endpoint")
+			}
+			if input.Runtime.HTTP.BearerToken != nil {
+				s.cfg.RuntimeHTTPBearerToken = *input.Runtime.HTTP.BearerToken
+				updated = append(updated, "runtime.http.bearerToken")
+			}
+			if input.Runtime.HTTP.MaxAttempts != nil {
+				s.cfg.RuntimeHTTPMaxAttempts = *input.Runtime.HTTP.MaxAttempts
+				updated = append(updated, "runtime.http.maxAttempts")
+			}
+		}
+	}
+
+	if input.Token != nil {
+		if input.Token.PromptPricePerMillion != nil {
+			s.cfg.TokenPromptPricePerMillion = *input.Token.PromptPricePerMillion
+			updated = append(updated, "token.promptPrice")
+		}
+		if input.Token.OutputPricePerMillion != nil {
+			s.cfg.TokenOutputPricePerMillion = *input.Token.OutputPricePerMillion
+			updated = append(updated, "token.outputPrice")
+		}
+		if input.Token.BudgetWarnUSD != nil {
+			s.cfg.TokenBudgetWarnUSD = *input.Token.BudgetWarnUSD
+			updated = append(updated, "token.budgetWarn")
+		}
+		if input.Token.BudgetBlockUSD != nil {
+			s.cfg.TokenBudgetBlockUSD = *input.Token.BudgetBlockUSD
+			updated = append(updated, "token.budgetBlock")
+		}
+	}
+
+	if input.S3 != nil {
+		if input.S3.Provider != nil {
+			s.cfg.ArtifactStoreProvider = *input.S3.Provider
+			updated = append(updated, "s3.provider")
+		}
+		if input.S3.Endpoint != nil {
+			s.cfg.S3Endpoint = *input.S3.Endpoint
+			updated = append(updated, "s3.endpoint")
+		}
+		if input.S3.AccessKey != nil {
+			s.cfg.S3AccessKey = *input.S3.AccessKey
+			updated = append(updated, "s3.accessKey")
+		}
+		if input.S3.SecretKey != nil {
+			s.cfg.S3SecretKey = *input.S3.SecretKey
+			updated = append(updated, "s3.secretKey")
+		}
+		if input.S3.Bucket != nil {
+			s.cfg.S3Bucket = *input.S3.Bucket
+			updated = append(updated, "s3.bucket")
+		}
+		if input.S3.Region != nil {
+			s.cfg.S3Region = *input.S3.Region
+			updated = append(updated, "s3.region")
+		}
+		if input.S3.UseSSL != nil {
+			s.cfg.S3UseSSL = *input.S3.UseSSL
+			updated = append(updated, "s3.useSSL")
+		}
+	}
+
+	if input.Alert != nil {
+		if input.Alert.WebhookURL != nil {
+			s.cfg.AlertWebhookURL = *input.Alert.WebhookURL
+			updated = append(updated, "alert.webhookURL")
+		}
+	}
+
+	if input.OIDC != nil {
+		if input.OIDC.Issuer != nil {
+			s.cfg.OIDCIssuer = *input.OIDC.Issuer
+			updated = append(updated, "oidc.issuer")
+		}
+		if input.OIDC.ClientID != nil {
+			s.cfg.OIDCClientID = *input.OIDC.ClientID
+			updated = append(updated, "oidc.clientID")
+		}
+		if input.OIDC.ClientSecret != nil {
+			s.cfg.OIDCClientSecret = *input.OIDC.ClientSecret
+			updated = append(updated, "oidc.clientSecret")
+		}
+		if input.OIDC.RedirectURL != nil {
+			s.cfg.OIDCRedirectURL = *input.OIDC.RedirectURL
+			updated = append(updated, "oidc.redirectURL")
+		}
+	}
+
+	if len(updated) == 0 {
+		return "no changes"
+	}
+	return "updated: " + strings.Join(updated, ", ")
 }
 
 type stateStore interface {
@@ -668,19 +996,19 @@ type jsonStateStore struct {
 }
 
 func newServiceStore(cfg config.Config) stateStore {
-	serviceStore, _, _, _ := newServiceStorage(cfg)
+	serviceStore, _, _, _, _ := newServiceStorage(cfg)
 	return serviceStore
 }
 
-func newServiceStorage(cfg config.Config) (stateStore, projectRequirementRepository, planContractTaskRepository, runArtifactRepository) {
+func newServiceStorage(cfg config.Config) (stateStore, projectRequirementRepository, planContractTaskRepository, runArtifactRepository, *postgresExtendedRepository) {
 	switch strings.ToLower(strings.TrimSpace(cfg.StoreProvider)) {
 	case "file":
-		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}, nil, nil, nil
+		return jsonStateStore{store: store.NewFileStore(cfg.DataRoot)}, nil, nil, nil, nil
 	case "postgres":
 		raw := store.NewPostgresStore(cfg.PostgresDSN)
-		return postgresDomainStateStore{raw: raw}, postgresProjectRequirementRepository{raw: raw}, postgresPlanContractTaskRepository{raw: raw}, postgresRunArtifactRepository{raw: raw}
+		return postgresDomainStateStore{raw: raw}, postgresProjectRequirementRepository{raw: raw}, postgresPlanContractTaskRepository{raw: raw}, postgresRunArtifactRepository{raw: raw}, &postgresExtendedRepository{raw: raw}
 	default:
-		return jsonStateStore{store: store.NewMemoryStore()}, nil, nil, nil
+		return jsonStateStore{store: store.NewMemoryStore()}, nil, nil, nil, nil
 	}
 }
 
@@ -1182,6 +1510,11 @@ func (s *Service) ListConflictQueue(_ context.Context, projectID string) ([]doma
 }
 
 func (s *Service) ResolveConflictQueueEntry(ctx context.Context, projectID, conflictID string, input ResolveConflictInput) (*domain.ConflictQueueEntry, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -1430,6 +1763,11 @@ func (s *Service) ListRequirements(ctx context.Context, projectID string) ([]dom
 }
 
 func (s *Service) GeneratePlan(ctx context.Context, projectID string) (*PlanResult, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	if s.planContractTaskRepo == nil {
@@ -1528,6 +1866,11 @@ func (s *Service) GeneratePlan(ctx context.Context, projectID string) (*PlanResu
 }
 
 func (s *Service) GenerateContract(ctx context.Context, projectID string) (*domain.Contract, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	if s.planContractTaskRepo == nil {
@@ -1750,6 +2093,11 @@ func (s *Service) GetLatestTaskContext(_ context.Context, projectID, taskID stri
 }
 
 func (s *Service) ApplyHumanOverride(ctx context.Context, projectID string, input ApplyHumanOverrideInput) (*HumanOverrideResult, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -1832,6 +2180,11 @@ func (s *Service) ApplyHumanOverride(ctx context.Context, projectID string, inpu
 }
 
 func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input ApplyCodeLockInput) (*CodeLockResult, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -1921,6 +2274,11 @@ func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input App
 }
 
 func (s *Service) StartPreview(ctx context.Context, projectID string) (*PreviewStartResult, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -2108,6 +2466,11 @@ func (s *Service) MarkTaskSandboxFailure(_ context.Context, projectID, taskID, r
 }
 
 func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, input MergeSharedSandboxInput) (*SharedSandboxMergeResult, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -2238,6 +2601,11 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 }
 
 func (s *Service) CleanupWorkspaces(ctx context.Context, projectID string, input CleanupWorkspacesInput) (*CleanupWorkspacesResult, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -2250,6 +2618,11 @@ func (s *Service) CleanupWorkspaces(ctx context.Context, projectID string, input
 }
 
 func (s *Service) RebaseWorkspaces(ctx context.Context, projectID string, input RebaseWorkspacesInput) (*RebaseWorkspacesResult, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 	targetRef := strings.TrimSpace(input.TargetRef)
 	if targetRef == "" {
@@ -2330,6 +2703,11 @@ func (s *Service) RebaseWorkspaces(ctx context.Context, projectID string, input 
 }
 
 func (s *Service) RollbackToSnapshot(ctx context.Context, projectID string, input RollbackSnapshotInput) (*RollbackResult, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -2360,6 +2738,11 @@ func (s *Service) RollbackToSnapshot(ctx context.Context, projectID string, inpu
 }
 
 func (s *Service) DispatchTasks(ctx context.Context, projectID string) (*DispatchTasksResult, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	if s.planContractTaskRepo == nil {
@@ -2664,6 +3047,11 @@ func (s *Service) RetryTask(ctx context.Context, projectID, taskID string) (*dom
 }
 
 func (s *Service) StartRun(ctx context.Context, projectID string, input StartRunInput) (*RunEnvelope, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	if s.runArtifactRepo == nil {
@@ -2744,6 +3132,11 @@ func (s *Service) StartRun(ctx context.Context, projectID string, input StartRun
 }
 
 func (s *Service) StartParallelRun(ctx context.Context, projectID string, input ParallelRunInput) (*ParallelRunResult, error) {
+	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
+		return nil, err
+	}
+	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
 	now := time.Now().UTC()
 
 	if s.runArtifactRepo == nil {

@@ -1,0 +1,80 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "${MULTI_AGENT_ADDR:-:8080}:8080"
+    environment:
+      MULTI_AGENT_ADDR: ":8080"
+      MULTI_AGENT_STORE_PROVIDER: postgres
+      MULTI_AGENT_POSTGRES_DSN: postgres://multiagentcom:multiagentcom@postgres:5432/multiagentcom?sslmode=disable
+      MULTI_AGENT_RUNTIME_PROVIDER: ${MULTI_AGENT_RUNTIME_PROVIDER:-local}
+      MULTI_AGENT_RUNTIME_CLAUDE_API_KEY: ${MULTI_AGENT_RUNTIME_CLAUDE_API_KEY:-}
+      MULTI_AGENT_RUNTIME_CLAUDE_MODEL: ${MULTI_AGENT_RUNTIME_CLAUDE_MODEL:-claude-sonnet-4-20250514}
+      MULTI_AGENT_RUNTIME_CLAUDE_BASE_URL: ${MULTI_AGENT_RUNTIME_CLAUDE_BASE_URL:-https://api.anthropic.com}
+      MULTI_AGENT_RUNTIME_OPENAI_API_KEY: ${MULTI_AGENT_RUNTIME_OPENAI_API_KEY:-}
+      MULTI_AGENT_RUNTIME_OPENAI_MODEL: ${MULTI_AGENT_RUNTIME_OPENAI_MODEL:-gpt-4o}
+      MULTI_AGENT_RUNTIME_OPENAI_BASE_URL: ${MULTI_AGENT_RUNTIME_OPENAI_BASE_URL:-https://api.openai.com/v1}
+      MULTI_AGENT_RUNTIME_OPENAI_FORMAT: ${MULTI_AGENT_RUNTIME_OPENAI_FORMAT:-chat}
+      MULTI_AGENT_RUNTIME_GEMINI_API_KEY: ${MULTI_AGENT_RUNTIME_GEMINI_API_KEY:-}
+      MULTI_AGENT_RUNTIME_GEMINI_MODEL: ${MULTI_AGENT_RUNTIME_GEMINI_MODEL:-gemini-2.0-flash}
+      MULTI_AGENT_RUNTIME_GEMINI_BASE_URL: ${MULTI_AGENT_RUNTIME_GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}
+      MULTI_AGENT_RUNTIME_HTTP_ENDPOINT: ${MULTI_AGENT_RUNTIME_HTTP_ENDPOINT:-}
+      MULTI_AGENT_RUNTIME_CONTAINER_IMAGE: ${MULTI_AGENT_RUNTIME_CONTAINER_IMAGE:-}
+      MULTI_AGENT_API_TOKEN: ${MULTI_AGENT_API_TOKEN:-}
+      MULTI_AGENT_AUTH_TOKENS: ${MULTI_AGENT_AUTH_TOKENS:-}
+      MULTI_AGENT_ALERT_WEBHOOK_URL: ${MULTI_AGENT_ALERT_WEBHOOK_URL:-}
+      MULTI_AGENT_ARTIFACT_ROOT: /data/artifacts
+      MULTI_AGENT_SANDBOX_ROOT: /data/sandboxes
+      MULTI_AGENT_DATA_ROOT: /data/state
+    volumes:
+      - app-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: multiagentcom
+      POSTGRES_PASSWORD: multiagentcom
+      POSTGRES_DB: multiagentcom
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U multiagentcom"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    profiles:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  app-data:
+  pg-data:
+  redis-data:
