@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"multiagentcom/internal/store"
@@ -197,6 +196,3 @@ func (s *Service) checkIdempotencyKey(ctx context.Context, key IdempotencyKey) (
 	}
 	return false, s.lockGuard.RecordIdempotency(ctx, key)
 }
-
-// strconv import is used by ParseIdempotencyKey - ensure it's available
-var _ = strconv.Itoa

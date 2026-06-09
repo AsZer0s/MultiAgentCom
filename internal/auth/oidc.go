@@ -95,7 +95,6 @@ type OIDCTokenClaims struct {
 	Audience   []string `json:"aud"`
 	Expiry     int64    `json:"exp"`
 	IssuedAt   int64    `json:"iat"`
-	Subject    string   `json:"sub"`
 	Roles      []string `json:"roles,omitempty"`
 	ProjectID  string   `json:"projectId,omitempty"`
 }

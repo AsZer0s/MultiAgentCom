@@ -142,7 +142,7 @@ func (r *GeminiRunner) Run(ctx context.Context, req Request) (Response, error) {
 		}
 	}
 
-	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s", r.baseURL, r.model, r.apiKey)
+	url := fmt.Sprintf("%s/models/%s:generateContent", r.baseURL, r.model)
 	httpReq, err := http.NewRequestWithContext(execCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return Response{}, transportProviderError(execCtx, err)
@@ -150,6 +150,7 @@ func (r *GeminiRunner) Run(ctx context.Context, req Request) (Response, error) {
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
 	httpReq.Header.Set("X-MultiAgentCom-Runtime-Protocol", ProtocolVersion)
+	httpReq.Header.Set("x-goog-api-key", r.apiKey)
 
 	resp, err := r.client.Do(httpReq)
 	if err != nil {
