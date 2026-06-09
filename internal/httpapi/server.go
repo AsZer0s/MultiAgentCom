@@ -1155,6 +1155,13 @@ func (s *Server) readiness() readinessResult {
 	}
 	addCheck("artifactRoot", ensureWritableDir(cfg.ArtifactRoot))
 	addCheck("sandboxRoot", ensureWritableDir(cfg.SandboxRoot))
+	if strings.EqualFold(strings.TrimSpace(cfg.ArtifactStoreProvider), "s3") {
+		if strings.TrimSpace(cfg.S3Endpoint) == "" || strings.TrimSpace(cfg.S3AccessKey) == "" {
+			addCheck("s3Storage", fmt.Errorf("s3 storage requires S3Endpoint and S3AccessKey"))
+		} else {
+			addCheck("s3Storage", nil)
+		}
+	}
 	if strings.EqualFold(strings.TrimSpace(cfg.WorkspaceProvider), "git") {
 		addCheck("gitWorkspace", service.CheckGitWorkspace(context.Background(), cfg))
 	} else {
@@ -1453,6 +1460,7 @@ func loggingMiddleware(logger *slog.Logger, metrics *MetricsCollector) func(http
 
 func authMiddleware(cfg config.Config) func(http.Handler) http.Handler {
 	authenticator, err := auth.New(cfg.APIToken, cfg.AuthTokens, cfg.AuthTokensFile)
+	var rbacPolicy *auth.RBACPolicy // nil until roles are assigned via admin API
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/health" || r.URL.Path == "/ready" {
@@ -1498,6 +1506,9 @@ func authMiddleware(cfg config.Config) func(http.Handler) http.Handler {
 			ctx := context.WithValue(r.Context(), authActorKey, principal.Actor)
 			ctx = auth.WithPrincipal(ctx, principal)
 			ctx = service.WithActor(ctx, principal.Actor)
+			if rbacPolicy != nil {
+				ctx = withRBACPolicy(ctx, rbacPolicy)
+			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

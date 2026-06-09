@@ -28,7 +28,6 @@ async function login() {
 }
 
 function oidcLogin() {
-  const oidcURL = import.meta.env.VITE_OIDC_AUTH_URL || ''
   if (oidcURL.value) {
     window.location.href = oidcURL.value
   }

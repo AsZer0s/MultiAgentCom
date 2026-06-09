@@ -243,7 +243,8 @@ func (m *MigrationManager) ensureMigrationsTable(ctx context.Context) error {
 	_, err := m.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version bigint PRIMARY KEY,
-			name text,
+			name text NOT NULL,
+			checksum text NOT NULL DEFAULT '',
 			applied_at timestamptz NOT NULL DEFAULT now()
 		)
 	`)

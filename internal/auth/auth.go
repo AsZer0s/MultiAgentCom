@@ -153,7 +153,7 @@ func normalizeRoles(values []string) []string {
 func hasRole(roles []string, role string) bool {
 	role = strings.ToLower(strings.TrimSpace(role))
 	for _, item := range roles {
-		if item == role {
+		if strings.ToLower(strings.TrimSpace(item)) == role {
 			return true
 		}
 	}

@@ -43,6 +43,24 @@ func (e *AppError) Error() string {
 	return e.Message
 }
 
+// Input length limits to prevent abuse.
+const (
+	MaxProjectNameLength        = 256
+	MaxProjectDescLength        = 4096
+	MaxRequirementTitleLength   = 512
+	MaxRequirementContentLength = 65536
+	MaxOverrideInstructionLen   = 8192
+	MaxCodeLockContentLen       = 65536
+	MaxCodeLockPathLen          = 1024
+)
+
+func validateLength(value, fieldName string, maxLen int) error {
+	if len(value) > maxLen {
+		return newValidationError(fmt.Sprintf("%s exceeds maximum length of %d characters", fieldName, maxLen))
+	}
+	return nil
+}
+
 func newValidationError(message string) *AppError {
 	return &AppError{Code: "VALIDATION_ERROR", StatusCode: 400, Message: message}
 }
@@ -1300,6 +1318,12 @@ func (s *Service) CreateProject(ctx context.Context, input CreateProjectInput) (
 	if name == "" {
 		return nil, newValidationError("project name is required")
 	}
+	if err := validateLength(name, "project name", MaxProjectNameLength); err != nil {
+		return nil, err
+	}
+	if err := validateLength(strings.TrimSpace(input.Description), "project description", MaxProjectDescLength); err != nil {
+		return nil, err
+	}
 
 	now := time.Now().UTC()
 	project := &domain.Project{
@@ -1653,6 +1677,12 @@ func (s *Service) AddRequirement(ctx context.Context, projectID string, input Ad
 	}
 	if content == "" {
 		return nil, newValidationError("requirement content is required")
+	}
+	if err := validateLength(title, "requirement title", MaxRequirementTitleLength); err != nil {
+		return nil, err
+	}
+	if err := validateLength(content, "requirement content", MaxRequirementContentLength); err != nil {
+		return nil, err
 	}
 
 	now := time.Now().UTC()
@@ -2115,6 +2145,9 @@ func (s *Service) ApplyHumanOverride(ctx context.Context, projectID string, inpu
 	if strings.TrimSpace(input.Instruction) == "" {
 		return nil, newValidationError("instruction is required for human override")
 	}
+	if err := validateLength(strings.TrimSpace(input.Instruction), "instruction", MaxOverrideInstructionLen); err != nil {
+		return nil, err
+	}
 	if task.Status != domain.TaskStatusInProgress && task.Status != domain.TaskStatusHumanOverride {
 		return nil, newConflictError("only in-progress tasks can receive human override")
 	}
@@ -2200,11 +2233,17 @@ func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input App
 	if lockPath == "" {
 		return nil, newValidationError("path is required for code lock")
 	}
+	if err := validateLength(lockPath, "path", MaxCodeLockPathLen); err != nil {
+		return nil, err
+	}
 	if filepath.IsAbs(lockPath) || strings.Contains(lockPath, "..") {
 		return nil, newValidationError("path must be a relative bundle path")
 	}
 	if strings.TrimSpace(lockContent) == "" {
 		return nil, newValidationError("content is required for code lock")
+	}
+	if err := validateLength(lockContent, "content", MaxCodeLockContentLen); err != nil {
+		return nil, err
 	}
 	if !strings.Contains(lockContent, "LOCKED BY HUMAN") {
 		return nil, newValidationError("content must include LOCKED BY HUMAN marker")
