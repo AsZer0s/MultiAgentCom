@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -98,18 +100,50 @@ type OIDCTokenClaims struct {
 	ProjectID  string   `json:"projectId,omitempty"`
 }
 
-// VerifyIDToken verifies an OIDC ID token and returns the claims.
-// This is a simplified verification for MVP - production should use a proper JWT library.
+// jwtHeader is the decoded JWT header.
+type jwtHeader struct {
+	Alg string `json:"alg"`
+	KID string `json:"kid"`
+	Typ string `json:"typ"`
+}
+
+// VerifyIDToken verifies an OIDC ID token including RSA signature verification.
 func (p *OIDCProvider) VerifyIDToken(ctx context.Context, tokenString string) (*OIDCTokenClaims, error) {
 	parts := strings.Split(tokenString, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("invalid id token format: expected 3 parts, got %d", len(parts))
 	}
 
-	// Decode payload (second part)
+	// Decode header to get kid and algorithm.
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("decode id token header: %w", err)
+	}
+	var header jwtHeader
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, fmt.Errorf("parse id token header: %w", err)
+	}
+
+	// Only support RS256.
+	if header.Alg != "RS256" {
+		return nil, fmt.Errorf("unsupported id token algorithm: %s (only RS256 supported)", header.Alg)
+	}
+
+	// Decode payload.
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return nil, fmt.Errorf("decode id token payload: %w", err)
+	}
+
+	// Decode signature.
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("decode id token signature: %w", err)
+	}
+
+	// Verify RSA signature using JWKS keys.
+	if err := p.verifyRS256Signature(parts[0]+"."+parts[1], sigBytes, header.KID, ctx); err != nil {
+		return nil, fmt.Errorf("signature verification failed: %w", err)
 	}
 
 	var claims OIDCTokenClaims
@@ -117,12 +151,12 @@ func (p *OIDCProvider) VerifyIDToken(ctx context.Context, tokenString string) (*
 		return nil, fmt.Errorf("parse id token claims: %w", err)
 	}
 
-	// Verify issuer
+	// Verify issuer.
 	if claims.Issuer != p.config.Issuer {
 		return nil, fmt.Errorf("id token issuer mismatch: got %s, want %s", claims.Issuer, p.config.Issuer)
 	}
 
-	// Verify audience includes our client ID
+	// Verify audience includes our client ID.
 	validAud := false
 	for _, aud := range claims.Audience {
 		if aud == p.config.ClientID {
@@ -134,17 +168,60 @@ func (p *OIDCProvider) VerifyIDToken(ctx context.Context, tokenString string) (*
 		return nil, fmt.Errorf("id token audience does not include client id %s", p.config.ClientID)
 	}
 
-	// Verify expiry
+	// Verify expiry.
 	if time.Now().Unix() > claims.Expiry {
 		return nil, fmt.Errorf("id token expired at %d", claims.Expiry)
 	}
 
-	// Normalize roles
+	// Normalize roles.
 	if len(claims.Roles) == 0 {
 		claims.Roles = []string{"viewer"}
 	}
 
 	return &claims, nil
+}
+
+// verifyRS256Signature verifies the RS256 signature of a JWT using JWKS keys.
+func (p *OIDCProvider) verifyRS256Signature(signedContent string, signature []byte, kid string, ctx context.Context) error {
+	// Ensure JWKS keys are loaded and fresh.
+	p.mu.RLock()
+	keys := p.keys
+	expiry := p.keyExpiry
+	p.mu.RUnlock()
+
+	if keys == nil || time.Now().After(expiry) {
+		discovery, err := p.Discover(ctx)
+		if err != nil {
+			return fmt.Errorf("discover oidc for jwks: %w", err)
+		}
+		if discovery.JWKURL == "" {
+			return fmt.Errorf("oidc jwks_uri not found in discovery document")
+		}
+		if err := p.FetchJWKS(ctx, discovery.JWKURL); err != nil {
+			return fmt.Errorf("fetch jwks: %w", err)
+		}
+		p.mu.RLock()
+		keys = p.keys
+		p.mu.RUnlock()
+	}
+
+	if len(keys) == 0 {
+		return fmt.Errorf("no signing keys available from oidc provider")
+	}
+
+	// Find the key by kid.
+	key, ok := keys[kid]
+	if !ok {
+		return fmt.Errorf("signing key %q not found in jwks", kid)
+	}
+
+	// Verify RS256 signature: SHA256(signedContent) signed with RSA PKCS1v15.
+	hash := sha256.Sum256([]byte(signedContent))
+	if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, hash[:], signature); err != nil {
+		return fmt.Errorf("rsa signature verification failed: %w", err)
+	}
+
+	return nil
 }
 
 // OIDCUserInfo holds user info from the OIDC userinfo endpoint.

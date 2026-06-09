@@ -12,9 +12,14 @@ const newDesc = ref('')
 const creating = ref(false)
 
 async function loadProjects() {
-  // Since we don't have a list projects endpoint, use status matrix to infer
-  // In practice, we'd add a list endpoint; for now we'll attempt direct creation
-  loading.value = false
+  try {
+    loading.value = true
+    projects.value = await api.listProjects()
+  } catch (e: any) {
+    console.error('Failed to load projects:', e.message)
+  } finally {
+    loading.value = false
+  }
 }
 
 async function createProject() {

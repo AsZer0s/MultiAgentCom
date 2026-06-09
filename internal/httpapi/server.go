@@ -51,6 +51,7 @@ func NewServer(cfg config.Config, logger *slog.Logger, svc *service.Service) htt
 	mux.HandleFunc("GET /status/stream", server.handleStatusStream)
 	mux.HandleFunc("GET /auth/oidc/callback", server.handleOIDCCallback)
 	mux.HandleFunc("POST /projects", server.handleCreateProject)
+	mux.HandleFunc("GET /projects", server.handleListProjects)
 	mux.HandleFunc("GET /projects/{id}", server.handleGetProject)
 	mux.HandleFunc("POST /projects/{id}/requirements", server.handleAddRequirement)
 	mux.HandleFunc("GET /projects/{id}/requirements", server.handleListRequirements)
@@ -407,6 +408,15 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, project)
+}
+
+func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	projects, err := s.svc.ListProjects(r.Context())
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, projects)
 }
 
 func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
@@ -1270,9 +1280,11 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		return
 	}
 
+	// For unexpected errors, return a generic message to avoid leaking internals.
+	// The actual error is logged server-side via recovery middleware or logger.
 	writeJSON(w, http.StatusInternalServerError, map[string]any{
 		"code":    "INTERNAL_ERROR",
-		"message": err.Error(),
+		"message": "an internal error occurred",
 	})
 }
 
@@ -1282,7 +1294,7 @@ const requestIDKey contextKey = "request_id"
 const authActorKey contextKey = "auth_actor"
 
 func withMiddleware(cfg config.Config, logger *slog.Logger, metrics *MetricsCollector, next http.Handler) http.Handler {
-	return requestIDMiddleware(securityHeadersMiddleware(corsMiddleware(rateLimitMiddleware(authMiddleware(cfg)(recoveryMiddleware(logger)(loggingMiddleware(logger, metrics)(next)))))))
+	return requestIDMiddleware(securityHeadersMiddleware(corsMiddleware(cfg)(rateLimitMiddleware(authMiddleware(cfg)(recoveryMiddleware(logger)(loggingMiddleware(logger, metrics)(next)))))))
 }
 
 func securityHeadersMiddleware(next http.Handler) http.Handler {
@@ -1298,22 +1310,55 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 
 var corsAllowHeaders = "Authorization, Content-Type, X-API-Key, X-Actor, X-Request-Id, Idempotency-Key"
 
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-			w.Header().Set("Access-Control-Max-Age", "86400")
+func corsMiddleware(cfg config.Config) func(http.Handler) http.Handler {
+	allowedOrigins := parseCORSAllowedOrigins(cfg.CORSAllowedOrigins)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+			if origin != "" && isOriginAllowed(origin, allowedOrigins) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+				w.Header().Set("Access-Control-Max-Age", "86400")
+			}
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func parseCORSAllowedOrigins(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var origins []string
+	for _, o := range strings.Split(raw, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			origins = append(origins, o)
 		}
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
+	}
+	return origins
+}
+
+func isOriginAllowed(origin string, allowed []string) bool {
+	for _, a := range allowed {
+		if a == "*" {
+			return true
 		}
-		next.ServeHTTP(w, r)
-	})
+		if a == origin {
+			return true
+		}
+		// Support wildcard subdomains like *.example.com
+		if strings.HasPrefix(a, "*.") && strings.HasSuffix(origin, a[1:]) {
+			return true
+		}
+	}
+	return false
 }
 
 type rateLimiter struct {

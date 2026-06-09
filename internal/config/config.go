@@ -87,6 +87,7 @@ type Config struct {
 	PostgresMaxOpenConns    int
 	PostgresMaxIdleConns    int
 	PostgresConnMaxLifetime time.Duration
+	CORSAllowedOrigins      string // comma-separated list, or "*" for all (not recommended)
 	TokenOutputPricePerMillion        float64
 	TokenBudgetWarnUSD                float64
 	TokenBudgetBlockUSD               float64
@@ -191,6 +192,7 @@ func Load() Config {
 		PostgresMaxOpenConns:              getenvInt("MULTI_AGENT_POSTGRES_MAX_OPEN_CONNS", 25),
 		PostgresMaxIdleConns:              getenvInt("MULTI_AGENT_POSTGRES_MAX_IDLE_CONNS", 5),
 		PostgresConnMaxLifetime:           getenvDuration("MULTI_AGENT_POSTGRES_CONN_MAX_LIFETIME", 5*time.Minute),
+		CORSAllowedOrigins:                getenv("MULTI_AGENT_CORS_ALLOWED_ORIGINS", ""),
 	})
 }
 
