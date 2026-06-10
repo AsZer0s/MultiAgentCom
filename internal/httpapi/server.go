@@ -1004,9 +1004,19 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Validate artifact URI to prevent path traversal.
+	uri := strings.TrimSpace(artifact.URI)
+	if uri == "" || strings.Contains(uri, "..") || strings.Contains(uri, "\x00") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"code":    "INVALID_ARTIFACT_URI",
+			"message": "artifact URI is invalid",
+		})
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", `attachment; filename="delivery.zip"`)
-	http.ServeFile(w, r, artifact.URI)
+	http.ServeFile(w, r, uri)
 }
 
 func decodeJSON(r *http.Request, target any) error {
@@ -1416,10 +1426,9 @@ func (rl *rateLimiter) allow(key string) bool {
 
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Use RemoteAddr for rate limiting. X-Forwarded-For is easily spoofable
+		// and should only be trusted behind a known reverse proxy that strips it.
 		key := r.RemoteAddr
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			key = strings.Split(xff, ",")[0]
-		}
 		if !globalRateLimiter.allow(strings.TrimSpace(key)) {
 			writeJSON(w, http.StatusTooManyRequests, map[string]any{
 				"code":    "RATE_LIMITED",
@@ -1715,6 +1724,16 @@ func generateRequestID() string {
 	return time.Now().UTC().Format("20060102T150405.000000000")
 }
 
+// htmlEscape escapes HTML special characters to prevent XSS.
+func htmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "'", "&#39;")
+	return s
+}
+
 func renderPreviewHTML(preview domain.Preview) string {
 	return fmt.Sprintf(`<!doctype html>
 <html lang="zh-CN">
@@ -1923,7 +1942,7 @@ func renderPreviewHTML(preview domain.Preview) string {
     window.setInterval(pollRevision, 3000);
   </script>
 </body>
-</html>`, preview.ID, preview.ID, preview.SandboxID, preview.Revision, preview.Revision)
+</html>`, htmlEscape(preview.ID), htmlEscape(preview.ID), htmlEscape(preview.SandboxID), htmlEscape(preview.Revision), htmlEscape(preview.Revision))
 }
 
 func renderStatusPanelHTML(serviceName string) string {
@@ -2697,5 +2716,5 @@ func renderStatusPanelHTML(serviceName string) string {
     setInterval(loadDashboard, 4000);
   </script>
 </body>
-</html>`, serviceName, serviceName)
+</html>`, htmlEscape(serviceName), htmlEscape(serviceName))
 }

@@ -50,8 +50,16 @@ const (
 	MaxRequirementTitleLength   = 512
 	MaxRequirementContentLength = 65536
 	MaxOverrideInstructionLen   = 8192
+	MaxOverrideOperatorLen      = 256
+	MaxOverrideOwnerLen         = 256
+	MaxOverrideLockScopeLen     = 64
 	MaxCodeLockContentLen       = 65536
 	MaxCodeLockPathLen          = 1024
+	MaxCodeLockCreatedByLen     = 256
+	MaxConflictResolutionLen    = 4096
+	MaxConflictResolvedByLen    = 256
+	MaxSandboxFailureReasonLen  = 1024
+	MaxParallelRunTaskIDs       = 50
 )
 
 func validateLength(value, fieldName string, maxLen int) error {
@@ -1553,6 +1561,12 @@ func (s *Service) ResolveConflictQueueEntry(ctx context.Context, projectID, conf
 	if !ok || conflict.ProjectID != projectID {
 		return nil, newNotFoundError("conflict not found")
 	}
+	if err := validateLength(strings.TrimSpace(input.ResolvedBy), "resolvedBy", MaxConflictResolvedByLen); err != nil {
+		return nil, err
+	}
+	if err := validateLength(strings.TrimSpace(input.ResolutionNote), "resolutionNote", MaxConflictResolutionLen); err != nil {
+		return nil, err
+	}
 	if conflict.Status != "OPEN" {
 		return nil, newConflictError("conflict is already resolved")
 	}
@@ -2153,12 +2167,21 @@ func (s *Service) ApplyHumanOverride(ctx context.Context, projectID string, inpu
 	}
 
 	operator := strings.TrimSpace(input.Operator)
+	if err := validateLength(operator, "operator", MaxOverrideOperatorLen); err != nil {
+		return nil, err
+	}
+	if err := validateLength(strings.TrimSpace(input.Owner), "owner", MaxOverrideOwnerLen); err != nil {
+		return nil, err
+	}
 	owner := hitlOwner(ctx, input.Owner, operator)
 	expiresAt, err := hitlExpiresAt(now, input.TTLSeconds)
 	if err != nil {
 		return nil, err
 	}
 	lockScope := strings.TrimSpace(input.LockScope)
+	if err := validateLength(lockScope, "lockScope", MaxOverrideLockScopeLen); err != nil {
+		return nil, err
+	}
 	if lockScope == "" {
 		lockScope = "TASK"
 	}
@@ -2255,6 +2278,9 @@ func (s *Service) ApplyCodeLock(ctx context.Context, projectID string, input App
 	symbolKind := strings.TrimSpace(input.SymbolKind)
 	symbolName := strings.TrimSpace(input.SymbolName)
 	language := strings.TrimSpace(input.Language)
+	if err := validateLength(strings.TrimSpace(input.CreatedBy), "createdBy", MaxCodeLockCreatedByLen); err != nil {
+		return nil, err
+	}
 	if err := validateCodeLock(lockPath, lockContent, lockMode, language, symbolKind, symbolName); err != nil {
 		return nil, err
 	}
@@ -3198,6 +3224,10 @@ func (s *Service) StartParallelRun(ctx context.Context, projectID string, input 
 		return nil, err
 	}
 	defer s.releaseAdvisoryProjectLock(ctx, projectID)
+
+	if len(input.TaskIDs) > MaxParallelRunTaskIDs {
+		return nil, newValidationError(fmt.Sprintf("taskIds exceeds maximum of %d", MaxParallelRunTaskIDs))
+	}
 
 	now := time.Now().UTC()
 
