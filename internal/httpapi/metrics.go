@@ -15,10 +15,11 @@ var defaultBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5,
 type MetricsCollector struct {
 	mu sync.RWMutex
 
-	// HTTP metrics
-	httpRequestsTotal    map[string]int64         // method+path+status -> count
-	httpRequestDuration  map[string][]time.Duration // for avg calculation
-	httpRequestHistogram map[string]map[float64]int64 // method+path -> bucket -> count
+	// HTTP metrics (bounded memory)
+	httpRequestsTotal    map[string]int64              // method+path+status -> count
+	httpRequestSum       map[string]float64            // method+path -> total seconds
+	httpRequestCount     map[string]int64              // method+path -> count (for avg)
+	httpRequestHistogram map[string]map[float64]int64  // method+path -> bucket -> count
 
 	// Business metrics
 	projectsCreated   int64
@@ -30,17 +31,18 @@ type MetricsCollector struct {
 	conflictsResolved int64
 
 	// LLM metrics
-	llmRequestsTotal   map[string]int64 // provider -> count
-	llmTokensTotal     map[string]int64 // provider -> tokens
-	llmErrorsTotal     map[string]int64 // provider -> count
-	llmDurationTotal   map[string]time.Duration // provider -> total duration
+	llmRequestsTotal   map[string]int64
+	llmTokensTotal     map[string]int64
+	llmErrorsTotal     map[string]int64
+	llmDurationTotal   map[string]time.Duration
 }
 
 // NewMetricsCollector creates a new metrics collector.
 func NewMetricsCollector() *MetricsCollector {
 	return &MetricsCollector{
 		httpRequestsTotal:    make(map[string]int64),
-		httpRequestDuration:  make(map[string][]time.Duration),
+		httpRequestSum:       make(map[string]float64),
+		httpRequestCount:     make(map[string]int64),
 		httpRequestHistogram: make(map[string]map[float64]int64),
 		llmRequestsTotal:     make(map[string]int64),
 		llmTokensTotal:       make(map[string]int64),
@@ -56,10 +58,13 @@ func (m *MetricsCollector) RecordHTTPRequest(method, path string, status int, du
 
 	key := fmt.Sprintf("%s %s %d", method, path, status)
 	m.httpRequestsTotal[key]++
-	m.httpRequestDuration[key] = append(m.httpRequestDuration[key], duration)
+
+	// Use running sum instead of storing every duration.
+	histKey := fmt.Sprintf("%s %s", method, path)
+	m.httpRequestSum[histKey] += duration.Seconds()
+	m.httpRequestCount[histKey]++
 
 	// Record histogram bucket.
-	histKey := fmt.Sprintf("%s %s", method, path)
 	if m.httpRequestHistogram[histKey] == nil {
 		m.httpRequestHistogram[histKey] = make(map[float64]int64)
 	}
@@ -69,7 +74,7 @@ func (m *MetricsCollector) RecordHTTPRequest(method, path string, status int, du
 			m.httpRequestHistogram[histKey][bucket]++
 		}
 	}
-	m.httpRequestHistogram[histKey][float64(0)]++ // +Inf bucket (total)
+	m.httpRequestHistogram[histKey][0]++ // +Inf bucket (total)
 }
 
 // IncProjectsCreated increments the projects created counter.
@@ -150,7 +155,6 @@ func (m *MetricsCollector) RenderPrometheus() string {
 	// HTTP request duration histogram.
 	out.WriteString("# HELP http_request_duration_seconds HTTP request duration histogram\n")
 	out.WriteString("# TYPE http_request_duration_seconds histogram\n")
-	// Sort keys for stable output.
 	histKeys := make([]string, 0, len(m.httpRequestHistogram))
 	for k := range m.httpRequestHistogram {
 		histKeys = append(histKeys, k)
@@ -166,25 +170,18 @@ func (m *MetricsCollector) RenderPrometheus() string {
 		sort.Float64s(bucketNums)
 		for _, bucket := range bucketNums {
 			if bucket == 0 {
-				continue // skip the +Inf accumulator for now
+				continue
 			}
 			cumulative += buckets[bucket]
 			fmt.Fprintf(&out, "http_request_duration_seconds_bucket{request=\"%s\",le=\"%.3f\"} %d\n", key, bucket, cumulative)
 		}
-		total := buckets[0] // +Inf
+		total := buckets[0]
 		if total == 0 {
 			total = cumulative
 		}
 		fmt.Fprintf(&out, "http_request_duration_seconds_bucket{request=\"%s\",le=\"+Inf\"} %d\n", key, total)
 		fmt.Fprintf(&out, "http_request_duration_seconds_count{request=\"%s\"} %d\n", key, total)
-
-		// Calculate sum.
-		durations := m.httpRequestDuration[key]
-		var sum float64
-		for _, d := range durations {
-			sum += d.Seconds()
-		}
-		fmt.Fprintf(&out, "http_request_duration_seconds_sum{request=\"%s\"} %.6f\n", key, sum)
+		fmt.Fprintf(&out, "http_request_duration_seconds_sum{request=\"%s\"} %.6f\n", key, m.httpRequestSum[key])
 	}
 
 	// Business counters.

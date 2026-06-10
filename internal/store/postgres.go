@@ -463,7 +463,7 @@ func CheckPostgres(ctx context.Context, dsn string) error {
 }
 
 func (s *PostgresStore) checkProjectionTables(ctx context.Context) error {
-	for _, table := range []string{"projects", "requirements", "plans", "contracts", "tasks", "task_order", "agent_runs", "run_order", "artifacts", "artifact_order", "context_injections", "sandboxes", "snapshots", "audit_logs", "alerts", "human_overrides", "code_locks", "conflict_queue_entries", "previews", "communication_logs"} {
+	for _, table := range []string{"projects", "requirements", "plans", "contracts", "tasks", "task_order", "agent_runs", "run_order", "artifacts", "artifact_order", "context_injections", "sandboxes", "snapshots", "audit_logs", "alerts", "human_overrides", "code_locks", "conflict_queue_entries", "previews", "communication_logs", "idempotency_keys"} {
 		query := fmt.Sprintf("SELECT 1 FROM %s LIMIT 1", table)
 		if _, err := s.db.ExecContext(ctx, query); err != nil {
 			return fmt.Errorf("check postgres projection table %s: %w", table, err)

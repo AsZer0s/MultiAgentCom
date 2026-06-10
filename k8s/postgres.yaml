@@ -40,11 +40,22 @@ spec:
             limits:
               cpu: 500m
               memory: 1Gi
-          livenessProbe:
+          startupProbe:
             exec:
               command: ["pg_isready", "-U", "multiagentcom"]
             initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "multiagentcom"]
+            initialDelaySeconds: 0
             periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "multiagentcom"]
+            initialDelaySeconds: 0
+            periodSeconds: 5
       volumes:
         - name: pg-data
           persistentVolumeClaim:

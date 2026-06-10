@@ -341,6 +341,22 @@ func Validate(cfg Config) error {
 	if cfg.RuntimeTimeout <= 0 {
 		issues = append(issues, ValidationIssue{Field: "RuntimeTimeout", Message: "must be positive"})
 	}
+	// Validate S3 configuration when S3 storage is selected.
+	if strings.EqualFold(strings.TrimSpace(cfg.ArtifactStoreProvider), "s3") {
+		if strings.TrimSpace(cfg.S3Endpoint) == "" {
+			issues = append(issues, ValidationIssue{Field: "S3Endpoint", Message: "is required when ArtifactStoreProvider is s3"})
+		}
+		if strings.TrimSpace(cfg.S3AccessKey) == "" {
+			issues = append(issues, ValidationIssue{Field: "S3AccessKey", Message: "is required when ArtifactStoreProvider is s3"})
+		}
+		if strings.TrimSpace(cfg.S3SecretKey) == "" {
+			issues = append(issues, ValidationIssue{Field: "S3SecretKey", Message: "is required when ArtifactStoreProvider is s3"})
+		}
+	}
+	// Warn about wildcard CORS.
+	if strings.TrimSpace(cfg.CORSAllowedOrigins) == "*" {
+		issues = append(issues, ValidationIssue{Field: "CORSAllowedOrigins", Message: "wildcard '*' allows all origins, not recommended for production"})
+	}
 	if cfg.RuntimeHTTPMaxAttempts <= 0 {
 		issues = append(issues, ValidationIssue{Field: "RuntimeHTTPMaxAttempts", Message: "must be positive"})
 	}

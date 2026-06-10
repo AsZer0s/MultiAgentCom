@@ -148,6 +148,8 @@ func (s *S3ArtifactStore) signRequestV4(req *http.Request, body []byte) {
 	dateStamp := now.Format("20060102")
 	amzDate := now.Format("20060102T150405Z")
 
+	// Set Host header BEFORE computing canonical request.
+	req.Header.Set("Host", req.URL.Host)
 	req.Header.Set("X-Amz-Date", amzDate)
 	req.Header.Set("X-Amz-Content-Sha256", sha256Hex(body))
 
@@ -161,7 +163,7 @@ func (s *S3ArtifactStore) signRequestV4(req *http.Request, body []byte) {
 	// Signed headers.
 	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
 	canonicalHeaders := fmt.Sprintf("host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n",
-		req.Header.Get("Host"), req.Header.Get("X-Amz-Content-Sha256"), amzDate)
+		req.URL.Host, req.Header.Get("X-Amz-Content-Sha256"), amzDate)
 
 	payloadHash := sha256Hex(body)
 	canonicalRequest := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s",
@@ -180,7 +182,6 @@ func (s *S3ArtifactStore) signRequestV4(req *http.Request, body []byte) {
 	authHeader := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
 		s.accessKey, credentialScope, signedHeaders, hex.EncodeToString(signature))
 	req.Header.Set("Authorization", authHeader)
-	req.Header.Set("Host", req.URL.Host)
 }
 
 func (s *S3ArtifactStore) getSignatureKey(dateStamp string) []byte {

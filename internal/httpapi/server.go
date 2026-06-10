@@ -1390,6 +1390,16 @@ func (rl *rateLimiter) allow(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
+	// Evict stale entries periodically to prevent unbounded memory growth.
+	if len(rl.visitors) > 10000 {
+		now := time.Now()
+		for k, v := range rl.visitors {
+			if now.Sub(v.lastSeen) > rl.window*2 {
+				delete(rl.visitors, k)
+			}
+		}
+	}
+
 	v, exists := rl.visitors[key]
 	now := time.Now()
 	if !exists || now.Sub(v.lastSeen) > rl.window {
