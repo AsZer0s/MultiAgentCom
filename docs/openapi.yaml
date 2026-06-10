@@ -1,0 +1,764 @@
+openapi: 3.0.3
+info:
+  title: MultiAgentCom API
+  description: Multi-Agent Collaborative Software Development Platform
+  version: 1.0.0
+  contact:
+    name: MultiAgentCom
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+security:
+  - BearerAuth: []
+  - ApiKeyAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  schemas:
+    Project:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Requirement:
+      type: object
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        title: { type: string }
+        content: { type: string }
+        constraints: { type: array, items: { type: string } }
+        acceptanceHints: { type: array, items: { type: string } }
+        createdAt: { type: string, format: date-time }
+
+    Task:
+      type: object
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        planId: { type: string }
+        name: { type: string }
+        type: { type: string }
+        status: { type: string, enum: [CREATED, IN_PROGRESS, HUMAN_OVERRIDE, DONE, FAILED] }
+        assigneeAgent: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AgentRun:
+      type: object
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        taskId: { type: string }
+        agentType: { type: string }
+        model: { type: string }
+        status: { type: string, enum: [PENDING, RUNNING, SUCCEEDED, FAILED] }
+        promptTokens: { type: integer }
+        completionTokens: { type: integer }
+        totalTokens: { type: integer }
+        estimatedCostUsd: { type: number }
+        startedAt: { type: string, format: date-time }
+        endedAt: { type: string, format: date-time }
+
+    Contract:
+      type: object
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        version: { type: integer }
+        name: { type: string }
+        summary: { type: string }
+        endpoints: { type: array, items: { type: object } }
+        schemas: { type: array, items: { type: object } }
+        createdAt: { type: string, format: date-time }
+
+    Snapshot:
+      type: object
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        branch: { type: string }
+        reason: { type: string }
+        stable: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    Error:
+      type: object
+      properties:
+        code: { type: string }
+        message: { type: string }
+
+    HealthResponse:
+      type: object
+      properties:
+        status: { type: string }
+        service: { type: string }
+        timestamp: { type: string, format: date-time }
+
+    ReadinessResponse:
+      type: object
+      properties:
+        status: { type: string }
+        service: { type: string }
+        timestamp: { type: string, format: date-time }
+        checks: { type: array, items: { type: object } }
+
+    MetricsResponse:
+      type: string
+      description: Prometheus text format metrics
+
+    LLMProvidersResponse:
+      type: object
+      properties:
+        activeProvider: { type: string }
+        providers:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              name: { type: string }
+              available: { type: boolean }
+              active: { type: boolean }
+              model: { type: string }
+
+    StatusMatrix:
+      type: object
+      properties:
+        agents:
+          type: array
+          items:
+            type: object
+            properties:
+              agent: { type: string }
+              status: { type: string }
+              doneTasks: { type: integer }
+              runningTasks: { type: integer }
+              failedTasks: { type: integer }
+              totalTasks: { type: integer }
+        taskCounts: { type: object, additionalProperties: { type: integer } }
+
+paths:
+  /health:
+    get:
+      summary: Liveness check
+      security: []
+      tags: [System]
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+
+  /ready:
+    get:
+      summary: Readiness check
+      security: []
+      tags: [System]
+      responses:
+        '200':
+          description: Service is ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessResponse' }
+        '503':
+          description: Service not ready
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      security: []
+      tags: [System]
+      responses:
+        '200':
+          description: Prometheus text format
+          content:
+            text/plain:
+              schema: { $ref: '#/components/schemas/MetricsResponse' }
+
+  /llm/providers:
+    get:
+      summary: List available LLM providers
+      tags: [System]
+      responses:
+        '200':
+          description: LLM providers list
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LLMProvidersResponse' }
+
+  /admin/config:
+    get:
+      summary: Get admin configuration
+      tags: [Admin]
+      responses:
+        '200':
+          description: Current configuration (secrets redacted)
+        '403':
+          description: Admin role required
+    put:
+      summary: Update admin configuration
+      tags: [Admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                runtime:
+                  type: object
+                token:
+                  type: object
+                s3:
+                  type: object
+                alert:
+                  type: object
+                oidc:
+                  type: object
+      responses:
+        '200':
+          description: Configuration updated
+        '403':
+          description: Admin role required
+
+  /projects:
+    get:
+      summary: List all projects
+      tags: [Projects]
+      responses:
+        '200':
+          description: Project list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Project' }
+    post:
+      summary: Create a project
+      tags: [Projects]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 256 }
+                description: { type: string, maxLength: 4096 }
+      responses:
+        '201':
+          description: Project created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+
+  /projects/{id}:
+    get:
+      summary: Get a project
+      tags: [Projects]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Project details
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '404':
+          description: Project not found
+
+  /projects/{id}/requirements:
+    get:
+      summary: List requirements
+      tags: [Requirements]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Requirements list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Requirement' }
+    post:
+      summary: Add a requirement
+      tags: [Requirements]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, content]
+              properties:
+                title: { type: string, maxLength: 512 }
+                content: { type: string, maxLength: 65536 }
+                constraints: { type: array, items: { type: string } }
+                acceptanceHints: { type: array, items: { type: string } }
+      responses:
+        '201':
+          description: Requirement added
+
+  /projects/{id}/plan:
+    post:
+      summary: Generate a plan
+      tags: [Plans]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '201':
+          description: Plan generated
+
+  /projects/{id}/contracts/generate:
+    post:
+      summary: Generate contracts
+      tags: [Contracts]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '201':
+          description: Contracts generated
+
+  /projects/{id}/contracts:
+    get:
+      summary: List contracts
+      tags: [Contracts]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Contracts list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Contract' }
+
+  /projects/{id}/tasks:
+    get:
+      summary: List tasks
+      tags: [Tasks]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Tasks list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Task' }
+
+  /projects/{id}/tasks/dispatch:
+    post:
+      summary: Dispatch tasks
+      tags: [Tasks]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '201':
+          description: Tasks dispatched
+
+  /projects/{id}/tasks/run:
+    post:
+      summary: Start a run
+      tags: [Runs]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                taskId: { type: string }
+      responses:
+        '202':
+          description: Run started
+
+  /projects/{id}/runs/parallel:
+    post:
+      summary: Start parallel runs
+      tags: [Runs]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '202':
+          description: Parallel runs started
+
+  /projects/{id}/runs/{runId}/status:
+    get:
+      summary: Get run status
+      tags: [Runs]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Run status
+
+  /projects/{id}/overrides:
+    post:
+      summary: Apply human override
+      tags: [HITL]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [taskId, instruction]
+              properties:
+                taskId: { type: string }
+                instruction: { type: string, maxLength: 8192 }
+                operator: { type: string }
+                lockScope: { type: string }
+      responses:
+        '200':
+          description: Override applied
+        '409':
+          description: Conflict
+
+  /projects/{id}/locks:
+    post:
+      summary: Apply code lock
+      tags: [HITL]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, content, createdBy]
+              properties:
+                path: { type: string, maxLength: 1024 }
+                content: { type: string, maxLength: 65536 }
+                createdBy: { type: string }
+                lockMode: { type: string }
+      responses:
+        '201':
+          description: Lock applied
+
+  /projects/{id}/conflicts:
+    get:
+      summary: List conflicts
+      tags: [HITL]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Conflicts list
+
+  /projects/{id}/conflicts/{conflictId}/resolve:
+    post:
+      summary: Resolve a conflict
+      tags: [HITL]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: conflictId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resolution]
+              properties:
+                resolution: { type: string }
+                note: { type: string }
+      responses:
+        '200':
+          description: Conflict resolved
+
+  /projects/{id}/shared-sandbox/merge:
+    post:
+      summary: Merge to shared sandbox
+      tags: [Sandbox]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Sandbox merged
+
+  /projects/{id}/workspaces/cleanup:
+    post:
+      summary: Cleanup workspaces
+      tags: [Workspace]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Cleanup completed
+
+  /projects/{id}/workspaces/rebase:
+    post:
+      summary: Rebase workspaces
+      tags: [Workspace]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Rebase completed
+
+  /projects/{id}/snapshots:
+    get:
+      summary: List snapshots
+      tags: [Snapshots]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Snapshots list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Snapshot' }
+
+  /projects/{id}/snapshots/rollback:
+    post:
+      summary: Rollback to snapshot
+      tags: [Snapshots]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Rollback completed
+
+  /projects/{id}/token-costs:
+    get:
+      summary: Get token costs
+      tags: [Observability]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Token costs
+
+  /projects/{id}/alerts:
+    get:
+      summary: List alerts
+      tags: [Observability]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Alerts list
+
+  /projects/{id}/audit-logs:
+    get:
+      summary: List audit logs
+      tags: [Observability]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Audit logs
+
+  /projects/{id}/communications:
+    get:
+      summary: List communications
+      tags: [Observability]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Communications
+
+  /projects/{id}/sandboxes:
+    get:
+      summary: List sandboxes
+      tags: [Observability]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Sandboxes
+
+  /projects/{id}/delivery/export:
+    post:
+      summary: Export delivery bundle
+      tags: [Delivery]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                runId: { type: string }
+      responses:
+        '200':
+          description: Delivery exported
+
+  /projects/{id}/artifacts/{artifactId}/download:
+    get:
+      summary: Download artifact
+      tags: [Delivery]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: artifactId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Artifact file
+
+  /status/matrix:
+    get:
+      summary: Get status matrix
+      tags: [Observability]
+      parameters:
+        - name: projectId
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Status matrix
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatusMatrix' }
+
+  /status/stream:
+    get:
+      summary: SSE status stream
+      tags: [Observability]
+      responses:
+        '200':
+          description: Server-Sent Events stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+  /migrations/status:
+    get:
+      summary: Get migration status
+      tags: [Admin]
+      responses:
+        '200':
+          description: Migration status
+
+  /auth/oidc/callback:
+    get:
+      summary: OIDC callback
+      tags: [Auth]
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OIDC authenticated

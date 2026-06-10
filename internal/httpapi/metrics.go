@@ -2,17 +2,23 @@ package httpapi
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
+
+// Histogram buckets in seconds.
+var defaultBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
 // MetricsCollector collects and exposes Prometheus-compatible metrics.
 type MetricsCollector struct {
 	mu sync.RWMutex
 
 	// HTTP metrics
-	httpRequestsTotal   map[string]int64 // method+path -> count
-	httpRequestDuration map[string][]time.Duration
+	httpRequestsTotal    map[string]int64         // method+path+status -> count
+	httpRequestDuration  map[string][]time.Duration // for avg calculation
+	httpRequestHistogram map[string]map[float64]int64 // method+path -> bucket -> count
 
 	// Business metrics
 	projectsCreated   int64
@@ -27,26 +33,43 @@ type MetricsCollector struct {
 	llmRequestsTotal   map[string]int64 // provider -> count
 	llmTokensTotal     map[string]int64 // provider -> tokens
 	llmErrorsTotal     map[string]int64 // provider -> count
+	llmDurationTotal   map[string]time.Duration // provider -> total duration
 }
 
 // NewMetricsCollector creates a new metrics collector.
 func NewMetricsCollector() *MetricsCollector {
 	return &MetricsCollector{
-		httpRequestsTotal:   make(map[string]int64),
-		httpRequestDuration: make(map[string][]time.Duration),
-		llmRequestsTotal:    make(map[string]int64),
-		llmTokensTotal:      make(map[string]int64),
-		llmErrorsTotal:      make(map[string]int64),
+		httpRequestsTotal:    make(map[string]int64),
+		httpRequestDuration:  make(map[string][]time.Duration),
+		httpRequestHistogram: make(map[string]map[float64]int64),
+		llmRequestsTotal:     make(map[string]int64),
+		llmTokensTotal:       make(map[string]int64),
+		llmErrorsTotal:       make(map[string]int64),
+		llmDurationTotal:     make(map[string]time.Duration),
 	}
 }
 
-// RecordHTTPRequest records an HTTP request metric.
+// RecordHTTPRequest records an HTTP request metric with histogram bucket.
 func (m *MetricsCollector) RecordHTTPRequest(method, path string, status int, duration time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	key := fmt.Sprintf("%s %s %d", method, path, status)
 	m.httpRequestsTotal[key]++
 	m.httpRequestDuration[key] = append(m.httpRequestDuration[key], duration)
+
+	// Record histogram bucket.
+	histKey := fmt.Sprintf("%s %s", method, path)
+	if m.httpRequestHistogram[histKey] == nil {
+		m.httpRequestHistogram[histKey] = make(map[float64]int64)
+	}
+	secs := duration.Seconds()
+	for _, bucket := range defaultBuckets {
+		if secs <= bucket {
+			m.httpRequestHistogram[histKey][bucket]++
+		}
+	}
+	m.httpRequestHistogram[histKey][float64(0)]++ // +Inf bucket (total)
 }
 
 // IncProjectsCreated increments the projects created counter.
@@ -99,11 +122,12 @@ func (m *MetricsCollector) IncConflictsResolved() {
 }
 
 // RecordLLMRequest records an LLM request metric.
-func (m *MetricsCollector) RecordLLMRequest(provider string, tokens int, err bool) {
+func (m *MetricsCollector) RecordLLMRequest(provider string, tokens int, duration time.Duration, err bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.llmRequestsTotal[provider]++
 	m.llmTokensTotal[provider] += int64(tokens)
+	m.llmDurationTotal[provider] += duration
 	if err {
 		m.llmErrorsTotal[provider]++
 	}
@@ -114,76 +138,108 @@ func (m *MetricsCollector) RenderPrometheus() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var out string
+	var out strings.Builder
 
-	// HTTP metrics
-	out += "# HELP http_requests_total Total HTTP requests\n"
-	out += "# TYPE http_requests_total counter\n"
+	// HTTP request total counter.
+	out.WriteString("# HELP http_requests_total Total HTTP requests\n")
+	out.WriteString("# TYPE http_requests_total counter\n")
 	for key, count := range m.httpRequestsTotal {
-		out += fmt.Sprintf("http_requests_total{request=\"%s\"} %d\n", key, count)
+		fmt.Fprintf(&out, "http_requests_total{request=\"%s\"} %d\n", key, count)
 	}
 
-	out += "# HELP http_request_duration_seconds HTTP request duration\n"
-	out += "# TYPE http_request_duration_seconds summary\n"
-	for key, durations := range m.httpRequestDuration {
-		if len(durations) == 0 {
-			continue
+	// HTTP request duration histogram.
+	out.WriteString("# HELP http_request_duration_seconds HTTP request duration histogram\n")
+	out.WriteString("# TYPE http_request_duration_seconds histogram\n")
+	// Sort keys for stable output.
+	histKeys := make([]string, 0, len(m.httpRequestHistogram))
+	for k := range m.httpRequestHistogram {
+		histKeys = append(histKeys, k)
+	}
+	sort.Strings(histKeys)
+	for _, key := range histKeys {
+		buckets := m.httpRequestHistogram[key]
+		var cumulative int64
+		bucketNums := make([]float64, 0, len(buckets))
+		for b := range buckets {
+			bucketNums = append(bucketNums, b)
 		}
-		var total time.Duration
+		sort.Float64s(bucketNums)
+		for _, bucket := range bucketNums {
+			if bucket == 0 {
+				continue // skip the +Inf accumulator for now
+			}
+			cumulative += buckets[bucket]
+			fmt.Fprintf(&out, "http_request_duration_seconds_bucket{request=\"%s\",le=\"%.3f\"} %d\n", key, bucket, cumulative)
+		}
+		total := buckets[0] // +Inf
+		if total == 0 {
+			total = cumulative
+		}
+		fmt.Fprintf(&out, "http_request_duration_seconds_bucket{request=\"%s\",le=\"+Inf\"} %d\n", key, total)
+		fmt.Fprintf(&out, "http_request_duration_seconds_count{request=\"%s\"} %d\n", key, total)
+
+		// Calculate sum.
+		durations := m.httpRequestDuration[key]
+		var sum float64
 		for _, d := range durations {
-			total += d
+			sum += d.Seconds()
 		}
-		avg := total.Seconds() / float64(len(durations))
-		out += fmt.Sprintf("http_request_duration_seconds{request=\"%s\"} %.6f\n", key, avg)
+		fmt.Fprintf(&out, "http_request_duration_seconds_sum{request=\"%s\"} %.6f\n", key, sum)
 	}
 
-	// Business metrics
-	out += "# HELP projects_created_total Total projects created\n"
-	out += "# TYPE projects_created_total counter\n"
-	out += fmt.Sprintf("projects_created_total %d\n", m.projectsCreated)
+	// Business counters.
+	out.WriteString("# HELP projects_created_total Total projects created\n")
+	out.WriteString("# TYPE projects_created_total counter\n")
+	fmt.Fprintf(&out, "projects_created_total %d\n", m.projectsCreated)
 
-	out += "# HELP tasks_dispatched_total Total tasks dispatched\n"
-	out += "# TYPE tasks_dispatched_total counter\n"
-	out += fmt.Sprintf("tasks_dispatched_total %d\n", m.tasksDispatched)
+	out.WriteString("# HELP tasks_dispatched_total Total tasks dispatched\n")
+	out.WriteString("# TYPE tasks_dispatched_total counter\n")
+	fmt.Fprintf(&out, "tasks_dispatched_total %d\n", m.tasksDispatched)
 
-	out += "# HELP agent_runs_started_total Total agent runs started\n"
-	out += "# TYPE agent_runs_started_total counter\n"
-	out += fmt.Sprintf("agent_runs_started_total %d\n", m.runsStarted)
+	out.WriteString("# HELP agent_runs_started_total Total agent runs started\n")
+	out.WriteString("# TYPE agent_runs_started_total counter\n")
+	fmt.Fprintf(&out, "agent_runs_started_total %d\n", m.runsStarted)
 
-	out += "# HELP agent_runs_completed_total Total agent runs completed\n"
-	out += "# TYPE agent_runs_completed_total counter\n"
-	out += fmt.Sprintf("agent_runs_completed_total %d\n", m.runsCompleted)
+	out.WriteString("# HELP agent_runs_completed_total Total agent runs completed\n")
+	out.WriteString("# TYPE agent_runs_completed_total counter\n")
+	fmt.Fprintf(&out, "agent_runs_completed_total %d\n", m.runsCompleted)
 
-	out += "# HELP agent_runs_failed_total Total agent runs failed\n"
-	out += "# TYPE agent_runs_failed_total counter\n"
-	out += fmt.Sprintf("agent_runs_failed_total %d\n", m.runsFailed)
+	out.WriteString("# HELP agent_runs_failed_total Total agent runs failed\n")
+	out.WriteString("# TYPE agent_runs_failed_total counter\n")
+	fmt.Fprintf(&out, "agent_runs_failed_total %d\n", m.runsFailed)
 
-	out += "# HELP overrides_applied_total Total human overrides applied\n"
-	out += "# TYPE overrides_applied_total counter\n"
-	out += fmt.Sprintf("overrides_applied_total %d\n", m.overridesApplied)
+	out.WriteString("# HELP overrides_applied_total Total human overrides applied\n")
+	out.WriteString("# TYPE overrides_applied_total counter\n")
+	fmt.Fprintf(&out, "overrides_applied_total %d\n", m.overridesApplied)
 
-	out += "# HELP conflicts_resolved_total Total conflicts resolved\n"
-	out += "# TYPE conflicts_resolved_total counter\n"
-	out += fmt.Sprintf("conflicts_resolved_total %d\n", m.conflictsResolved)
+	out.WriteString("# HELP conflicts_resolved_total Total conflicts resolved\n")
+	out.WriteString("# TYPE conflicts_resolved_total counter\n")
+	fmt.Fprintf(&out, "conflicts_resolved_total %d\n", m.conflictsResolved)
 
-	// LLM metrics
-	out += "# HELP llm_requests_total Total LLM requests by provider\n"
-	out += "# TYPE llm_requests_total counter\n"
+	// LLM metrics.
+	out.WriteString("# HELP llm_requests_total Total LLM requests by provider\n")
+	out.WriteString("# TYPE llm_requests_total counter\n")
 	for provider, count := range m.llmRequestsTotal {
-		out += fmt.Sprintf("llm_requests_total{provider=\"%s\"} %d\n", provider, count)
+		fmt.Fprintf(&out, "llm_requests_total{provider=\"%s\"} %d\n", provider, count)
 	}
 
-	out += "# HELP llm_tokens_total Total LLM tokens by provider\n"
-	out += "# TYPE llm_tokens_total counter\n"
+	out.WriteString("# HELP llm_tokens_total Total LLM tokens by provider\n")
+	out.WriteString("# TYPE llm_tokens_total counter\n")
 	for provider, tokens := range m.llmTokensTotal {
-		out += fmt.Sprintf("llm_tokens_total{provider=\"%s\"} %d\n", provider, tokens)
+		fmt.Fprintf(&out, "llm_tokens_total{provider=\"%s\"} %d\n", provider, tokens)
 	}
 
-	out += "# HELP llm_errors_total Total LLM errors by provider\n"
-	out += "# TYPE llm_errors_total counter\n"
+	out.WriteString("# HELP llm_errors_total Total LLM errors by provider\n")
+	out.WriteString("# TYPE llm_errors_total counter\n")
 	for provider, count := range m.llmErrorsTotal {
-		out += fmt.Sprintf("llm_errors_total{provider=\"%s\"} %d\n", provider, count)
+		fmt.Fprintf(&out, "llm_errors_total{provider=\"%s\"} %d\n", provider, count)
 	}
 
-	return out
+	out.WriteString("# HELP llm_duration_seconds_total Total LLM request duration by provider\n")
+	out.WriteString("# TYPE llm_duration_seconds_total counter\n")
+	for provider, duration := range m.llmDurationTotal {
+		fmt.Fprintf(&out, "llm_duration_seconds_total{provider=\"%s\"} %.6f\n", provider, duration.Seconds())
+	}
+
+	return out.String()
 }

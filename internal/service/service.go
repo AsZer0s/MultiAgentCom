@@ -2639,6 +2639,29 @@ func (s *Service) MergeToSharedSandbox(ctx context.Context, projectID string, in
 	return result, nil
 }
 
+// CleanupOnShutdown performs cleanup tasks before server shutdown.
+func (s *Service) CleanupOnShutdown(ctx context.Context) error {
+	s.mu.RLock()
+	projectIDs := make([]string, 0, len(s.projects))
+	for id := range s.projects {
+		projectIDs = append(projectIDs, id)
+	}
+	s.mu.RUnlock()
+
+	var lastErr error
+	for _, pid := range projectIDs {
+		_, err := s.CleanupWorkspaces(ctx, pid, CleanupWorkspacesInput{
+			Scope:         "ALL",
+			IncludeFailed: true,
+		})
+		if err != nil {
+			s.logger.Warn("cleanup on shutdown failed for project", "projectId", pid, "error", err)
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
 func (s *Service) CleanupWorkspaces(ctx context.Context, projectID string, input CleanupWorkspacesInput) (*CleanupWorkspacesResult, error) {
 	if err := s.acquireAdvisoryProjectLock(ctx, projectID); err != nil {
 		return nil, err

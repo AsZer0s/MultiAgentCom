@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multiagentcom-config
+  namespace: multiagentcom
+data:
+  MULTI_AGENT_ADDR: ":8080"
+  MULTI_AGENT_SERVICE_NAME: "multiagentcom-api"
+  MULTI_AGENT_STORE_PROVIDER: "postgres"
+  MULTI_AGENT_POSTGRES_DSN: "postgres://multiagentcom:multiagentcom@postgres:5432/multiagentcom?sslmode=disable"
+  MULTI_AGENT_RUNTIME_PROVIDER: "local"
+  MULTI_AGENT_WORKSPACE_PROVIDER: "directory"
+  MULTI_AGENT_ARTIFACT_STORE_PROVIDER: "filesystem"
+  MULTI_AGENT_MIGRATIONS_DIR: "/app/migrations"

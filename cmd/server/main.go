@@ -49,6 +49,11 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Cleanup sandboxes before shutdown.
+	if err := svc.CleanupOnShutdown(shutdownCtx); err != nil {
+		logger.Warn("sandbox cleanup on shutdown failed", "error", err)
+	}
+
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown failed", "error", err)
 		os.Exit(1)

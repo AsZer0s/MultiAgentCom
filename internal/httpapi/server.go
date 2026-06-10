@@ -1490,6 +1490,9 @@ func authMiddleware(cfg config.Config) func(http.Handler) http.Handler {
 			}
 			if token == "" {
 				token = strings.TrimSpace(r.URL.Query().Get("token"))
+				if token != "" {
+					w.Header().Set("X-Deprecation-Warning", "Token via query string is deprecated. Use Authorization header instead.")
+				}
 			}
 			principal, ok := authenticator.Authenticate(token, time.Now().UTC())
 			if !ok {
