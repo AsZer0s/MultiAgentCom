@@ -64,17 +64,22 @@ func (m *MetricsCollector) RecordHTTPRequest(method, path string, status int, du
 	m.httpRequestSum[histKey] += duration.Seconds()
 	m.httpRequestCount[histKey]++
 
-	// Record histogram bucket.
+	// Record histogram bucket - store in the smallest matching bucket.
 	if m.httpRequestHistogram[histKey] == nil {
 		m.httpRequestHistogram[histKey] = make(map[float64]int64)
 	}
 	secs := duration.Seconds()
+	recorded := false
 	for _, bucket := range defaultBuckets {
 		if secs <= bucket {
 			m.httpRequestHistogram[histKey][bucket]++
+			recorded = true
+			break
 		}
 	}
-	m.httpRequestHistogram[histKey][0]++ // +Inf bucket (total)
+	if !recorded {
+		m.httpRequestHistogram[histKey][0]++ // overflow bucket
+	}
 }
 
 // IncProjectsCreated increments the projects created counter.
@@ -162,23 +167,18 @@ func (m *MetricsCollector) RenderPrometheus() string {
 	sort.Strings(histKeys)
 	for _, key := range histKeys {
 		buckets := m.httpRequestHistogram[key]
-		var cumulative int64
-		bucketNums := make([]float64, 0, len(buckets))
-		for b := range buckets {
+		bucketNums := make([]float64, 0, len(defaultBuckets)+1)
+		for _, b := range defaultBuckets {
 			bucketNums = append(bucketNums, b)
 		}
-		sort.Float64s(bucketNums)
+		var total int64
+		var cumulative int64
 		for _, bucket := range bucketNums {
-			if bucket == 0 {
-				continue
-			}
 			cumulative += buckets[bucket]
 			fmt.Fprintf(&out, "http_request_duration_seconds_bucket{request=\"%s\",le=\"%.3f\"} %d\n", key, bucket, cumulative)
 		}
-		total := buckets[0]
-		if total == 0 {
-			total = cumulative
-		}
+		overflow := buckets[0]
+		total = cumulative + overflow
 		fmt.Fprintf(&out, "http_request_duration_seconds_bucket{request=\"%s\",le=\"+Inf\"} %d\n", key, total)
 		fmt.Fprintf(&out, "http_request_duration_seconds_count{request=\"%s\"} %d\n", key, total)
 		fmt.Fprintf(&out, "http_request_duration_seconds_sum{request=\"%s\"} %.6f\n", key, m.httpRequestSum[key])
