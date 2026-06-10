@@ -5366,7 +5366,10 @@ func (s *Service) notifyAlertAsync(alert *domain.Alert) {
 			return
 		}
 
-		req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewReader(payload))
+		webhookCtx, webhookCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer webhookCancel()
+
+		req, err := http.NewRequestWithContext(webhookCtx, http.MethodPost, webhookURL, bytes.NewReader(payload))
 		if err != nil {
 			logger.Error("alert webhook request failed", "error", err, "alertId", alert.ID)
 			return
