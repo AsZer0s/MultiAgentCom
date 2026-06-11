@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { setAuthToken, api } from '@/api/client'
+import { api } from '@/api/client'
+import { useAuth } from '@/composables/useAuth'
 
 const router = useRouter()
+const { login: authLogin } = useAuth()
+
 const token = ref('')
 const error = ref('')
 const loading = ref(false)
@@ -11,17 +14,24 @@ const showOIDC = computed(() => !!import.meta.env.VITE_OIDC_AUTH_URL)
 const oidcURL = computed(() => (import.meta.env.VITE_OIDC_AUTH_URL as string) || '')
 
 async function login() {
+  if (!token.value.trim()) {
+    error.value = 'Please enter your API token'
+    return
+  }
   loading.value = true
   error.value = ''
   try {
+    // Verify token works by calling health endpoint
+    const { setAuthToken } = await import('@/api/client')
     setAuthToken(token.value)
-    localStorage.setItem('auth_token', token.value)
     await api.health()
+    // Token is valid, save it
+    authLogin(token.value, 'user')
     router.push('/')
   } catch (e: any) {
     error.value = e.message || 'Authentication failed'
+    const { setAuthToken } = await import('@/api/client')
     setAuthToken('')
-    localStorage.removeItem('auth_token')
   } finally {
     loading.value = false
   }
@@ -43,7 +53,7 @@ function oidcLogin() {
       <form @submit.prevent="login" class="login-form">
         <div class="form-group">
           <label class="form-label">API Token</label>
-          <input v-model="token" type="password" class="form-input" placeholder="Enter your API token" />
+          <input v-model="token" type="password" class="form-input" placeholder="Enter your API token" autofocus />
         </div>
         <button type="submit" class="btn btn-primary login-btn" :disabled="loading">
           <span v-if="loading" class="spinner"></span>

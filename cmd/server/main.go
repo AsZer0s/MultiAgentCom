@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +21,21 @@ import (
 func main() {
 	cfg := config.Load()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// Auto-generate API token if none is configured.
+	if strings.TrimSpace(cfg.APIToken) == "" && strings.TrimSpace(cfg.AuthTokens) == "" && strings.TrimSpace(cfg.AuthTokensFile) == "" {
+		token, err := generateSecureToken(16) // 128-bit token
+		if err != nil {
+			logger.Error("failed to generate API token", "error", err)
+			os.Exit(1)
+		}
+		cfg.APIToken = token
+		logger.Info("═══════════════════════════════════════════════════════════════")
+		logger.Info("  Auto-generated API Token (save this, it won't be shown again)")
+		logger.Info(fmt.Sprintf("  Token: %s", token))
+		logger.Info("═══════════════════════════════════════════════════════════════")
+	}
+
 	if err := config.Validate(cfg); err != nil {
 		logger.Error("invalid configuration", "error", err, "issues", config.ValidationIssues(err))
 		os.Exit(1)
@@ -60,4 +79,13 @@ func main() {
 	}
 
 	logger.Info("server stopped")
+}
+
+// generateSecureToken generates a cryptographically secure random token.
+func generateSecureToken(bytes int) (string, error) {
+	b := make([]byte, bytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
