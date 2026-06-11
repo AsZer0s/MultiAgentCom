@@ -228,17 +228,25 @@ SERVER_PID="$!"
 
 wait_health "$BASE_URL" "multiagentcom-api"
 
+# Extract auto-generated token from server logs
+AUTO_TOKEN="$(grep -oP 'Token:\s*\K[a-f0-9]+' "$LOG_FILE" 2>/dev/null | head -1 || true)"
+if [[ -n "$AUTO_TOKEN" ]]; then
+  echo "Extracted auto-generated token: ${AUTO_TOKEN:0:8}..."
+  API_TOKEN="$AUTO_TOKEN"
+  export API_TOKEN
+fi
+
 echo
 echo "== status stream smoke verification =="
-BASE_URL="$BASE_URL" bash "$ROOT_DIR/scripts/status-stream-smoke.sh"
+BASE_URL="$BASE_URL" API_TOKEN="${API_TOKEN:-}" bash "$ROOT_DIR/scripts/status-stream-smoke.sh"
 
 echo
 echo "== end-to-end demo and delivery gate verification =="
-RUNS="$DEMO_RUNS" BASE_URL="$BASE_URL" ARTIFACT_DIR="${TMPDIR:-/tmp}/multiagentcom-release-artifacts" bash "$ROOT_DIR/scripts/demo.sh"
+RUNS="$DEMO_RUNS" BASE_URL="$BASE_URL" API_TOKEN="${API_TOKEN:-}" ARTIFACT_DIR="${TMPDIR:-/tmp}/multiagentcom-release-artifacts" bash "$ROOT_DIR/scripts/demo.sh"
 
 echo
 echo "== alert webhook smoke verification =="
-BASE_URL="$BASE_URL" ALERT_WEBHOOK_LOG="$ALERT_WEBHOOK_LOG" bash "$ROOT_DIR/scripts/alert-smoke.sh"
+BASE_URL="$BASE_URL" API_TOKEN="${API_TOKEN:-}" ALERT_WEBHOOK_LOG="$ALERT_WEBHOOK_LOG" bash "$ROOT_DIR/scripts/alert-smoke.sh"
 
 echo
 echo "== file-store restart smoke verification =="

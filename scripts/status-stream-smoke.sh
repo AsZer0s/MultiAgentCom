@@ -38,6 +38,14 @@ wait_for_health() {
   return 1
 }
 
+# Extract auto-generated token from server logs
+extract_token_from_log() {
+  local log_file="$1"
+  if [[ -f "$log_file" ]]; then
+    grep -oP 'Token:\s*\K[a-f0-9]+' "$log_file" 2>/dev/null | head -1 || true
+  fi
+}
+
 if curl -sS "$BASE_URL/health" >/dev/null 2>&1; then
   echo "Using existing server at $BASE_URL"
 else
@@ -50,6 +58,14 @@ else
       tail -n 50 "$LOG_FILE" >&2
     fi
     exit 1
+  fi
+
+  # If no API_TOKEN provided, try to extract from server logs
+  if [[ -z "$API_TOKEN" ]]; then
+    API_TOKEN="$(extract_token_from_log "$LOG_FILE")"
+    if [[ -n "$API_TOKEN" ]]; then
+      echo "Extracted auto-generated token from server logs"
+    fi
   fi
 fi
 
