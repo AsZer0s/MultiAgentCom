@@ -3,9 +3,11 @@ import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import { useAuth } from '@/composables/useAuth'
+import { useI18n } from '@/i18n'
 
 const router = useRouter()
 const { login: authLogin } = useAuth()
+const { t } = useI18n()
 
 const token = ref('')
 const error = ref('')
@@ -15,21 +17,19 @@ const oidcURL = computed(() => (import.meta.env.VITE_OIDC_AUTH_URL as string) ||
 
 async function login() {
   if (!token.value.trim()) {
-    error.value = 'Please enter your API token'
+    error.value = t('auth.loginRequired')
     return
   }
   loading.value = true
   error.value = ''
   try {
-    // Verify token works by calling health endpoint
     const { setAuthToken } = await import('@/api/client')
     setAuthToken(token.value)
     await api.health()
-    // Token is valid, save it
     authLogin(token.value, 'user')
     router.push('/')
   } catch (e: any) {
-    error.value = e.message || 'Authentication failed'
+    error.value = e.message || t('auth.loginFailed')
     const { setAuthToken } = await import('@/api/client')
     setAuthToken('')
   } finally {
@@ -47,26 +47,26 @@ function oidcLogin() {
 <template>
   <div class="login-page">
     <div class="card login-card">
-      <h1 class="login-title">MultiAgentCom</h1>
-      <p class="login-subtitle">Multi-Agent Development Platform</p>
+      <h1 class="login-title">{{ t('auth.loginTitle') }}</h1>
+      <p class="login-subtitle">{{ t('auth.loginSubtitle') }}</p>
 
       <form @submit.prevent="login" class="login-form">
         <div class="form-group">
-          <label class="form-label">API Token</label>
-          <input v-model="token" type="password" class="form-input" placeholder="Enter your API token" autofocus />
+          <label class="form-label">{{ t('auth.apiToken') }}</label>
+          <input v-model="token" type="password" class="form-input" :placeholder="t('auth.apiTokenPlaceholder')" autofocus />
         </div>
         <button type="submit" class="btn btn-primary login-btn" :disabled="loading">
           <span v-if="loading" class="spinner"></span>
-          {{ loading ? 'Signing in...' : 'Sign In' }}
+          {{ loading ? t('auth.signingIn') : t('auth.signIn') }}
         </button>
         <p v-if="error" class="login-error">{{ error }}</p>
       </form>
 
       <div v-if="showOIDC" class="login-divider">
-        <span>or</span>
+        <span>{{ t('auth.or') }}</span>
       </div>
       <button v-if="showOIDC" class="btn oidc-btn" @click="oidcLogin">
-        Sign in with SSO
+        {{ t('auth.ssoLogin') }}
       </button>
     </div>
   </div>

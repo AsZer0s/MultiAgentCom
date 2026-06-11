@@ -2,7 +2,9 @@
 import { ref, onMounted } from 'vue'
 import { api, type StatusMatrixAgent, type LLMProvider } from '@/api/client'
 import { useSSE } from '@/composables/useSSE'
+import { useI18n } from '@/i18n'
 
+const { t } = useI18n()
 const agents = ref<StatusMatrixAgent[]>([])
 const providers = ref<LLMProvider[]>([])
 const activeProvider = ref('')
@@ -34,19 +36,19 @@ onMounted(loadMatrix)
 <template>
   <div>
     <div class="page-header">
-      <h1 class="page-title">Dashboard</h1>
+      <h1 class="page-title">{{ t('dashboard.title') }}</h1>
       <div class="sse-indicator">
         <span class="sse-dot" :class="connected ? 'connected' : 'disconnected'"></span>
-        {{ connected ? 'Live' : 'Offline' }}
+        {{ connected ? t('common.live') : t('common.offline') }}
       </div>
     </div>
 
     <div v-if="loading" class="loading-state">
-      <span class="spinner"></span> Loading...
+      <span class="spinner"></span> {{ t('common.loading') }}
     </div>
 
     <div v-else-if="error" class="card">
-      <p style="color: var(--danger)">Failed to load: {{ error }}</p>
+      <p style="color: var(--danger)">{{ error }}</p>
     </div>
 
     <div v-else class="grid grid-3">
@@ -58,41 +60,41 @@ onMounted(loadMatrix)
         <div class="grid grid-3" style="gap: 8px;">
           <div class="stat">
             <div class="stat-value">{{ agent.doneTasks }}</div>
-            <div class="stat-label">Done</div>
+            <div class="stat-label">{{ t('taskStatus.done') }}</div>
           </div>
           <div class="stat">
             <div class="stat-value">{{ agent.runningTasks }}</div>
-            <div class="stat-label">Running</div>
+            <div class="stat-label">{{ t('taskStatus.inProgress') }}</div>
           </div>
           <div class="stat">
             <div class="stat-value">{{ agent.failedTasks }}</div>
-            <div class="stat-label">Failed</div>
+            <div class="stat-label">{{ t('taskStatus.failed') }}</div>
           </div>
         </div>
         <div style="margin-top: 12px; font-size: 12px; color: var(--text-secondary);">
-          Total: {{ agent.totalTasks }} tasks
+          {{ t('common.total') }}: {{ agent.totalTasks }} {{ t('statusPanel.tasks') }}
         </div>
       </div>
     </div>
 
     <div v-if="!loading && agents.length === 0" class="card" style="text-align: center; padding: 40px;">
-      <p style="color: var(--text-secondary);">No agents registered. Create a project to get started.</p>
-      <router-link to="/projects" class="btn btn-primary" style="margin-top: 16px;">Create Project</router-link>
+      <p style="color: var(--text-secondary);">{{ t('dashboard.noAgents') }}</p>
+      <router-link to="/projects" class="btn btn-primary" style="margin-top: 16px;">{{ t('dashboard.createProject') }}</router-link>
     </div>
 
     <div class="card" style="margin-top: 24px;">
-      <div class="card-title">LLM Providers</div>
+      <div class="card-title">{{ t('dashboard.llmProviders') }}</div>
       <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 16px;">
-        Active: <strong>{{ activeProvider || 'none' }}</strong> — Configure via environment variables and restart server to switch.
+        {{ t('settings.activeProvider') }}: <strong>{{ activeProvider || 'none' }}</strong> — {{ t('dashboard.llmConfigHint') }}
       </p>
       <div class="grid grid-4">
         <div v-for="p in providers" :key="p.id" class="provider-card" :class="{ active: p.active, unavailable: !p.available }">
           <div class="provider-name">{{ p.name }}</div>
           <div class="provider-model" v-if="p.model">{{ p.model }}</div>
           <div class="provider-status">
-            <span v-if="p.active" class="pill pill-done">Active</span>
-            <span v-else-if="p.available" class="pill pill-created">Available</span>
-            <span v-else class="pill pill-failed">Not Configured</span>
+            <span v-if="p.active" class="pill pill-done">{{ t('dashboard.active') }}</span>
+            <span v-else-if="p.available" class="pill pill-created">{{ t('dashboard.available') }}</span>
+            <span v-else class="pill pill-failed">{{ t('dashboard.notConfigured') }}</span>
           </div>
         </div>
       </div>

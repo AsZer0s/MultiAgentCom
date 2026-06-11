@@ -2,8 +2,10 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, type Project } from '@/api/client'
+import { useI18n } from '@/i18n'
 
 const router = useRouter()
+const { t } = useI18n()
 const projects = ref<Project[]>([])
 const loading = ref(true)
 const showCreate = ref(false)
@@ -33,7 +35,7 @@ async function createProject() {
     newDesc.value = ''
     router.push(`/projects/${project.id}`)
   } catch (e: any) {
-    alert('Failed to create project: ' + e.message)
+    alert(t('projects.createFailed') + ': ' + e.message)
   } finally {
     creating.value = false
   }
@@ -45,36 +47,36 @@ onMounted(loadProjects)
 <template>
   <div>
     <div class="page-header">
-      <h1 class="page-title">Projects</h1>
-      <button class="btn btn-primary" @click="showCreate = true">New Project</button>
+      <h1 class="page-title">{{ t('projects.title') }}</h1>
+      <button class="btn btn-primary" @click="showCreate = true">{{ t('projects.newProject') }}</button>
     </div>
 
     <div v-if="showCreate" class="card" style="margin-bottom: 24px;">
-      <div class="card-title">Create Project</div>
+      <div class="card-title">{{ t('projects.createProject') }}</div>
       <div class="form-group">
-        <label class="form-label">Name</label>
-        <input v-model="newName" class="form-input" placeholder="My Project" />
+        <label class="form-label">{{ t('projects.projectName') }}</label>
+        <input v-model="newName" class="form-input" :placeholder="t('projects.projectNamePlaceholder')" />
       </div>
       <div class="form-group">
-        <label class="form-label">Description</label>
-        <textarea v-model="newDesc" class="form-textarea" placeholder="Optional description..."></textarea>
+        <label class="form-label">{{ t('projects.projectDescription') }}</label>
+        <textarea v-model="newDesc" class="form-textarea" :placeholder="t('projects.projectDescriptionPlaceholder')"></textarea>
       </div>
       <div style="display: flex; gap: 8px;">
         <button class="btn btn-primary" @click="createProject" :disabled="creating">
-          {{ creating ? 'Creating...' : 'Create' }}
+          {{ creating ? t('projects.creating') : t('common.create') }}
         </button>
-        <button class="btn" @click="showCreate = false">Cancel</button>
+        <button class="btn" @click="showCreate = false">{{ t('common.cancel') }}</button>
       </div>
     </div>
 
     <div v-if="projects.length === 0 && !loading" class="card" style="text-align: center; padding: 40px;">
-      <p style="color: var(--text-secondary);">No projects yet. Create your first project to start.</p>
+      <p style="color: var(--text-secondary);">{{ t('projects.noProjects') }}</p>
     </div>
 
     <div v-else class="grid grid-3">
       <div v-for="project in projects" :key="project.id" class="card" style="cursor: pointer;" @click="router.push(`/projects/${project.id}`)">
         <div class="card-title">{{ project.name }}</div>
-        <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 12px;">{{ project.description || 'No description' }}</p>
+        <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 12px;">{{ project.description || t('common.noData') }}</p>
         <div style="font-size: 12px; color: var(--text-secondary);">{{ project.id }}</div>
       </div>
     </div>
