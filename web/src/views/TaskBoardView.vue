@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
-import { api, type Task, type AgentRun } from '@/api/client'
+import { ref, onMounted, watch, computed } from 'vue'
+import { api, type Task } from '@/api/client'
 import { useSSE } from '@/composables/useSSE'
 
 const props = defineProps<{ id: string }>()
 
 const tasks = ref<Task[]>([])
-const loading = ref(true)
+const initialLoading = ref(true)
 const runningTask = ref<string | null>(null)
 const { connected, data: sseData } = useSSE('/status/stream')
 
@@ -18,22 +18,43 @@ const columns = [
   { key: 'FAILED', label: 'Failed' },
 ]
 
-function tasksForStatus(status: string): Task[] {
-  return tasks.value.filter(t => t.status === status)
+const tasksByStatus = computed(() => {
+  const map: Record<string, Task[]> = {}
+  for (const col of columns) {
+    map[col.key] = []
+  }
+  for (const t of tasks.value) {
+    if (map[t.status]) {
+      map[t.status].push(t)
+    }
+  }
+  return map
+})
+
+// Silent background refresh - no loading indicator
+async function silentRefresh() {
+  try {
+    const fresh = await api.listTasks(props.id)
+    tasks.value = fresh
+  } catch {}
 }
 
-async function load() {
-  loading.value = true
+// Initial load with loading indicator
+async function initialLoad() {
+  initialLoading.value = true
   try {
     tasks.value = await api.listTasks(props.id)
-  } catch {} finally { loading.value = false }
+  } catch {} finally {
+    initialLoading.value = false
+  }
 }
 
 async function startRun(taskId: string) {
   runningTask.value = taskId
   try {
     await api.startRun(props.id, taskId)
-    setTimeout(load, 2000)
+    // Silent refresh after a short delay
+    setTimeout(silentRefresh, 1500)
   } catch (e: any) {
     alert('Failed: ' + e.message)
   } finally {
@@ -44,17 +65,19 @@ async function startRun(taskId: string) {
 async function retryTask(taskId: string) {
   try {
     await api.retryTask(props.id, taskId)
-    setTimeout(load, 1000)
+    setTimeout(silentRefresh, 1000)
   } catch (e: any) {
     alert('Failed: ' + e.message)
   }
 }
 
-// Auto-refresh on SSE events
-watch(sseData, () => { load() })
+// Silent auto-refresh on SSE events - no loading state
+watch(sseData, () => {
+  silentRefresh()
+})
 
-watch(() => props.id, load)
-onMounted(load)
+watch(() => props.id, initialLoad)
+onMounted(initialLoad)
 </script>
 
 <template>
@@ -66,42 +89,75 @@ onMounted(load)
           <span class="sse-dot" :class="connected ? 'connected' : 'disconnected'"></span>
           {{ connected ? 'Live' : 'Offline' }}
         </div>
-        <button class="btn btn-sm" @click="load">Refresh</button>
         <router-link :to="`/projects/${id}`" class="btn btn-sm">Back</router-link>
       </div>
     </div>
 
-    <div v-if="loading" style="text-align: center; padding: 40px; color: var(--text-secondary);">
+    <div v-if="initialLoading" style="text-align: center; padding: 40px; color: var(--text-secondary);">
       <span class="spinner"></span> Loading...
     </div>
 
     <div v-else class="board">
       <div v-for="col in columns" :key="col.key" class="board-column">
         <div class="board-column-title">
-          {{ col.label }} ({{ tasksForStatus(col.key).length }})
+          {{ col.label }} ({{ tasksByStatus[col.key].length }})
         </div>
-        <div v-for="task in tasksForStatus(col.key)" :key="task.id" class="board-card">
-          <div class="board-card-title">{{ task.name }}</div>
-          <div class="board-card-meta">
-            {{ task.assigneeAgent }} · {{ task.type }}
+        <TransitionGroup name="task-card" tag="div">
+          <div v-for="task in tasksByStatus[col.key]" :key="task.id" class="board-card">
+            <div class="board-card-title">{{ task.name }}</div>
+            <div class="board-card-meta">
+              {{ task.assigneeAgent }} · {{ task.type }}
+            </div>
+            <div style="display: flex; gap: 4px; margin-top: 8px;">
+              <button v-if="task.status === 'CREATED' || task.status === 'FAILED'" class="btn btn-sm btn-primary"
+                @click="startRun(task.id)" :disabled="runningTask === task.id">
+                {{ runningTask === task.id ? 'Starting...' : 'Run' }}
+              </button>
+              <button v-if="task.status === 'FAILED'" class="btn btn-sm" @click="retryTask(task.id)">
+                Retry
+              </button>
+              <router-link v-if="task.status === 'HUMAN_OVERRIDE'" :to="`/projects/${id}/hitl`" class="btn btn-sm">
+                Handle
+              </router-link>
+            </div>
           </div>
-          <div style="display: flex; gap: 4px; margin-top: 8px;">
-            <button v-if="task.status === 'CREATED' || task.status === 'FAILED'" class="btn btn-sm btn-primary"
-              @click="startRun(task.id)" :disabled="runningTask === task.id">
-              {{ runningTask === task.id ? 'Starting...' : 'Run' }}
-            </button>
-            <button v-if="task.status === 'FAILED'" class="btn btn-sm" @click="retryTask(task.id)">
-              Retry
-            </button>
-            <router-link v-if="task.status === 'HUMAN_OVERRIDE'" :to="`/projects/${id}/hitl`" class="btn btn-sm">
-              Handle
-            </router-link>
-          </div>
-        </div>
-        <div v-if="tasksForStatus(col.key).length === 0" style="font-size: 12px; color: var(--text-secondary); text-align: center; padding: 20px;">
+        </TransitionGroup>
+        <div v-if="tasksByStatus[col.key].length === 0" class="board-empty">
           No tasks
         </div>
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.board-empty {
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: center;
+  padding: 20px;
+}
+
+/* Smooth transitions for task cards */
+.task-card-enter-active {
+  transition: all 0.3s ease-out;
+}
+
+.task-card-leave-active {
+  transition: all 0.2s ease-in;
+}
+
+.task-card-enter-from {
+  opacity: 0;
+  transform: translateY(-10px);
+}
+
+.task-card-leave-to {
+  opacity: 0;
+  transform: scale(0.95);
+}
+
+.task-card-move {
+  transition: transform 0.3s ease;
+}
+</style>
