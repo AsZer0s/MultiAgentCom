@@ -201,7 +201,7 @@ export const api = {
   addRequirement: (projectId: string, input: { title: string; content: string; constraints?: string[]; acceptanceHints?: string[] }) =>
     apiFetch<Requirement>(`/projects/${projectId}/requirements`, { method: 'POST', body: JSON.stringify(input) }),
   listRequirements: (projectId: string) =>
-    apiFetch<Requirement[]>(`/projects/${projectId}/requirements`),
+    apiFetch<{ items: Requirement[]; count: number }>(`/projects/${projectId}/requirements`).then(r => r.items),
 
   // Plans
   generatePlan: (projectId: string) =>
@@ -211,11 +211,11 @@ export const api = {
   generateContract: (projectId: string) =>
     apiFetch<Contract>(`/projects/${projectId}/contracts/generate`, { method: 'POST' }),
   listContracts: (projectId: string) =>
-    apiFetch<Contract[]>(`/projects/${projectId}/contracts`),
+    apiFetch<{ items: Contract[]; count: number }>(`/projects/${projectId}/contracts`).then(r => r.items),
 
   // Tasks
   listTasks: (projectId: string) =>
-    apiFetch<Task[]>(`/projects/${projectId}/tasks`),
+    apiFetch<{ items: Task[]; count: number }>(`/projects/${projectId}/tasks`).then(r => r.items),
   dispatchTasks: (projectId: string) =>
     apiFetch<{ contract: Contract; tasks: Task[] }>(`/projects/${projectId}/tasks/dispatch`, { method: 'POST' }),
 
