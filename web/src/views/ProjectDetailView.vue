@@ -168,7 +168,7 @@ onMounted(load)
               <td>{{ task.name }}</td>
               <td>{{ task.type }}</td>
               <td>{{ task.assigneeAgent }}</td>
-              <td><span class="pill" :class="`pill-${task.status.toLowerCase()}`">{{ task.status }}</span></td>
+              <td><span class="pill" :class="`pill-${(task.status || '').toLowerCase()}`">{{ task.status || 'UNKNOWN' }}</span></td>
             </tr>
           </tbody>
         </table>
