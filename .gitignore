@@ -1,10 +1,68 @@
+# ── Go ───────────────────────────────────────────────────
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+*.trace
+coverage.out
+coverage.html
+
+# ── Runtime artifacts ────────────────────────────────────
 runtime/artifacts/
 runtime/sandboxes/
-/internal/httpapi/proj_*/
-/internal/service/proj_*/
 /internal/httpapi/runtime/
 /internal/service/runtime/
-bin/
+/internal/httpapi/proj_*/
+/internal/service/proj_*/
+
+# ── Environment ─────────────────────────────────────────
 .env
+.env.local
+.env.*.local
+
+# ── Frontend ─────────────────────────────────────────────
 web/node_modules/
 web/dist/
+web/.vite/
+web/*.local
+
+# ── IDE ─────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Docker ──────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── Kubernetes secrets (never commit real values) ────────
+k8s/*-secret.yaml
+k8s/*-values.yaml
+
+# ── Logs ────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Temporary ───────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# ── OS ──────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
