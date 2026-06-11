@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { api, type AdminConfig, type AdminConfigUpdate } from '@/api/client'
+import { useI18n } from '@/i18n'
 
+const { t } = useI18n()
 const config = ref<AdminConfig | null>(null)
 const loading = ref(true)
 const saving = ref(false)
@@ -157,12 +159,12 @@ onMounted(loadConfig)
 <template>
   <div>
     <div class="page-header">
-      <h1 class="page-title">Settings</h1>
-      <span class="pill pill-done">Admin</span>
+      <h1 class="page-title">{{ t('settings.title') }}</h1>
+      <span class="pill pill-done">{{ t('settings.admin') }}</span>
     </div>
 
     <div v-if="loading" class="loading-state">
-      <span class="spinner"></span> Loading...
+      <span class="spinner"></span> {{ t('common.loading') }}
     </div>
 
     <div v-else-if="error && !config" class="card">
@@ -174,43 +176,43 @@ onMounted(loadConfig)
       <div v-if="error" class="alert alert-danger">{{ error }}</div>
 
       <div class="tabs">
-        <button class="tab" :class="{ active: activeTab === 'runtime' }" @click="activeTab = 'runtime'">Runtime</button>
-        <button class="tab" :class="{ active: activeTab === 'token' }" @click="activeTab = 'token'">Token Cost</button>
-        <button class="tab" :class="{ active: activeTab === 's3' }" @click="activeTab = 's3'">S3 Storage</button>
-        <button class="tab" :class="{ active: activeTab === 'alert' }" @click="activeTab = 'alert'">Alerts</button>
-        <button class="tab" :class="{ active: activeTab === 'oidc' }" @click="activeTab = 'oidc'">OIDC</button>
+        <button class="tab" :class="{ active: activeTab === 'runtime' }" @click="activeTab = 'runtime'">{{ t('settings.runtime') }}</button>
+        <button class="tab" :class="{ active: activeTab === 'token' }" @click="activeTab = 'token'">{{ t('settings.tokenCost') }}</button>
+        <button class="tab" :class="{ active: activeTab === 's3' }" @click="activeTab = 's3'">{{ t('settings.s3Storage') }}</button>
+        <button class="tab" :class="{ active: activeTab === 'alert' }" @click="activeTab = 'alert'">{{ t('settings.alerts') }}</button>
+        <button class="tab" :class="{ active: activeTab === 'oidc' }" @click="activeTab = 'oidc'">{{ t('settings.oidc') }}</button>
       </div>
 
       <!-- Runtime Tab -->
       <div v-if="activeTab === 'runtime'" class="card">
-        <div class="card-title">Runtime Provider</div>
+        <div class="card-title">{{ t('settings.runtime') }}</div>
         <div class="form-group">
-          <label>Active Provider</label>
+          <label>{{ t('settings.activeProvider') }}</label>
           <select v-model="runtimeProvider" class="form-select">
-            <option value="local">Local (Mock)</option>
-            <option value="claude">Claude (Anthropic)</option>
-            <option value="openai">OpenAI Compatible</option>
-            <option value="gemini">Gemini (Google)</option>
-            <option value="http">HTTP Endpoint</option>
+            <option value="local">{{ t('settings.localMock') }}</option>
+            <option value="claude">{{ t('settings.claude') }}</option>
+            <option value="openai">{{ t('settings.openai') }}</option>
+            <option value="gemini">{{ t('settings.gemini') }}</option>
+            <option value="http">{{ t('settings.httpEndpoint') }}</option>
           </select>
         </div>
 
         <h3 style="margin: 20px 0 12px; font-size: 15px;">Claude</h3>
         <div class="grid grid-2">
           <div class="form-group">
-            <label>API Key (leave empty to keep current)</label>
+            <label>{{ t('settings.apiKey') }} ({{ t('settings.apiKeyPlaceholder') }})</label>
             <input v-model="claudeApiKey" type="password" class="form-input" placeholder="sk-ant-...">
           </div>
           <div class="form-group">
-            <label>Model</label>
+            <label>{{ t('settings.model') }}</label>
             <input v-model="claudeModel" class="form-input">
           </div>
           <div class="form-group">
-            <label>Base URL</label>
+            <label>{{ t('settings.baseUrl') }}</label>
             <input v-model="claudeBaseURL" class="form-input">
           </div>
           <div class="form-group">
-            <label>Max Tokens</label>
+            <label>{{ t('settings.maxTokens') }}</label>
             <input v-model.number="claudeMaxTokens" type="number" class="form-input">
           </div>
         </div>
@@ -218,26 +220,26 @@ onMounted(loadConfig)
         <h3 style="margin: 20px 0 12px; font-size: 15px;">OpenAI</h3>
         <div class="grid grid-2">
           <div class="form-group">
-            <label>API Key (leave empty to keep current)</label>
+            <label>{{ t('settings.apiKey') }} ({{ t('settings.apiKeyPlaceholder') }})</label>
             <input v-model="openaiApiKey" type="password" class="form-input" placeholder="sk-...">
           </div>
           <div class="form-group">
-            <label>Model</label>
+            <label>{{ t('settings.model') }}</label>
             <input v-model="openaiModel" class="form-input">
           </div>
           <div class="form-group">
-            <label>Base URL</label>
+            <label>{{ t('settings.baseUrl') }}</label>
             <input v-model="openaiBaseURL" class="form-input">
           </div>
           <div class="form-group">
-            <label>Max Tokens</label>
+            <label>{{ t('settings.maxTokens') }}</label>
             <input v-model.number="openaiMaxTokens" type="number" class="form-input">
           </div>
           <div class="form-group">
-            <label>Format</label>
+            <label>{{ t('settings.format') }}</label>
             <select v-model="openaiFormat" class="form-select">
-              <option value="chat">Chat Completions</option>
-              <option value="completions">Legacy Completions (Codex)</option>
+              <option value="chat">{{ t('settings.chatCompletions') }}</option>
+              <option value="completions">{{ t('settings.legacyCompletions') }}</option>
             </select>
           </div>
         </div>
@@ -245,135 +247,135 @@ onMounted(loadConfig)
         <h3 style="margin: 20px 0 12px; font-size: 15px;">Gemini</h3>
         <div class="grid grid-2">
           <div class="form-group">
-            <label>API Key (leave empty to keep current)</label>
+            <label>{{ t('settings.apiKey') }} ({{ t('settings.apiKeyPlaceholder') }})</label>
             <input v-model="geminiApiKey" type="password" class="form-input" placeholder="AIza...">
           </div>
           <div class="form-group">
-            <label>Model</label>
+            <label>{{ t('settings.model') }}</label>
             <input v-model="geminiModel" class="form-input">
           </div>
           <div class="form-group">
-            <label>Base URL</label>
+            <label>{{ t('settings.baseUrl') }}</label>
             <input v-model="geminiBaseURL" class="form-input">
           </div>
           <div class="form-group">
-            <label>Max Tokens</label>
+            <label>{{ t('settings.maxTokens') }}</label>
             <input v-model.number="geminiMaxTokens" type="number" class="form-input">
           </div>
         </div>
 
         <button class="btn btn-primary" style="margin-top: 16px" @click="saveSection('runtime')" :disabled="saving">
-          {{ saving ? 'Saving...' : 'Save Runtime Settings' }}
+          {{ saving ? t('settings.saving') : t('settings.saveRuntime') }}
         </button>
       </div>
 
       <!-- Token Tab -->
       <div v-if="activeTab === 'token'" class="card">
-        <div class="card-title">Token Cost Tracking</div>
+        <div class="card-title">{{ t('settings.tokenCost') }}</div>
         <div class="grid grid-2">
           <div class="form-group">
-            <label>Prompt Price (per 1M tokens)</label>
+            <label>{{ t('settings.promptPrice') }}</label>
             <input v-model.number="tokenPromptPrice" type="number" step="0.1" class="form-input">
           </div>
           <div class="form-group">
-            <label>Output Price (per 1M tokens)</label>
+            <label>{{ t('settings.outputPrice') }}</label>
             <input v-model.number="tokenOutputPrice" type="number" step="0.1" class="form-input">
           </div>
           <div class="form-group">
-            <label>Budget Warn (USD)</label>
+            <label>{{ t('settings.budgetWarn') }}</label>
             <input v-model.number="tokenBudgetWarn" type="number" step="0.01" class="form-input">
           </div>
           <div class="form-group">
-            <label>Budget Block (USD)</label>
+            <label>{{ t('settings.budgetBlock') }}</label>
             <input v-model.number="tokenBudgetBlock" type="number" step="0.01" class="form-input">
           </div>
         </div>
         <button class="btn btn-primary" style="margin-top: 16px" @click="saveSection('token')" :disabled="saving">
-          {{ saving ? 'Saving...' : 'Save Token Settings' }}
+          {{ saving ? t('settings.saving') : t('settings.saveToken') }}
         </button>
       </div>
 
       <!-- S3 Tab -->
       <div v-if="activeTab === 's3'" class="card">
-        <div class="card-title">Artifact Storage</div>
+        <div class="card-title">{{ t('settings.s3Storage') }}</div>
         <div class="form-group">
-          <label>Storage Provider</label>
+          <label>{{ t('settings.storageProvider') }}</label>
           <select v-model="s3Provider" class="form-select">
-            <option value="filesystem">Local Filesystem</option>
-            <option value="s3">S3 / MinIO</option>
+            <option value="filesystem">{{ t('settings.filesystem') }}</option>
+            <option value="s3">{{ t('settings.s3') }}</option>
           </select>
         </div>
         <template v-if="s3Provider === 's3'">
           <div class="grid grid-2">
             <div class="form-group">
-              <label>Endpoint</label>
+              <label>{{ t('settings.endpoint') }}</label>
               <input v-model="s3Endpoint" class="form-input" placeholder="localhost:9000">
             </div>
             <div class="form-group">
-              <label>Bucket</label>
+              <label>{{ t('settings.bucket') }}</label>
               <input v-model="s3Bucket" class="form-input">
             </div>
             <div class="form-group">
-              <label>Access Key (leave empty to keep current)</label>
+              <label>{{ t('settings.accessKey') }} ({{ t('settings.apiKeyPlaceholder') }})</label>
               <input v-model="s3AccessKey" type="password" class="form-input">
             </div>
             <div class="form-group">
-              <label>Secret Key (leave empty to keep current)</label>
+              <label>{{ t('settings.secretKey') }} ({{ t('settings.apiKeyPlaceholder') }})</label>
               <input v-model="s3SecretKey" type="password" class="form-input">
             </div>
             <div class="form-group">
-              <label>Region</label>
+              <label>{{ t('settings.region') }}</label>
               <input v-model="s3Region" class="form-input">
             </div>
             <div class="form-group">
-              <label>Use SSL</label>
+              <label>{{ t('settings.useSsl') }}</label>
               <select v-model="s3UseSSL" class="form-select">
-                <option :value="false">No</option>
-                <option :value="true">Yes</option>
+                <option :value="false">{{ t('common.no') }}</option>
+                <option :value="true">{{ t('common.yes') }}</option>
               </select>
             </div>
           </div>
         </template>
         <button class="btn btn-primary" style="margin-top: 16px" @click="saveSection('s3')" :disabled="saving">
-          {{ saving ? 'Saving...' : 'Save Storage Settings' }}
+          {{ saving ? t('settings.saving') : t('settings.saveStorage') }}
         </button>
       </div>
 
       <!-- Alert Tab -->
       <div v-if="activeTab === 'alert'" class="card">
-        <div class="card-title">Alert Webhook</div>
+        <div class="card-title">{{ t('settings.alerts') }}</div>
         <div class="form-group">
-          <label>Webhook URL (leave empty to keep current)</label>
-          <input v-model="alertWebhookURL" class="form-input" placeholder="https://hooks.slack.com/...">
+          <label>{{ t('settings.webhookUrl') }} ({{ t('settings.apiKeyPlaceholder') }})</label>
+          <input v-model="alertWebhookURL" class="form-input" :placeholder="t('settings.webhookPlaceholder')">
         </div>
         <button class="btn btn-primary" style="margin-top: 16px" @click="saveSection('alert')" :disabled="saving">
-          {{ saving ? 'Saving...' : 'Save Alert Settings' }}
+          {{ saving ? t('settings.saving') : t('settings.saveAlert') }}
         </button>
       </div>
 
       <!-- OIDC Tab -->
       <div v-if="activeTab === 'oidc'" class="card">
-        <div class="card-title">OIDC / OAuth2</div>
+        <div class="card-title">{{ t('settings.oidc') }} / OAuth2</div>
         <div class="grid grid-2">
           <div class="form-group">
-            <label>Issuer URL</label>
-            <input v-model="oidcIssuer" class="form-input" placeholder="https://accounts.google.com">
+            <label>{{ t('settings.issuer') }}</label>
+            <input v-model="oidcIssuer" class="form-input" :placeholder="t('settings.issuerPlaceholder')">
           </div>
           <div class="form-group">
-            <label>Client ID</label>
+            <label>{{ t('settings.clientId') }}</label>
             <input v-model="oidcClientID" class="form-input">
           </div>
           <div class="form-group">
-            <label>Client Secret (leave empty to keep current)</label>
+            <label>{{ t('settings.clientSecret') }} ({{ t('settings.apiKeyPlaceholder') }})</label>
             <input v-model="oidcClientSecret" type="password" class="form-input">
           </div>
           <div class="form-group">
-            <label>Redirect URL</label>
-            <input v-model="oidcRedirectURL" class="form-input" placeholder="https://your-app.com/auth/oidc/callback">
+            <label>{{ t('settings.redirectUrl') }}</label>
+            <input v-model="oidcRedirectURL" class="form-input" :placeholder="t('settings.redirectPlaceholder')">
           </div>
         </div>
         <button class="btn btn-primary" style="margin-top: 16px" @click="saveSection('oidc')" :disabled="saving">
-          {{ saving ? 'Saving...' : 'Save OIDC Settings' }}
+          {{ saving ? t('settings.saving') : t('settings.saveOidc') }}
         </button>
       </div>
     </template>
