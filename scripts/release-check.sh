@@ -80,11 +80,15 @@ request_json() {
   local path="$3"
   local payload="${4:-}"
   local tmp code body
+  local auth_header=()
+  if [[ -n "${API_TOKEN:-}" ]]; then
+    auth_header=(-H "Authorization: Bearer $API_TOKEN")
+  fi
   tmp="$(mktemp)"
   if [[ -n "$payload" ]]; then
-    code="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "$base_url$path" -H 'Content-Type: application/json' -d "$payload")"
+    code="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "$base_url$path" "${auth_header[@]}" -H 'Content-Type: application/json' -d "$payload")"
   else
-    code="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "$base_url$path")"
+    code="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "$base_url$path" "${auth_header[@]}")"
   fi
   body="$(<"$tmp")"
   rm -f "$tmp"
@@ -149,6 +153,14 @@ start_file_store_server() {
     go run ./cmd/server >"${LOG_FILE}.filestore" 2>&1) &
   FILE_STORE_SERVER_PID="$!"
   wait_health "http://127.0.0.1:$FILE_STORE_SMOKE_PORT" "multiagentcom-file-store-smoke"
+
+  # Extract auto-generated token from file-store server logs
+  local file_store_token
+  file_store_token="$(grep -oP 'Token:\s*\K[a-f0-9]+' "${LOG_FILE}.filestore" 2>/dev/null | head -1 || true)"
+  if [[ -n "$file_store_token" ]]; then
+    API_TOKEN="$file_store_token"
+    export API_TOKEN
+  fi
 }
 
 stop_file_store_server() {
@@ -408,6 +420,13 @@ RUNTIME_SERVER_PID="$!"
 
 RUNTIME_BASE_URL="http://127.0.0.1:$RUNTIME_SMOKE_PORT"
 wait_health "$RUNTIME_BASE_URL" "multiagentcom-runtime-smoke"
+
+# Extract auto-generated token from runtime server logs
+RUNTIME_API_TOKEN="$(grep -oP 'Token:\s*\K[a-f0-9]+' "${LOG_FILE}.runtime" 2>/dev/null | head -1 || true)"
+if [[ -n "$RUNTIME_API_TOKEN" ]]; then
+  API_TOKEN="$RUNTIME_API_TOKEN"
+  export API_TOKEN
+fi
 
 runtime_project_json="$(request_json "$RUNTIME_BASE_URL" POST "/projects" '{"name":"Runtime Provider Smoke"}')"
 runtime_project_id="$(printf '%s' "$runtime_project_json" | json_query "id")"
