@@ -48,53 +48,59 @@ onMounted(loadMatrix)
     </div>
 
     <div v-else-if="error" class="card">
-      <p style="color: var(--danger)">{{ error }}</p>
+      <p style="color: var(--red)">{{ error }}</p>
     </div>
 
-    <div v-else class="grid grid-3">
-      <div v-for="agent in agents" :key="agent.agent" class="card">
-        <div class="card-title">{{ agent.agent }}</div>
-        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">
-          <span class="pill" :class="`pill-${agent.status.toLowerCase()}`">{{ agent.status }}</span>
-        </div>
-        <div class="grid grid-3" style="gap: 8px;">
-          <div class="stat">
-            <div class="stat-value">{{ agent.doneTasks }}</div>
-            <div class="stat-label">{{ t('taskStatus.done') }}</div>
+    <div v-else>
+      <!-- Agent Fleet -->
+      <div class="section-label">{{ t('dashboard.title') }} — AGENT FLEET</div>
+      <div class="grid grid-3" style="margin-bottom: 24px;">
+        <div v-for="agent in agents" :key="agent.agent" class="card agent-card">
+          <div class="agent-header">
+            <span class="agent-name">{{ agent.agent }}</span>
+            <span class="pill" :class="`pill-${agent.status.toLowerCase()}`">{{ agent.status }}</span>
           </div>
-          <div class="stat">
-            <div class="stat-value">{{ agent.runningTasks }}</div>
-            <div class="stat-label">{{ t('taskStatus.inProgress') }}</div>
+          <div class="agent-stats">
+            <div class="stat">
+              <div class="stat-value stat-done">{{ agent.doneTasks }}</div>
+              <div class="stat-label">{{ t('taskStatus.done') }}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-value stat-running">{{ agent.runningTasks }}</div>
+              <div class="stat-label">{{ t('taskStatus.inProgress') }}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-value stat-failed">{{ agent.failedTasks }}</div>
+              <div class="stat-label">{{ t('taskStatus.failed') }}</div>
+            </div>
           </div>
-          <div class="stat">
-            <div class="stat-value">{{ agent.failedTasks }}</div>
-            <div class="stat-label">{{ t('taskStatus.failed') }}</div>
+          <div class="agent-total">
+            {{ t('common.total') }}: {{ agent.totalTasks }}
           </div>
-        </div>
-        <div style="margin-top: 12px; font-size: 12px; color: var(--text-secondary);">
-          {{ t('common.total') }}: {{ agent.totalTasks }} {{ t('statusPanel.tasks') }}
         </div>
       </div>
-    </div>
 
-    <div v-if="!loading && agents.length === 0" class="card" style="text-align: center; padding: 40px;">
-      <p style="color: var(--text-secondary);">{{ t('dashboard.noAgents') }}</p>
-      <router-link to="/projects" class="btn btn-primary" style="margin-top: 16px;">{{ t('dashboard.createProject') }}</router-link>
-    </div>
+      <div v-if="agents.length === 0" class="card" style="text-align: center; padding: 48px;">
+        <p style="color: var(--text-dim); margin-bottom: 16px;">{{ t('dashboard.noAgents') }}</p>
+        <router-link to="/projects" class="btn btn-primary">{{ t('dashboard.createProject') }}</router-link>
+      </div>
 
-    <div class="card" style="margin-top: 24px;">
-      <div class="card-title">{{ t('dashboard.llmProviders') }}</div>
-      <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 16px;">
-        {{ t('settings.activeProvider') }}: <strong>{{ activeProvider || 'none' }}</strong> — {{ t('dashboard.llmConfigHint') }}
-      </p>
-      <div class="grid grid-4">
-        <div v-for="p in providers" :key="p.id" class="provider-card" :class="{ active: p.active, unavailable: !p.available }">
-          <div class="provider-name">{{ p.name }}</div>
-          <div class="provider-model" v-if="p.model">{{ p.model }}</div>
-          <div class="provider-status">
-            <span v-if="p.active" class="pill pill-done">{{ t('dashboard.active') }}</span>
-            <span v-else-if="p.available" class="pill pill-created">{{ t('dashboard.available') }}</span>
-            <span v-else class="pill pill-failed">{{ t('dashboard.notConfigured') }}</span>
+      <!-- LLM Providers -->
+      <div class="section-label">{{ t('dashboard.llmProviders') }}</div>
+      <div class="card">
+        <div style="font-size: 12px; color: var(--text-dim); margin-bottom: 20px;">
+          {{ t('settings.activeProvider') }}: <span style="color: var(--cyan); font-weight: 700;">{{ activeProvider || '—' }}</span>
+          <span style="margin-left: 8px; color: var(--text-ghost);">{{ t('dashboard.llmConfigHint') }}</span>
+        </div>
+        <div class="grid grid-4">
+          <div v-for="p in providers" :key="p.id" class="provider-card" :class="{ active: p.active, unavailable: !p.available }">
+            <div class="provider-name">{{ p.name }}</div>
+            <div class="provider-model" v-if="p.model">{{ p.model }}</div>
+            <div class="provider-status">
+              <span v-if="p.active" class="pill pill-done">{{ t('dashboard.active') }}</span>
+              <span v-else-if="p.available" class="pill pill-created">{{ t('dashboard.available') }}</span>
+              <span v-else class="pill pill-failed">{{ t('dashboard.notConfigured') }}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -103,36 +109,44 @@ onMounted(loadMatrix)
 </template>
 
 <style scoped>
-.stat { text-align: center; }
-.stat-value { font-size: 20px; font-weight: 700; }
-.stat-label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; }
-.loading-state { display: flex; align-items: center; gap: 12px; color: var(--text-secondary); padding: 40px; justify-content: center; }
-.provider-card {
-  padding: 16px;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  background: var(--bg);
-  transition: border-color 0.2s;
+.section-label {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-ghost);
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  margin-bottom: 12px;
 }
-.provider-card.active {
-  border-color: var(--success);
-  background: rgba(63, 185, 80, 0.05);
+.agent-card { transition: all 0.2s; }
+.agent-card:hover { border-color: var(--cyan-dim); }
+.agent-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
 }
-.provider-card.unavailable {
-  opacity: 0.6;
-}
-.provider-name {
-  font-weight: 600;
+.agent-name {
+  font-family: var(--font-display);
   font-size: 14px;
-  margin-bottom: 4px;
+  font-weight: 700;
+  color: var(--text-bright);
 }
-.provider-model {
-  font-size: 12px;
-  color: var(--text-secondary);
-  margin-bottom: 8px;
-  font-family: monospace;
+.agent-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 16px;
 }
-.provider-status {
-  margin-top: 8px;
+.stat-done { color: var(--green); }
+.stat-running { color: var(--cyan); }
+.stat-failed { color: var(--red); }
+.agent-total {
+  font-size: 11px;
+  color: var(--text-ghost);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 </style>
